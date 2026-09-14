@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from .context_builder import build_context
+from .context_state import save_context_state
 from .git_utils import (
     GitError,
     get_branch,
@@ -91,6 +92,10 @@ def command_context(
     output = build_context(
         repo,
         task,
+    )
+
+    save_context_state(
+        repo
     )
 
     patch_file = get_default_patch_file(

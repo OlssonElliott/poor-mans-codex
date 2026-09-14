@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+from .context_state import (
+    get_stale_context_reason,
+)
 from .git_utils import GitError, run_git
 from .history import (
     HistoryError,
@@ -12,6 +15,9 @@ from .history import (
     get_history_patch_file,
     get_latest_applied_entry,
     move_entry_to_undone,
+)
+from .workspace import (
+    get_default_patch_file,
 )
 
 
@@ -106,6 +112,7 @@ def validate_patch_paths(
 
     return paths
 
+
 def strip_markdown_fence(
     patch_text: str,
 ) -> str:
@@ -132,6 +139,7 @@ def strip_markdown_fence(
             lines = lines[1:-1]
 
     return "\n".join(lines)
+
 
 def normalize_patch_file(
     patch_file: Path,
@@ -171,6 +179,7 @@ def patch_is_already_applied(
             "apply",
             "--reverse",
             "--check",
+            "--recount",
             str(patch_file),
             cwd=repo,
         )
@@ -185,6 +194,7 @@ def patch_is_already_applied(
             "apply",
             "--reverse",
             "--check",
+            "--recount",
             "--ignore-space-change",
             str(patch_file),
             cwd=repo,
@@ -222,12 +232,30 @@ def apply_patch(
         patch_text
     )
 
+    default_patch_file = (
+        get_default_patch_file(
+            repo
+        ).resolve()
+    )
+
+    if patch_file == default_patch_file:
+        stale_reason = (
+            get_stale_context_reason(
+                repo,
+                paths,
+            )
+        )
+
+        if stale_reason is not None:
+            raise PatchError(stale_reason)
+
     ignore_space = False
 
     try:
         run_git(
             "apply",
             "--check",
+            "--recount",
             str(patch_file),
             cwd=repo,
         )
@@ -246,6 +274,7 @@ def apply_patch(
             run_git(
                 "apply",
                 "--check",
+                "--recount",
                 "--ignore-space-change",
                 str(patch_file),
                 cwd=repo,
@@ -281,6 +310,7 @@ def apply_patch(
 
     apply_args = [
         "apply",
+        "--recount",
     ]
 
     if ignore_space:
@@ -379,6 +409,7 @@ def undo_last_patch(
             "apply",
             "--reverse",
             "--check",
+            "--recount",
             str(patch_file),
             cwd=repo,
         )
@@ -389,6 +420,7 @@ def undo_last_patch(
                 "apply",
                 "--reverse",
                 "--check",
+                "--recount",
                 "--ignore-space-change",
                 str(patch_file),
                 cwd=repo,
@@ -408,6 +440,7 @@ def undo_last_patch(
     undo_args = [
         "apply",
         "--reverse",
+        "--recount",
     ]
 
     if ignore_space:
