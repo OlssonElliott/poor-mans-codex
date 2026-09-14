@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: chatcode-local
+Version: 0.1.0
+Summary: Local bridge between a Git repository and ChatGPT
+Requires-Python: >=3.11

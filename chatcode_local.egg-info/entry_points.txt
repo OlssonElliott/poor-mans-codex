@@ -1,0 +1,2 @@
+[console_scripts]
+chatcode = chatcode.cli:main

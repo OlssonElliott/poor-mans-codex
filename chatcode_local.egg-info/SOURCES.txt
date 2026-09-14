@@ -1,0 +1,10 @@
+pyproject.toml
+chatcode/__init__.py
+chatcode/cli.py
+chatcode/context_builder.py
+chatcode/git_utils.py
+chatcode_local.egg-info/PKG-INFO
+chatcode_local.egg-info/SOURCES.txt
+chatcode_local.egg-info/dependency_links.txt
+chatcode_local.egg-info/entry_points.txt
+chatcode_local.egg-info/top_level.txt
