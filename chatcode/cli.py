@@ -105,7 +105,8 @@ def command_context(
         )
 
     save_context_state(
-        repo
+        repo,
+        task=task,
     )
 
     patch_file = get_default_patch_file(

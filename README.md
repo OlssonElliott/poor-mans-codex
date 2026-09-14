@@ -162,7 +162,9 @@ chatcode apply --no-review
 
 ChatCode also strips an outer Markdown `diff`, `patch` or unlabeled code fence from `incoming.diff` before applying it.
 
-Before changing any file, `chatcode apply` runs `git apply --check`. A failed check never partially applies the patch and produces `PATCH_REPAIR_CONTEXT.md` with the error, failed hunks, and exact current working-tree context. ChatCode never uses `git apply --reject`.
+Before changing any file, `chatcode apply` parses the unified diff, recalculates hunk counts, serializes a canonical patch, asks Git to parse it with `git apply --numstat`, and then runs `git apply --check`. Only a patch that passes every stage is applied.
+
+Malformed syntax, stale context, and valid patches that do not match the working tree are reported as separate failure types. Each produces `PATCH_REPAIR_CONTEXT.md` with failure-specific diagnostics and exact current working-tree context. A failed validation never partially applies the patch, and ChatCode never uses `git apply --reject`.
 
 ### `chatcode test`
 

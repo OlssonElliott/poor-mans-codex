@@ -110,10 +110,12 @@ def _collect_file_hashes(
 
 def save_context_state(
     repo: Path,
+    task: str | None = None,
 ) -> Path:
     state = {
-        "version": 1,
+        "version": 2,
         "branch": get_branch(repo),
+        "task": task,
         "files": _collect_file_hashes(
             repo
         ),
@@ -132,6 +134,20 @@ def save_context_state(
     )
 
     return state_file
+
+
+def get_context_task(
+    repo: Path,
+) -> str:
+    state_file = _state_file(repo)
+    if not state_file.exists():
+        return "[Original task unavailable]"
+    try:
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "[Original task unavailable]"
+    task = state.get("task")
+    return task if isinstance(task, str) and task else "[Original task unavailable]"
 
 
 def get_stale_context_reason(

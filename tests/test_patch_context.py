@@ -108,9 +108,13 @@ class PatchContextTests(unittest.TestCase):
             newline="\n",
         )
 
-        with self.assertRaisesRegex(PatchError, "inaktuell"):
+        with self.assertRaisesRegex(PatchError, "inaktuell") as raised:
             apply_patch(self.repo, incoming)
 
+        self.assertEqual(raised.exception.failure_type, "stale_context")
+        repair = get_repair_context_file(self.repo).read_text(encoding="utf-8")
+        self.assertIn("Failure type: `stale_context`", repair)
+        self.assertIn("value = 99", repair)
         self.assertEqual(source.read_text(encoding="utf-8"), "value = 99\n")
 
     def test_large_file_uses_labeled_symbol_aware_current_excerpt(self) -> None:
@@ -151,6 +155,64 @@ class PatchContextTests(unittest.TestCase):
             "first\ndirty\nadded\n",
         )
 
+    def test_count_metadata_is_canonicalized_before_apply(self) -> None:
+        source = self.write("app.py", "old\n")
+        self.commit_all()
+        incoming = self.root / "wrong-counts.diff"
+        incoming.write_text(
+            "--- a/app.py\n+++ b/app.py\n@@ -1,40 +1,70 @@\n-old\n+new\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        apply_patch(self.repo, incoming)
+
+        self.assertEqual(source.read_text(encoding="utf-8"), "new\n")
+        self.assertIn(
+            "@@ -1,1 +1,1 @@",
+            incoming.read_text(encoding="utf-8"),
+        )
+
+    def test_unrelated_uncommitted_change_is_preserved(self) -> None:
+        source = self.write("app.py", "old\n")
+        unrelated = self.write("notes.txt", "committed\n")
+        self.commit_all()
+        unrelated.write_text("dirty and unrelated\n", encoding="utf-8", newline="\n")
+        incoming = self.root / "app-only.diff"
+        incoming.write_text(
+            "--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-old\n+new\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        apply_patch(self.repo, incoming)
+
+        self.assertEqual(source.read_text(encoding="utf-8"), "new\n")
+        self.assertEqual(
+            unrelated.read_text(encoding="utf-8"),
+            "dirty and unrelated\n",
+        )
+
+    def test_corrupt_patch_gets_syntax_specific_repair_context(self) -> None:
+        source = self.write("app.py", "current = True\n")
+        self.commit_all()
+        save_context_state(self.repo, task="change current flag")
+        incoming = self.root / "corrupt.diff"
+        original = "--- a/app.py\n+++ b/app.py\n-current = True\n+current = False\n"
+        incoming.write_text(original, encoding="utf-8", newline="\n")
+
+        with self.assertRaises(PatchError) as raised:
+            apply_patch(self.repo, incoming)
+
+        self.assertEqual(raised.exception.failure_type, "invalid_patch_syntax")
+        repair = get_repair_context_file(self.repo).read_text(encoding="utf-8")
+        self.assertIn("Failure type: `invalid_patch_syntax`", repair)
+        self.assertIn("change current flag", repair)
+        self.assertIn("## Complete generated patch", repair)
+        self.assertIn(original.rstrip(), repair)
+        self.assertIn("current = True", repair)
+        self.assertEqual(source.read_text(encoding="utf-8"), "current = True\n")
+
     def test_failed_apply_check_writes_compact_repair_context(self) -> None:
         source = self.write("app.py", "current = True\n")
         self.commit_all()
@@ -166,15 +228,42 @@ class PatchContextTests(unittest.TestCase):
             newline="\n",
         )
 
-        with self.assertRaisesRegex(PatchError, "Repair context"):
+        with self.assertRaisesRegex(PatchError, "Repair context") as raised:
             apply_patch(self.repo, incoming)
 
+        self.assertEqual(raised.exception.failure_type, "patch_target_mismatch")
         repair = get_repair_context_file(self.repo).read_text(encoding="utf-8")
         self.assertIn("git apply error", repair)
         self.assertIn("current = True", repair)
-        self.assertIn(failed_hunk, repair)
+        self.assertIn("-stale = True\n+current = False", repair)
         self.assertIn("only a corrected unified diff", repair)
         self.assertEqual(source.read_text(encoding="utf-8"), "current = True\n")
+
+    def test_out_of_range_hunk_recovers_matching_context_without_invalid_range(self) -> None:
+        lines = [f"padding_{index} = {index}" for index in range(7000)]
+        lines[120] = "needle = True"
+        source = self.write("large.py", "\n".join(lines) + "\n")
+        self.commit_all()
+        incoming = self.root / "out-of-range.diff"
+        incoming.write_text(
+            "--- a/large.py\n+++ b/large.py\n"
+            "@@ -99999,2 +99999,2 @@\n"
+            " needle = True\n"
+            "-missing_after_needle = True\n"
+            "+replacement = True\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        with self.assertRaises(PatchError) as raised:
+            apply_patch(self.repo, incoming)
+
+        self.assertEqual(raised.exception.failure_type, "patch_target_mismatch")
+        repair = get_repair_context_file(self.repo).read_text(encoding="utf-8")
+        self.assertIn("needle = True", repair)
+        self.assertNotRegex(repair, r"lines (\d{3,})-(\d{1,2})(?:\D|$)")
+        self.assertNotIn("```text\n\n```", repair)
+        self.assertEqual(source.read_text(encoding="utf-8"), "\n".join(lines) + "\n")
 
 
 if __name__ == "__main__":
