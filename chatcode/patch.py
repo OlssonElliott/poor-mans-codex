@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -18,6 +19,7 @@ from .history import (
 )
 from .workspace import (
     get_default_patch_file,
+    get_repair_context_file,
 )
 
 
@@ -206,6 +208,138 @@ def patch_is_already_applied(
         return False
 
 
+def _patch_hunks(
+    patch_text: str,
+) -> list[tuple[str, int, str]]:
+    lines = patch_text.splitlines()
+    hunks: list[tuple[str, int, str]] = []
+    current_path = ""
+    old_path = ""
+    index = 0
+    hunk_header = re.compile(
+        r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@"
+    )
+
+    while index < len(lines):
+        line = lines[index]
+        if line.startswith("--- "):
+            old_path = line[4:].split("\t", 1)[0].strip()
+            if old_path.startswith("a/"):
+                old_path = old_path[2:]
+
+        if line.startswith("+++ "):
+            raw_path = line[4:].split("\t", 1)[0].strip()
+            if raw_path.startswith("b/"):
+                raw_path = raw_path[2:]
+            current_path = (
+                old_path
+                if raw_path == "/dev/null"
+                else raw_path
+            )
+
+        match = hunk_header.match(line)
+        if not match:
+            index += 1
+            continue
+
+        hunk_lines = [line]
+        index += 1
+        while index < len(lines) and not lines[index].startswith(
+            ("@@ ", "diff --git ", "--- ", "+++ ")
+        ):
+            hunk_lines.append(lines[index])
+            index += 1
+        hunks.append((
+            current_path,
+            int(match.group(1)),
+            "\n".join(hunk_lines),
+        ))
+
+    return hunks
+
+
+def build_patch_repair_context(
+    repo: Path,
+    patch_text: str,
+    apply_error: str,
+) -> Path:
+    output_file = get_repair_context_file(repo)
+    error_paths = {
+        PurePosixPath(match).as_posix()
+        for match in re.findall(
+            r"patch failed: (.*?):\d+",
+            apply_error,
+        )
+    }
+    hunks = _patch_hunks(patch_text)
+    if error_paths:
+        failed_hunks = [
+            hunk for hunk in hunks
+            if hunk[0] in error_paths
+        ]
+    else:
+        failed_hunks = hunks
+
+    sections: list[str] = []
+    for raw_path, line_number, hunk in failed_hunks:
+        path = repo.joinpath(*PurePosixPath(raw_path).parts)
+        if path.is_file():
+            current_lines = path.read_text(
+                encoding="utf-8",
+                errors="replace",
+            ).splitlines()
+            start = max(1, line_number - 30)
+            end = min(len(current_lines), line_number + 60)
+            current = "\n".join(current_lines[start - 1:end])
+        else:
+            start = 0
+            end = 0
+            current = "[File does not currently exist.]"
+
+        sections.extend([
+            f"### {raw_path}",
+            f"Current working-tree lines {start}-{end}:",
+            "```text",
+            current,
+            "```",
+            "Failed hunk:",
+            "```diff",
+            hunk,
+            "```",
+            "",
+        ])
+
+    if not sections:
+        sections = [
+            "No individual hunk could be identified; inspect the complete patch below.",
+            "```diff",
+            patch_text.rstrip(),
+            "```",
+            "",
+        ]
+
+    content = "\n".join([
+        "# ChatCode Patch Repair Context",
+        "",
+        "The patch failed `git apply --check`. Return only a corrected unified diff against the exact CURRENT working-tree excerpts below.",
+        "Preserve all existing uncommitted changes. Use repository-relative paths with forward slashes.",
+        "",
+        "## git apply error",
+        "```text",
+        apply_error,
+        "```",
+        "",
+        "## Failed hunks and current contents",
+        *sections,
+    ])
+    output_file.write_text(
+        content,
+        encoding="utf-8",
+        newline="\n",
+    )
+    return output_file
+
+
 def apply_patch(
     repo: Path,
     patch_file: Path,
@@ -249,13 +383,10 @@ def apply_patch(
         if stale_reason is not None:
             raise PatchError(stale_reason)
 
-    ignore_space = False
-
     try:
         run_git(
             "apply",
             "--check",
-            "--recount",
             str(patch_file),
             cwd=repo,
         )
@@ -270,24 +401,17 @@ def apply_patch(
                 "applicerad."
             )
 
-        try:
-            run_git(
-                "apply",
-                "--check",
-                "--recount",
-                "--ignore-space-change",
-                str(patch_file),
-                cwd=repo,
-            )
-
-            ignore_space = True
-
-        except GitError:
-            raise PatchError(
-                "Patchen kunde inte "
-                "appliceras:\n"
-                f"{strict_error}"
-            ) from strict_error
+        repair_context = build_patch_repair_context(
+            repo,
+            patch_text,
+            str(strict_error),
+        )
+        raise PatchError(
+            "Patchen kunde inte appliceras efter "
+            "git apply --check. Inga ändringar gjordes.\n"
+            f"{strict_error}\n\n"
+            f"Repair context: {repair_context}"
+        ) from strict_error
 
     try:
         pending_entry = (
@@ -310,17 +434,8 @@ def apply_patch(
 
     apply_args = [
         "apply",
-        "--recount",
+        str(history_patch),
     ]
-
-    if ignore_space:
-        apply_args.append(
-            "--ignore-space-change"
-        )
-
-    apply_args.append(
-        str(history_patch)
-    )
 
     try:
         run_git(

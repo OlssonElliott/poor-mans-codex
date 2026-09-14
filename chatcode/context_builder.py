@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 
@@ -8,6 +9,7 @@ from .git_utils import (
     get_staged_changed_paths,
     get_staged_diff,
     get_status,
+    get_untracked_paths,
     get_unstaged_changed_paths,
     get_unstaged_diff,
 )
@@ -154,6 +156,8 @@ MAX_FILES = 12
 MAX_FILE_CHARS = 20_000
 MAX_TOTAL_CHARS = 120_000
 MAX_TEST_RESULT_CHARS = 60_000
+PATCH_FULL_FILE_CHARS = 80_000
+PATCH_EXCERPT_RADIUS = 45
 
 PATCH_RESPONSE_INSTRUCTIONS = """\
 When this task requires code changes:
@@ -174,6 +178,11 @@ and applicable with:
 
 chatcode apply
 """
+
+PATCH_CONTEXT_HEADER = """\
+The files below are the exact CURRENT working-tree contents.
+Generate the patch against these contents.
+Uncommitted changes are intentional and must be preserved."""
 
 UPLOAD_INSTRUCTIONS = """\
 This file is an execution request.
@@ -454,6 +463,10 @@ def get_changed_files(
         get_staged_changed_paths(repo)
     )
 
+    paths.update(
+        get_untracked_paths(repo)
+    )
+
     for raw_path in paths:
         path = (repo / raw_path).resolve()
 
@@ -529,7 +542,7 @@ def score_file(
             errors="replace",
         ).lower()
 
-        content = content[:100_000]
+        content = content[:1_000_000]
 
         for word in task_words:
             occurrences = content.count(word)
@@ -646,6 +659,199 @@ def build_source_context(
         )
 
     return "\n".join(sections)
+
+
+def _read_current_text_and_hash(
+    path: Path,
+) -> tuple[str, str]:
+    data = path.read_bytes()
+    return (
+        data.decode("utf-8", errors="replace"),
+        hashlib.sha256(data).hexdigest(),
+    )
+
+
+def _merge_line_ranges(
+    ranges: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    merged: list[list[int]] = []
+
+    for start, end in sorted(ranges):
+        if merged and start <= merged[-1][1] + 1:
+            merged[-1][1] = max(
+                merged[-1][1],
+                end,
+            )
+        else:
+            merged.append([start, end])
+
+    return [
+        (start, end)
+        for start, end in merged
+    ]
+
+
+def _symbol_aware_ranges(
+    content: str,
+    task: str,
+) -> list[tuple[int, int]]:
+    lines = content.splitlines()
+    count = len(lines)
+    task_words = get_task_words(task)
+    matches: set[int] = set()
+    definition = re.compile(
+        r"^\s*(?:async\s+)?(?:def|class|function|interface|type|enum|struct|trait)\s+([A-Za-z_][A-Za-z0-9_]*)"
+    )
+    symbols: set[str] = set()
+
+    for index, line in enumerate(lines, start=1):
+        lowered = line.lower()
+        if any(word in lowered for word in task_words):
+            matches.add(index)
+            found = definition.match(line)
+            if found:
+                symbols.add(found.group(1))
+
+    # References to matched definitions are useful caller/callee clues.
+    if symbols:
+        for index, line in enumerate(lines, start=1):
+            if any(
+                re.search(rf"\b{re.escape(symbol)}\b", line)
+                for symbol in symbols
+            ):
+                matches.add(index)
+
+    ranges: list[tuple[int, int]] = []
+    import_end = 0
+    for index, line in enumerate(lines[:200], start=1):
+        stripped = line.lstrip()
+        if stripped.startswith(
+            ("import ", "from ", "#include", "using ")
+        ):
+            import_end = index
+    if import_end:
+        ranges.append((1, min(count, import_end + 8)))
+
+    if not matches:
+        matches.add(1)
+
+    for line_number in matches:
+        ranges.append((
+            max(1, line_number - PATCH_EXCERPT_RADIUS),
+            min(count, line_number + PATCH_EXCERPT_RADIUS),
+        ))
+
+    return _merge_line_ranges(ranges)
+
+
+def build_patch_source_context(
+    repo: Path,
+    task: str,
+    files: list[Path] | None = None,
+) -> str:
+    if files is None:
+        files = collect_relevant_files(repo, task)
+
+    changed_files = get_changed_files(repo)
+    sections: list[str] = []
+
+    for path in files:
+        try:
+            content, digest = (
+                _read_current_text_and_hash(path)
+            )
+        except OSError:
+            continue
+
+        relative = path.relative_to(repo).as_posix()
+        include_full = (
+            len(content) <= PATCH_FULL_FILE_CHARS
+            or path in changed_files
+        )
+
+        if include_full:
+            section = (
+                f"===== FULL FILE: {relative} =====\n"
+                f"SHA-256: {digest}\n"
+                f"Line range: 1-{max(1, len(content.splitlines()))}\n\n"
+                f"{content}\n"
+            )
+        else:
+            lines = content.splitlines(keepends=True)
+            excerpts: list[str] = []
+            for start, end in _symbol_aware_ranges(content, task):
+                excerpts.append(
+                    f"----- EXCERPT {relative} lines {start}-{end} -----\n"
+                    + "".join(lines[start - 1:end])
+                )
+            section = (
+                f"===== EXCERPTS FROM CURRENT FILE: {relative} =====\n"
+                f"SHA-256 (complete source file): {digest}\n"
+                + "\n".join(excerpts)
+                + "\n"
+            )
+
+        sections.append(section)
+
+    return "\n".join(sections) or "No relevant source files found."
+
+
+def build_patch_context(
+    repo: Path,
+    task: str,
+) -> Path:
+    output_file = get_repo_workspace(repo) / "UPLOAD_TO_CHATGPT.md"
+    repo_display = repo.resolve().as_posix()
+    status = build_safe_status(repo).replace("\\", "/")
+    files = collect_relevant_files(repo, task)
+    source_context = build_patch_source_context(
+        repo,
+        task,
+        files=files,
+    )
+    selected = [
+        path.relative_to(repo).as_posix()
+        for path in files
+    ]
+
+    parts = [
+        "# ChatCode Patch Context",
+        "",
+        PATCH_CONTEXT_HEADER,
+        "",
+        "## ChatGPT instructions",
+        UPLOAD_INSTRUCTIONS,
+        "",
+        "## Task (verbatim)",
+        task,
+        "",
+        "## Repository root",
+        repo_display,
+        "",
+        "## Current branch",
+        get_branch(repo),
+        "",
+        "## Git status --short",
+        status or "Working tree clean",
+        "",
+        "## Selected relevant files",
+        "\n".join(f"- {path}" for path in selected) or "None",
+        "",
+        "## Exact current working-tree contents",
+        source_context,
+        "",
+        "## Response instructions",
+        PATCH_RESPONSE_INSTRUCTIONS,
+        "All patch paths must use forward slashes (`/`).",
+        "Patch only against the current contents above; do not reconstruct files from Git history or a separate diff.",
+        "",
+    ]
+    output_file.write_text(
+        "\n".join(parts),
+        encoding="utf-8",
+        newline="\n",
+    )
+    return output_file
 
 
 def build_safe_diff(

@@ -65,7 +65,7 @@ Run ChatCode from inside the Git repository you want ChatGPT to work on.
 Create a task:
 
 ```text
-chatcode context "Add validation to the contact form"
+chatcode patch-context "Add validation to the contact form"
 ```
 
 ChatCode creates a repository-specific workspace and opens it automatically.
@@ -122,6 +122,18 @@ chatcode context "Describe the task here"
 
 Each new context clears `patches/incoming.diff` so an old patch is not accidentally reused.
 
+### `chatcode patch-context`
+
+Generate patch-oriented context from the exact current working-tree files:
+
+```text
+chatcode patch-context "Describe the code change here"
+```
+
+This is the preferred command when asking ChatGPT to produce a patch. Relevant files are read directly from disk; modified patch targets are preferentially included in full, while very large files use labeled, symbol-aware excerpts. Every included source file has a SHA-256 digest. Paths in the generated context use forward slashes.
+
+General `chatcode context` behavior remains available for analysis tasks.
+
 ### `chatcode apply`
 
 Apply the default `patches/incoming.diff`.
@@ -149,6 +161,8 @@ chatcode apply --no-review
 ```
 
 ChatCode also strips an outer Markdown `diff`, `patch` or unlabeled code fence from `incoming.diff` before applying it.
+
+Before changing any file, `chatcode apply` runs `git apply --check`. A failed check never partially applies the patch and produces `PATCH_REPAIR_CONTEXT.md` with the error, failed hunks, and exact current working-tree context. ChatCode never uses `git apply --reject`.
 
 ### `chatcode test`
 

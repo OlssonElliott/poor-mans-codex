@@ -6,7 +6,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .context_builder import build_context
+from .context_builder import (
+    build_context,
+    build_patch_context,
+)
 from .context_state import save_context_state
 from .git_utils import (
     GitError,
@@ -86,13 +89,20 @@ def command_status() -> None:
 
 def command_context(
     task: str,
+    patch_oriented: bool = False,
 ) -> None:
     repo = get_repo_root()
 
-    output = build_context(
-        repo,
-        task,
-    )
+    if patch_oriented:
+        output = build_patch_context(
+            repo,
+            task,
+        )
+    else:
+        output = build_context(
+            repo,
+            task,
+        )
 
     save_context_state(
         repo
@@ -459,6 +469,20 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    patch_context_parser = (
+        subparsers.add_parser(
+            "patch-context",
+            help=(
+                "Build patch-oriented context from exact current working-tree files."
+            ),
+        )
+    )
+
+    patch_context_parser.add_argument(
+        "task",
+        help="Describe the patch ChatGPT should generate.",
+    )
+
     apply_parser = (
         subparsers.add_parser(
             "apply",
@@ -570,7 +594,14 @@ def main() -> None:
 
             case "context":
                 command_context(
-                    args.task
+                    args.task,
+                    patch_oriented=False,
+                )
+
+            case "patch-context":
+                command_context(
+                    args.task,
+                    patch_oriented=True,
                 )
 
             case "apply":

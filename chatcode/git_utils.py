@@ -8,7 +8,11 @@ class GitError(RuntimeError):
     pass
 
 
-def run_git(*args: str, cwd: Path | None = None) -> str:
+def _run_git(
+    *args: str,
+    cwd: Path | None = None,
+    strip: bool = True,
+) -> str:
     result = subprocess.run(
         ["git", *args],
         cwd=cwd,
@@ -22,7 +26,14 @@ def run_git(*args: str, cwd: Path | None = None) -> str:
         message = result.stderr.strip() or "Git command failed."
         raise GitError(message)
 
-    return result.stdout.strip()
+    if strip:
+        return result.stdout.strip()
+
+    return result.stdout.rstrip("\r\n")
+
+
+def run_git(*args: str, cwd: Path | None = None) -> str:
+    return _run_git(*args, cwd=cwd)
 
 
 def get_repo_root() -> Path:
@@ -50,10 +61,11 @@ def get_branch(repo: Path) -> str:
 
 
 def get_status(repo: Path) -> str:
-    return run_git(
+    return _run_git(
         "status",
         "--short",
         cwd=repo,
+        strip=False,
     )
 
 
@@ -104,6 +116,28 @@ def get_staged_changed_paths(
         repo,
         staged=True,
     )
+
+
+def get_untracked_paths(
+    repo: Path,
+) -> list[str]:
+    output = run_git(
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "-z",
+        "--",
+        cwd=repo,
+    )
+
+    if not output:
+        return []
+
+    return [
+        path
+        for path in output.split("\0")
+        if path
+    ]
 
 
 def _get_diff(

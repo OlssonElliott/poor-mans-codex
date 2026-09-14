@@ -76,6 +76,15 @@ def get_default_patch_file(
     )
 
 
+def get_repair_context_file(
+    repo: Path,
+) -> Path:
+    return (
+        get_repo_workspace(repo)
+        / "PATCH_REPAIR_CONTEXT.md"
+    )
+
+
 def get_test_results_dir(
     repo: Path,
 ) -> Path:
