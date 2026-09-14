@@ -161,15 +161,16 @@ When this task requires code changes:
 1. Return a valid unified diff that can be applied with `git apply`.
 2. All file paths must be relative to the repository root.
 3. Do not use absolute paths.
-4. Do not include Markdown code fences.
-5. Do not include explanations before or after the patch.
+4. Put the entire patch inside a single Markdown code block labeled `diff`.
+5. Do not include any explanations before or after the code block.
 6. Include all required changes in a single patch.
 7. Preserve unrelated existing changes.
 8. Do not modify `.git` or sensitive files such as `.env`, credentials, private keys or secrets.
 9. For new files, use `/dev/null` as the old file.
 10. For deleted files, use `/dev/null` as the new file.
 
-The response should be directly saveable as `incoming.diff` and applicable with:
+The contents of the code block must be directly saveable as `incoming.diff`
+and applicable with:
 
 chatcode apply
 """

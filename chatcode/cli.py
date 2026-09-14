@@ -93,6 +93,15 @@ def command_context(
         task,
     )
 
+    patch_file = get_default_patch_file(
+        repo
+    )
+
+    patch_file.write_text(
+        "",
+        encoding="utf-8",
+    )
+
     print("Context created:")
     print(output)
     print()

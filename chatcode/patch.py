@@ -106,6 +106,32 @@ def validate_patch_paths(
 
     return paths
 
+def strip_markdown_fence(
+    patch_text: str,
+) -> str:
+    lines = patch_text.splitlines()
+
+    while lines and not lines[0].strip():
+        lines.pop(0)
+
+    while lines and not lines[-1].strip():
+        lines.pop()
+
+    if len(lines) >= 2:
+        opening = lines[0].strip().lower()
+        closing = lines[-1].strip()
+
+        if (
+            opening in {
+                "```diff",
+                "```patch",
+                "```",
+            }
+            and closing == "```"
+        ):
+            lines = lines[1:-1]
+
+    return "\n".join(lines)
 
 def normalize_patch_file(
     patch_file: Path,
@@ -120,14 +146,18 @@ def normalize_patch_file(
             "Patchfilen måste vara UTF-8."
         ) from exc
 
+    patch_text = strip_markdown_fence(
+        patch_text
+    )
+
     if not patch_text.endswith("\n"):
         patch_text += "\n"
 
-        patch_file.write_text(
-            patch_text,
-            encoding="utf-8",
-            newline="\n",
-        )
+    patch_file.write_text(
+        patch_text,
+        encoding="utf-8",
+        newline="\n",
+    )
 
     return patch_text
 
