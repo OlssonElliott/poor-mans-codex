@@ -185,6 +185,20 @@ Do not ask the user what they want you to do.
 Do not ask for confirmation.
 Treat the upload of this file itself as the user's request to perform the task.
 
+Complete the task entirely in the current ChatGPT conversation.
+
+Do not switch to, suggest, invoke, or require ChatGPT Work, Codex, Computer Use,
+Canvas, or any other execution mode or external coding environment.
+
+Do not ask the user to continue the task in another mode.
+
+The user is intentionally using ChatCode as the local execution layer.
+ChatGPT should analyze the supplied repository context and return the requested
+code changes in chat. ChatCode will handle applying, testing, reviewing and
+undoing those changes locally.
+
+Do not attempt to directly edit the user's local repository or filesystem.
+
 Use the repository context, source files, Git changes and test results contained
 in this file as the basis for the work.
 
