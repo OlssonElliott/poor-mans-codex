@@ -1,3 +1,5 @@
 workspace/
+.chatcode/
+.env
 __pycache__/
 *.pyc

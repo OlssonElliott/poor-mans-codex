@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Callable
 from pathlib import Path
 
+from .file_filter import (
+    is_ignored,
+    iter_repository_files,
+)
 from .git_utils import (
     get_branch,
     get_staged_changed_paths,
@@ -13,50 +18,12 @@ from .git_utils import (
     get_unstaged_changed_paths,
     get_unstaged_diff,
 )
+from .indexing.index_manager import IndexProgress, update_project_map
+from .retrieval.graph_retriever import retrieve_files
 from .workspace import (
     get_repo_workspace,
     get_test_results_file,
 )
-
-
-IGNORED_DIRS = {
-    ".git",
-    ".chatcode",
-    ".vite",
-    "node_modules",
-    "vendor",
-    "target",
-    "dist",
-    "build",
-    "tmp",
-    ".idea",
-    ".vscode",
-    "__pycache__",
-    ".venv",
-    "venv",
-    ".aws",
-    ".ssh",
-}
-
-
-SECRET_FILENAMES = {
-    "credentials.json",
-    "secrets.json",
-    "service-account.json",
-    "serviceaccount.json",
-    ".npmrc",
-    ".pypirc",
-}
-
-
-SECRET_SUFFIXES = {
-    ".pem",
-    ".key",
-    ".p12",
-    ".pfx",
-    ".jks",
-    ".keystore",
-}
 
 
 SOURCE_SUFFIXES = {
@@ -300,40 +267,6 @@ BEARER_TOKEN_PATTERN = re.compile(
 )
 
 
-def is_secret(path: Path) -> bool:
-    name = path.name.lower()
-
-    if name == ".env":
-        return True
-
-    if name.startswith(".env."):
-        return True
-
-    if name in SECRET_FILENAMES:
-        return True
-
-    if path.suffix.lower() in SECRET_SUFFIXES:
-        return True
-
-    return False
-
-
-def is_ignored(
-    path: Path,
-    repo: Path,
-) -> bool:
-    try:
-        relative = path.relative_to(repo)
-    except ValueError:
-        return True
-
-    for part in relative.parts:
-        if part.lower() in IGNORED_DIRS:
-            return True
-
-    return is_secret(path)
-
-
 def build_safe_status(
     repo: Path,
 ) -> str:
@@ -425,12 +358,7 @@ def build_tree(
     lines: list[str] = []
     file_count = 0
 
-    for path in sorted(repo.rglob("*")):
-        if is_ignored(path, repo):
-            continue
-
-        if path.is_dir():
-            continue
+    for path in iter_repository_files(repo):
 
         file_count += 1
 
@@ -561,21 +489,24 @@ def score_file(
 def collect_relevant_files(
     repo: Path,
     task: str,
+    index_progress: Callable[[IndexProgress], None] | None = None,
 ) -> list[Path]:
+    # Synchronizing here also catches edits made manually since the previous
+    # ChatCode invocation. Indexing is an enhancement, so a damaged/unwritable
+    # cache must not prevent the established retrieval path from working.
+    graph_files: list[Path] = []
+    try:
+        update_project_map(repo, progress=index_progress)
+        graph_files = retrieve_files(repo, task, max_files=MAX_FILES)
+    except Exception:
+        graph_files = []
+
     task_words = get_task_words(task)
     changed_files = get_changed_files(repo)
 
-    candidates: list[
-        tuple[int, Path]
-    ] = []
+    candidate_scores: dict[Path, int] = {}
 
-    for path in repo.rglob("*"):
-        if not path.is_file():
-            continue
-
-        if is_ignored(path, repo):
-            continue
-
+    for path in iter_repository_files(repo):
         if not is_source_file(path):
             continue
 
@@ -587,20 +518,27 @@ def collect_relevant_files(
         )
 
         if score > 0:
-            candidates.append(
-                (score, path)
-            )
+            candidate_scores[path] = score
 
-    candidates.sort(
+    # Graph hits complement keyword/content scoring. Earlier graph results get
+    # a larger boost while dirty files retain their existing highest priority.
+    for rank, path in enumerate(graph_files):
+        candidate_scores[path] = candidate_scores.get(path, 0) + max(
+            100,
+            300 - rank * 15,
+        )
+
+    candidates = sorted(
+        candidate_scores.items(),
         key=lambda item: (
-            -item[0],
-            str(item[1]).lower(),
+            -item[1],
+            str(item[0]).lower(),
         )
     )
 
     return [
         path
-        for _, path
+        for path, _
         in candidates[:MAX_FILES]
     ]
 
@@ -608,10 +546,12 @@ def collect_relevant_files(
 def build_source_context(
     repo: Path,
     task: str,
+    index_progress: Callable[[IndexProgress], None] | None = None,
 ) -> str:
     files = collect_relevant_files(
         repo,
         task,
+        index_progress=index_progress,
     )
 
     sections: list[str] = []
@@ -799,11 +739,16 @@ def build_patch_source_context(
 def build_patch_context(
     repo: Path,
     task: str,
+    index_progress: Callable[[IndexProgress], None] | None = None,
 ) -> Path:
     output_file = get_repo_workspace(repo) / "UPLOAD_TO_CHATGPT.md"
     repo_display = repo.resolve().as_posix()
     status = build_safe_status(repo).replace("\\", "/")
-    files = collect_relevant_files(repo, task)
+    files = collect_relevant_files(
+        repo,
+        task,
+        index_progress=index_progress,
+    )
     source_context = build_patch_source_context(
         repo,
         task,
@@ -950,6 +895,7 @@ def build_failed_test_context(
 def build_context(
     repo: Path,
     task: str,
+    index_progress: Callable[[IndexProgress], None] | None = None,
 ) -> Path:
     output_dir = get_repo_workspace(repo)
 
@@ -976,6 +922,7 @@ def build_context(
         build_source_context(
             repo,
             task,
+            index_progress=index_progress,
         )
     )
 

@@ -727,6 +727,16 @@ def apply_patch(
             f"historiken:\n{exc}"
         ) from exc
 
+    # Keep the persistent map current immediately after an apply. Failure to
+    # update this derived cache must never turn a successful patch into a
+    # reported patch failure; the next context command will repair it by hash.
+    try:
+        from .indexing.index_manager import update_project_map
+
+        update_project_map(repo, paths=paths, run_semantic=False)
+    except Exception:
+        pass
+
     return ApplyResult(
         paths=paths,
         history_entry=history_entry,

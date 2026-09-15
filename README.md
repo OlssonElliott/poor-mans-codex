@@ -9,6 +9,7 @@ ChatCode does not use the OpenAI API. Instead, it packages relevant repository c
 ## Features
 
 - Builds task-specific context from the current Git repository
+- Maintains a persistent, incrementally updated project graph
 - Includes local staged and unstaged changes
 - Filters common secret files and redacts common secret patterns
 - Applies unified diffs with `git apply`
@@ -133,6 +134,40 @@ chatcode patch-context "Describe the code change here"
 This is the preferred command when asking ChatGPT to produce a patch. Relevant files are read directly from disk; modified patch targets are preferentially included in full, while very large files use labeled, symbol-aware excerpts. Every included source file has a SHA-256 digest. Paths in the generated context use forward slashes.
 
 General `chatcode context` behavior remains available for analysis tasks.
+
+Both context commands synchronize `project-map.json` in the target repository's
+ChatCode workspace. The compact index stores file hashes, summaries, tags,
+high-level symbols, imports and direct source dependencies. It is not written
+inside the target repository. Unchanged files are not reanalyzed, so edits made
+manually in an IDE are detected on the next context command without requiring
+`chatcode apply`.
+
+Python is analyzed with its standard AST. JavaScript/TypeScript and the other
+currently indexed code suffixes use a conservative structural fallback. File
+metadata ranking and shallow dependency expansion supplement the existing
+filename, content and Git-change ranking. Low-level calls and state accesses are
+not persisted.
+
+Optional semantic indexing uses a local Qwen model through Ollama. It is off by
+default; enable it in ChatCode's local `.env` (copy `.env.example`) by setting
+`CHATCODE_QWEN_ENABLED=true`, or set both variables for a terminal session:
+
+```powershell
+$env:CHATCODE_QWEN_MODEL = "qwen2.5-coder:7b"
+$env:CHATCODE_QWEN_ENABLED = "true"
+chatcode context "why does the door reopen?"
+```
+
+Qwen only returns validated semantic relations and never writes code. Missing
+Ollama, timeouts, invalid JSON and low-confidence responses are ignored, leaving
+the deterministic graph available.
+
+The deterministic map is saved before Qwen starts. Semantic state is cached per
+file using its source hash, model name and analyzer version, and each completed
+file is checkpointed atomically. Context generation shows semantic progress and
+an approximate ETA. If it is interrupted, rerunning the command resumes pending
+files without repeating completed work. `chatcode apply` updates the static map
+immediately and leaves semantic enrichment for the next context command.
 
 ### `chatcode apply`
 

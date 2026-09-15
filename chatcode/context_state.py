@@ -4,7 +4,7 @@ import hashlib
 import json
 from pathlib import Path, PurePosixPath
 
-from .context_builder import is_ignored
+from .file_filter import is_ignored
 from .git_utils import (
     get_branch,
     run_git,

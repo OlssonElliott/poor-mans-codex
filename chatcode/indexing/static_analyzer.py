@@ -1,0 +1,107 @@
+from __future__ import annotations
+
+import ast
+import re
+from pathlib import Path
+from typing import Any
+
+
+MAX_SYMBOLS = 100
+MAX_IMPORTS = 100
+
+
+class _PythonVisitor(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.symbols: list[dict[str, str]] = []
+        self.imports: list[str] = []
+        self.class_name: str | None = None
+        self.function_depth = 0
+
+    def _symbol(self, name: str, qualified: str, kind: str) -> None:
+        if len(self.symbols) < MAX_SYMBOLS:
+            self.symbols.append({
+                "name": name,
+                "qualified_name": qualified,
+                "kind": kind,
+            })
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        if self.function_depth == 0:
+            qualified = f"{self.class_name}.{node.name}" if self.class_name else node.name
+            self._symbol(node.name, qualified, "method" if self.class_name else "function")
+        self.function_depth += 1
+        self.generic_visit(node)
+        self.function_depth -= 1
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self.visit_FunctionDef(node)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        if self.function_depth:
+            return
+        previous = self.class_name
+        qualified = f"{previous}.{node.name}" if previous else node.name
+        self._symbol(node.name, qualified, "class")
+        self.class_name = qualified
+        self.generic_visit(node)
+        self.class_name = previous
+
+    def visit_Import(self, node: ast.Import) -> None:
+        self.imports.extend(alias.name for alias in node.names)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        base = "." * node.level + (node.module or "")
+        if base:
+            self.imports.append(base)
+        for alias in node.names:
+            if alias.name != "*":
+                separator = "" if base.endswith(".") else "."
+                self.imports.append(f"{base}{separator}{alias.name}")
+
+
+GENERIC_SYMBOL = re.compile(
+    r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?"
+    r"(?:(class|interface|function)\s+([A-Za-z_$][\w$]*)|"
+    r"(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\([^)]*\)\s*=>)",
+    re.MULTILINE,
+)
+GENERIC_IMPORT = re.compile(
+    r"(?:import\s+(?:[^;]*?\s+from\s+)?|require\s*\(\s*)['\"]([^'\"]+)['\"]"
+)
+
+
+def _analyze_generic(text: str) -> dict[str, Any]:
+    symbols: list[dict[str, str]] = []
+    for match in GENERIC_SYMBOL.finditer(text):
+        kind = match.group(1) or "function"
+        name = match.group(2) or match.group(3)
+        symbols.append({"name": name, "qualified_name": name, "kind": kind})
+        if len(symbols) >= MAX_SYMBOLS:
+            break
+    return {
+        "language": "javascript_typescript",
+        "symbols": symbols,
+        "imports": list(dict.fromkeys(GENERIC_IMPORT.findall(text)))[:MAX_IMPORTS],
+    }
+
+
+def analyze_file(path: Path, repo: Path) -> dict[str, Any]:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if path.suffix.lower() == ".py":
+        try:
+            tree = ast.parse(text, filename=path.relative_to(repo).as_posix())
+        except SyntaxError as exc:
+            return {
+                "language": "python",
+                "symbols": [],
+                "imports": [],
+                "error": str(exc),
+            }
+        visitor = _PythonVisitor()
+        visitor.visit(tree)
+        return {
+            "language": "python",
+            "symbols": visitor.symbols[:MAX_SYMBOLS],
+            "imports": list(dict.fromkeys(visitor.imports))[:MAX_IMPORTS],
+        }
+    return _analyze_generic(text)

@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from .context_builder import (
+    build_safe_status,
     build_context,
     build_patch_context,
 )
@@ -15,7 +16,6 @@ from .git_utils import (
     GitError,
     get_branch,
     get_repo_root,
-    get_status,
 )
 from .history import (
     HistoryError,
@@ -24,6 +24,7 @@ from .history import (
     review_history_by_index,
     update_history_test_result,
 )
+from .indexing.index_manager import IndexProgress, SemanticIndexInterrupted
 from .patch import (
     PatchAlreadyApplied,
     PatchError,
@@ -78,7 +79,7 @@ def command_status() -> None:
     )
     print()
 
-    status = get_status(repo)
+    status = build_safe_status(repo)
 
     if status:
         print("Changes:")
@@ -87,21 +88,96 @@ def command_status() -> None:
         print("Working tree clean.")
 
 
+class ConsoleIndexReporter:
+    def __init__(self) -> None:
+        self._progress_line = False
+        self._initial = False
+
+    def _finish_progress_line(self) -> None:
+        if self._progress_line:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            self._progress_line = False
+
+    def __call__(self, event: IndexProgress) -> None:
+        if event.phase == "index" and event.status == "initial":
+            self._initial = True
+            print("Project map not found. Building initial project index...")
+        elif event.phase == "scan" and event.status == "started":
+            print("Scanning project files...")
+        elif event.phase == "index" and event.status == "updating":
+            print("Project changes detected. Updating project index...")
+        elif event.phase == "index" and event.status == "up_to_date":
+            print("Project index up to date.")
+        elif event.phase == "static" and event.status == "complete":
+            print(f"Static analysis complete: {event.total} source files.")
+        elif event.phase == "static" and event.status == "saved":
+            print("Project map saved.")
+            if self._initial:
+                print(f"Project index created: {event.total} source files.")
+            else:
+                print(
+                    "Project index updated: "
+                    f"{event.changed} changed, {event.added} new, "
+                    f"{event.deleted} removed."
+                )
+        elif event.phase == "semantic" and event.status == "started":
+            print(f"Running semantic analysis with {event.model}...")
+        elif event.phase == "semantic" and event.status == "progress":
+            width = 20
+            filled = round(width * event.completed / event.total) if event.total else width
+            bar = "█" * filled + "░" * (width - filled)
+            details = (
+                f"Semantic indexing [{bar}] "
+                f"{event.completed}/{event.total}"
+            )
+            if event.current_file:
+                details += f" | {event.current_file}"
+            if event.eta_seconds is not None:
+                if event.eta_seconds < 60:
+                    details += f" | ~{round(event.eta_seconds)}s remaining"
+                else:
+                    details += f" | ~{round(event.eta_seconds / 60)}m remaining"
+            sys.stdout.write("\r" + details.ljust(120))
+            sys.stdout.flush()
+            self._progress_line = True
+        elif event.phase == "semantic" and event.status == "complete":
+            self._finish_progress_line()
+            if self._initial:
+                print(f"Semantic analysis complete: {event.completed} files.")
+            else:
+                print(f"Semantic analysis updated: {event.processed} files.")
+            if event.failed:
+                print(
+                    f"Qwen semantic analysis failed for {event.failed} files; "
+                    "continuing with static index."
+                )
+        elif event.phase == "semantic" and event.status == "interrupted":
+            self._finish_progress_line()
+            print("Semantic indexing interrupted by user.")
+            print(
+                f"Progress saved: {event.completed}/{event.total} files completed."
+            )
+
+
 def command_context(
     task: str,
     patch_oriented: bool = False,
 ) -> None:
     repo = get_repo_root()
+    reporter = ConsoleIndexReporter()
 
     if patch_oriented:
         output = build_patch_context(
             repo,
             task,
+            index_progress=reporter,
         )
     else:
         output = build_context(
             repo,
             task,
+            index_progress=reporter,
         )
 
     save_context_state(
@@ -647,6 +723,13 @@ def main() -> None:
 
             case _:
                 parser.print_help()
+
+    except SemanticIndexInterrupted:
+        sys.exit(130)
+
+    except KeyboardInterrupt:
+        print("\nChatCode interrupted by user.", file=sys.stderr)
+        sys.exit(130)
 
     except (
         GitError,
