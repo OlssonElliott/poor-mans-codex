@@ -94,6 +94,12 @@ def is_ignored(path: Path, repo: Path) -> bool:
         relative = path.relative_to(repo)
     except ValueError:
         return True
+    # A file symlink is still yielded by os.walk even with followlinks=False.
+    # Never let a repository-relative link read content outside the repository.
+    try:
+        path.resolve().relative_to(repo.resolve())
+    except (OSError, ValueError):
+        return True
     return any(is_excluded_directory_name(part) for part in relative.parts) or is_secret(path)
 
 

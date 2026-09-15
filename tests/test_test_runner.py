@@ -7,7 +7,9 @@ from unittest.mock import patch
 
 from chatcode.test_runner import (
     TestError as ChatCodeTestError,
+    _failed_test_ids,
     detect_test_command,
+    run_relevant_tests,
 )
 
 
@@ -19,7 +21,7 @@ class TestCommandDetectionTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def test_python_project_with_tests_directory_uses_pytest(self) -> None:
+    def test_python_project_with_tests_directory_uses_unittest_without_pytest_config(self) -> None:
         (self.repo / "pyproject.toml").write_text(
             "[project]\nname = \"demo\"\n",
             encoding="utf-8",
@@ -39,7 +41,10 @@ class TestCommandDetectionTests(unittest.TestCase):
             [
                 "python-test",
                 "-m",
-                "pytest",
+                "unittest",
+                "discover",
+                "-s",
+                "tests",
             ],
         )
 
@@ -89,6 +94,62 @@ class TestCommandDetectionTests(unittest.TestCase):
             detect_test_command(
                 self.repo
             )
+
+    def test_relevant_unittest_file_is_run_before_full_suite(self) -> None:
+        (self.repo / "pyproject.toml").write_text(
+            "[project]\nname = \"demo\"\n",
+            encoding="utf-8",
+        )
+        tests = self.repo / "tests"
+        tests.mkdir()
+        (tests / "test_widget.py").write_text(
+            "# fixture\n",
+            encoding="utf-8",
+        )
+
+        with patch(
+            "chatcode.test_runner._project_python",
+            return_value="python-test",
+        ), patch(
+            "chatcode.test_runner._run_test_command",
+        ) as run:
+            run_relevant_tests(self.repo, {"package/widget.py"})
+
+        command = run.call_args.args[1]
+        self.assertEqual(
+            command.args,
+            [
+                "python-test", "-m", "unittest", "discover",
+                "-s", "tests", "-p", "test_widget.py",
+            ],
+        )
+
+    def test_relevant_tests_do_not_guess_ambiguous_mapping(self) -> None:
+        (self.repo / "pyproject.toml").write_text(
+            "[project]\nname = \"demo\"\n",
+            encoding="utf-8",
+        )
+        tests = self.repo / "tests"
+        (tests / "one").mkdir(parents=True)
+        (tests / "two").mkdir()
+        (tests / "one" / "test_widget.py").write_text("", encoding="utf-8")
+        (tests / "two" / "test_widget.py").write_text("", encoding="utf-8")
+
+        self.assertIsNone(
+            run_relevant_tests(self.repo, {"package/widget.py"})
+        )
+
+    def test_failure_parser_ignores_unittest_aggregate_summary(self) -> None:
+        failures = _failed_test_ids(
+            "FAIL: test_drop (tests.test_world.WorldTests.test_drop)\n"
+            "FAILED (failures=1, errors=0)\n",
+            "",
+        )
+
+        self.assertEqual(
+            failures,
+            frozenset({"tests.test_world.WorldTests.test_drop"}),
+        )
 
 
 if __name__ == "__main__":

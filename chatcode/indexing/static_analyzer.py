@@ -85,8 +85,15 @@ def _analyze_generic(text: str) -> dict[str, Any]:
     }
 
 
-def analyze_file(path: Path, repo: Path) -> dict[str, Any]:
-    text = path.read_text(encoding="utf-8", errors="replace")
+def analyze_file(
+    path: Path,
+    repo: Path,
+    source: str | None = None,
+) -> dict[str, Any]:
+    """Analyze a caller-supplied source snapshot when one is available."""
+    text = source if source is not None else path.read_text(
+        encoding="utf-8", errors="replace"
+    )
     if path.suffix.lower() == ".py":
         try:
             tree = ast.parse(text, filename=path.relative_to(repo).as_posix())

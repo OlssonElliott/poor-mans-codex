@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+import uuid
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 
@@ -18,13 +20,16 @@ from .git_utils import (
     get_unstaged_changed_paths,
     get_unstaged_diff,
 )
+from .context_state import save_context_state
 from .indexing.index_manager import IndexProgress, update_project_map
 from .indexing.project_graph import load_map, save_map
 from .retrieval.graph_retriever import retrieve_files
 from .workspace import (
+    atomic_write_text,
     get_repo_workspace,
     get_test_results_file,
 )
+from . import workspace
 
 
 SOURCE_SUFFIXES = {
@@ -124,8 +129,11 @@ MAX_FILES = 12
 MAX_FILE_CHARS = 20_000
 MAX_TOTAL_CHARS = 120_000
 MAX_TEST_RESULT_CHARS = 60_000
-PATCH_FULL_FILE_CHARS = 80_000
-PATCH_EXCERPT_RADIUS = 45
+PATCH_FULL_FILE_CHARS = 20_000
+PATCH_DIRTY_FULL_FILE_CHARS = 48_000
+PATCH_EXCERPT_RADIUS = 32
+PATCH_CONTEXT_BUDGET_CHARS = 90_000
+PATCH_DEPENDENCY_RESERVE_RATIO = 0.25
 CONTEXT_CAPTURE_RETRIES = 3
 
 CONTEXT_PURPOSE = (
@@ -147,6 +155,9 @@ When this task requires code changes:
 10. For deleted files, use `/dev/null` as the new file.
 11. Build `@@` hunk line numbers from the source-file line ranges shown in the
     FILE/EXCERPT blocks, never from Markdown/document line numbers.
+12. For a change inside an existing file, include at least three unchanged
+    context lines when those lines exist. Never return a one-line hunk based
+    only on a guessed line number.
 
 The contents of the code block must be directly saveable as `incoming.diff`
 and applicable with:
@@ -368,7 +379,9 @@ def _internal_workspace_root(repo: Path) -> Path | None:
     """Return ChatCode state root when that state lives inside the target repo."""
     repo_root = repo.resolve()
     try:
-        repo_workspace = get_repo_workspace(repo).resolve()
+        # Resolve through the module so the workspace provider remains the
+        # single authority (and can be replaced by an embedding application).
+        repo_workspace = workspace.get_repo_workspace(repo).resolve()
     except OSError:
         return None
 
@@ -558,6 +571,27 @@ def _resolve_task_file_references(
             resolved.append(matches[0])
 
     return resolved
+
+
+def _ambiguous_task_file_paths(repo: Path, task: str) -> set[Path]:
+    """Find bare filename references that cannot be resolved safely."""
+    bare_filenames = [
+        token.replace("\\", "/")
+        for token in _task_file_tokens(task)
+        if "/" not in token.replace("\\", "/") and "." in token
+    ]
+    if not bare_filenames:
+        return set()
+    candidates = [path.resolve() for path in _iter_context_files(repo)]
+    ambiguous: set[Path] = set()
+    for normalized in bare_filenames:
+        matches = [
+            path for path in candidates
+            if path.name.casefold() == normalized.casefold()
+        ]
+        if len(matches) > 1:
+            ambiguous.update(matches)
+    return ambiguous
 
 
 def _ensure_explicit_task_files(
@@ -813,6 +847,7 @@ def collect_relevant_files(
     task_words = get_task_words(task)
     changed_files = get_changed_files(repo)
     explicit_files = _resolve_task_file_references(repo, task)
+    ambiguous_files = _ambiguous_task_file_paths(repo, task)
 
     if effective_mode == "ai":
         # AI retrieval is the primary selector in AI mode. Do not also scan
@@ -824,7 +859,9 @@ def collect_relevant_files(
             and is_source_file(path)
             and not _is_context_internal_artifact(path, repo)
         )
-        selected: list[Path] = list(changed_source_files)
+        selected: list[Path] = [
+            path for path in changed_source_files if path not in ambiguous_files
+        ]
         for path in explicit_files:
             if path not in selected:
                 selected.append(path)
@@ -833,7 +870,12 @@ def collect_relevant_files(
             len(selected),
         )
         for path in graph_files:
-            if path.is_file() and is_source_file(path) and path not in selected:
+            if (
+                path.is_file()
+                and is_source_file(path)
+                and path not in ambiguous_files
+                and path not in selected
+            ):
                 selected.append(path)
             if len(selected) >= selection_limit:
                 break
@@ -842,6 +884,8 @@ def collect_relevant_files(
     candidate_scores: dict[Path, int] = {}
 
     for path in _iter_context_files(repo):
+        if path.resolve() in ambiguous_files:
+            continue
         if not is_source_file(path):
             continue
 
@@ -858,6 +902,8 @@ def collect_relevant_files(
     # Graph hits complement keyword/content scoring. Earlier graph results get
     # a larger boost while dirty files retain their existing highest priority.
     for rank, path in enumerate(graph_files):
+        if path in ambiguous_files:
+            continue
         candidate_scores[path] = candidate_scores.get(path, 0) + max(
             100,
             300 - rank * 15,
@@ -878,7 +924,7 @@ def collect_relevant_files(
         and is_source_file(path)
         and not _is_context_internal_artifact(path, repo)
     )
-    selected = list(changed_source_files)
+    selected = [path for path in changed_source_files if path not in ambiguous_files]
     for path in explicit_files:
         if path not in selected:
             selected.append(path)
@@ -912,10 +958,7 @@ def build_source_context(
 
     for path in files:
         try:
-            content = path.read_text(
-                encoding="utf-8",
-                errors="replace",
-            )
+            content, _digest = _read_current_text_and_hash(path)
         except OSError:
             continue
 
@@ -957,6 +1000,12 @@ def build_source_context(
 def _read_current_text_and_hash(
     path: Path,
 ) -> tuple[str, str]:
+    """Return one authoritative working-tree snapshot of ``path``.
+
+    Context rendering must never consult Git blobs or the project-map cache for
+    source text.  Keeping the decode and digest tied to the same byte read also
+    prevents a hash from describing a different revision than the text below it.
+    """
     data = path.read_bytes()
     return (
         data.decode("utf-8", errors="replace"),
@@ -984,16 +1033,37 @@ def _merge_line_ranges(
     ]
 
 
+def _configured_positive_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _context_budget_chars() -> int:
+    return _configured_positive_int(
+        "CHATCODE_CONTEXT_BUDGET_CHARS",
+        PATCH_CONTEXT_BUDGET_CHARS,
+    )
+
+
 def _symbol_aware_ranges(
     content: str,
     task: str,
+    *,
+    test_file: bool = False,
 ) -> list[tuple[int, int]]:
     lines = content.splitlines()
     count = len(lines)
     task_words = get_task_words(task)
     matches: set[int] = set()
     definition = re.compile(
-        r"^\s*(?:async\s+)?(?:def|class|function|interface|type|enum|struct|trait)\s+([A-Za-z_][A-Za-z0-9_]*)"
+        r"^\s*(?:async\s+)?(?:def|class|function|interface|type|enum|struct|trait)\s+"
+        r"([A-Za-z_][A-Za-z0-9_]*)"
     )
     symbols: set[str] = set()
 
@@ -1005,7 +1075,14 @@ def _symbol_aware_ranges(
             if found:
                 symbols.add(found.group(1))
 
-    # References to matched definitions are useful caller/callee clues.
+    if test_file and task_words:
+        for index, line in enumerate(lines, start=1):
+            lowered = line.lower()
+            if ("test" in lowered or "spec" in lowered) and any(
+                word in lowered for word in task_words
+            ):
+                matches.add(index)
+
     if symbols:
         for index, line in enumerate(lines, start=1):
             if any(
@@ -1018,15 +1095,16 @@ def _symbol_aware_ranges(
     import_end = 0
     for index, line in enumerate(lines[:200], start=1):
         stripped = line.lstrip()
-        if stripped.startswith(
-            ("import ", "from ", "#include", "using ")
-        ):
+        if stripped.startswith(("import ", "from ", "#include", "using ")):
             import_end = index
     if import_end:
         ranges.append((1, min(count, import_end + 8)))
 
     if not matches:
-        matches.add(1)
+        fallback_end = min(count, PATCH_EXCERPT_RADIUS * 2 + 1)
+        return _merge_line_ranges(
+            [*ranges, (1, fallback_end)] if count else ranges
+        )
 
     for line_number in matches:
         ranges.append((
@@ -1035,6 +1113,83 @@ def _symbol_aware_ranges(
         ))
 
     return _merge_line_ranges(ranges)
+
+
+def _render_patch_file_context(
+    repo: Path,
+    path: Path,
+    task: str,
+    changed_files: set[Path],
+    explicit_files: set[Path],
+) -> str:
+    content, digest = _read_current_text_and_hash(path)
+    relative = path.relative_to(repo).as_posix()
+    line_count = max(1, len(content.splitlines()))
+    include_full = (
+        len(content) <= PATCH_FULL_FILE_CHARS
+        or (
+            path in explicit_files
+            and len(content) <= PATCH_DIRTY_FULL_FILE_CHARS
+        )
+    )
+    if include_full:
+        diagnostic = ""
+        if os.getenv("CHATCODE_DEBUG_CONTEXT", "").strip():
+            dirty = "yes" if path in changed_files else "no"
+            diagnostic = f"Source: working-tree; dirty={dirty}; sha256={digest}\n"
+        return (
+            f"===== FULL FILE: {relative} =====\n"
+            f"SHA-256: {digest}\n"
+            f"{diagnostic}"
+            f"Source line range: 1-{line_count}\n\n"
+            f"{content}\n"
+        )
+
+    lines = content.splitlines(keepends=True)
+    excerpts = []
+    test_file = "test" in path.stem.casefold() or "spec" in path.stem.casefold()
+    for start, end in _symbol_aware_ranges(
+        content,
+        task,
+        test_file=test_file,
+    ):
+        excerpts.append(
+            f"----- EXCERPT {relative} source lines {start}-{end} -----\n"
+            + "".join(lines[start - 1:end])
+        )
+    return (
+        f"===== SYMBOL CONTEXT: {relative} =====\n"
+        f"SHA-256 (complete source file): {digest}\n"
+        + "\n".join(excerpts)
+        + "\n"
+    )
+
+
+def _dependency_paths(repo: Path, files: list[Path]) -> set[Path]:
+    try:
+        graph = load_map(repo)
+    except Exception:
+        return set()
+    entries = graph.get("files", {})
+    if not isinstance(entries, dict):
+        return set()
+    selected = {
+        path.relative_to(repo).as_posix()
+        for path in files
+        if path.is_file()
+    }
+    dependencies: set[Path] = set()
+    for relative in selected:
+        entry = entries.get(relative, {})
+        if not isinstance(entry, dict):
+            continue
+        for raw_dependency in entry.get("dependencies", []):
+            if not isinstance(raw_dependency, str):
+                continue
+            candidate = (repo / raw_dependency).resolve()
+            if candidate.is_file():
+                dependencies.add(candidate)
+    return dependencies
 
 
 def build_patch_source_context(
@@ -1046,49 +1201,43 @@ def build_patch_source_context(
         files = collect_relevant_files(repo, task)
 
     changed_files = get_changed_files(repo)
-    explicit_files = set(
-        _resolve_task_file_references(repo, task)
-    )
-    sections: list[str] = []
+    explicit_files = set(_resolve_task_file_references(repo, task))
+    dependencies = _dependency_paths(repo, files)
+    ordered = list(dict.fromkeys([
+        *[path for path in files if path in explicit_files],
+        *[path for path in files if path in changed_files],
+        *files,
+        *sorted(dependencies),
+    ]))
 
-    for path in files:
+    budget = _context_budget_chars()
+    dependency_reserve = int(budget * PATCH_DEPENDENCY_RESERVE_RATIO)
+    primary_budget = max(1, budget - dependency_reserve)
+    sections: list[str] = []
+    used = 0
+
+    for path in ordered:
         try:
-            content, digest = (
-                _read_current_text_and_hash(path)
+            section = _render_patch_file_context(
+                repo,
+                path,
+                task,
+                changed_files,
+                explicit_files,
             )
         except OSError:
             continue
 
-        relative = path.relative_to(repo).as_posix()
-        include_full = (
-            len(content) <= PATCH_FULL_FILE_CHARS
-            or path in changed_files
-            or path in explicit_files
+        supporting_dependency = (
+            path in dependencies
+            and path not in explicit_files
+            and path not in changed_files
         )
-
-        if include_full:
-            section = (
-                f"===== FULL FILE: {relative} =====\n"
-                f"SHA-256: {digest}\n"
-                f"Source line range: 1-{max(1, len(content.splitlines()))}\n\n"
-                f"{content}\n"
-            )
-        else:
-            lines = content.splitlines(keepends=True)
-            excerpts: list[str] = []
-            for start, end in _symbol_aware_ranges(content, task):
-                excerpts.append(
-                    f"----- EXCERPT {relative} source lines {start}-{end} -----\n"
-                    + "".join(lines[start - 1:end])
-                )
-            section = (
-                f"===== EXCERPTS FROM CURRENT FILE: {relative} =====\n"
-                f"SHA-256 (complete source file): {digest}\n"
-                + "\n".join(excerpts)
-                + "\n"
-            )
-
+        limit = budget if supporting_dependency else primary_budget
+        if used + len(section) > limit:
+            continue
         sections.append(section)
+        used += len(section)
 
     return "\n".join(sections) or "No relevant source files found."
 
@@ -1107,22 +1256,46 @@ def _current_file_hashes(
     return hashes
 
 
+def _captured_source_paths(repo: Path, files: list[Path]) -> list[Path]:
+    """Return every working-tree file that may be emitted in source context.
+
+    Dependencies are selected from cached graph metadata, but their contents
+    are loaded from disk.  They must therefore participate in the same
+    before/after integrity check as primary files.
+    """
+    return list(dict.fromkeys([
+        *files,
+        *sorted(_dependency_paths(repo, files)),
+    ]))
+
+
 def _build_stable_patch_source_context(
     repo: Path,
     task: str,
     files: list[Path],
-) -> str:
+) -> tuple[str, dict[str, str]]:
     """Read source from disk and retry if it changes during context capture."""
     for _attempt in range(CONTEXT_CAPTURE_RETRIES):
-        before = _current_file_hashes(files)
+        captured_paths = _captured_source_paths(repo, files)
+        before = _current_file_hashes(captured_paths)
         source_context = build_patch_source_context(
             repo,
             task,
             files=files,
         )
-        after = _current_file_hashes(files)
+        # Re-resolve dependencies in case graph metadata was refreshed while
+        # rendering, then verify every path that could have been emitted.
+        captured_paths = list(dict.fromkeys([
+            *captured_paths,
+            *_captured_source_paths(repo, files),
+        ]))
+        after = _current_file_hashes(captured_paths)
         if before == after:
-            return source_context
+            return source_context, {
+                path.relative_to(repo).as_posix(): digest
+                for path, digest in after.items()
+                if digest is not None
+            }
 
     raise RuntimeError(
         "Source files changed while ChatCode was building context. "
@@ -1148,7 +1321,7 @@ def build_patch_context(
         task,
         files,
     )
-    source_context = _build_stable_patch_source_context(
+    source_context, source_hashes = _build_stable_patch_source_context(
         repo,
         task,
         files,
@@ -1190,11 +1363,16 @@ def build_patch_context(
         "Patch only against the current contents above; do not reconstruct files from Git history or a separate diff.",
         "",
     ]
-    output_file.write_text(
-        "\n".join(parts),
-        encoding="utf-8",
-        newline="\n",
+    content = "\n".join(parts)
+    save_context_state(
+        repo,
+        task=task,
+        source_hashes=source_hashes,
+        context_sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        generation_id=uuid.uuid4().hex,
     )
+    # Publish last: watchers cannot observe this generation before its hashes.
+    atomic_write_text(output_file, content, newline="\n")
     return output_file
 
 
@@ -1330,14 +1508,17 @@ def build_context(
         task,
         files,
     )
-    source_context = _build_stable_patch_source_context(
+    failed_tests = (
+        build_failed_test_context(repo)
+    )
+
+    # Capture source last: it is the only material sent as an authoritative
+    # patch target, and this keeps its final hash recheck immediately before
+    # the generated context is finalized.
+    source_context, source_hashes = _build_stable_patch_source_context(
         repo,
         task,
         files,
-    )
-
-    failed_tests = (
-        build_failed_test_context(repo)
     )
 
     parts = [
@@ -1391,9 +1572,14 @@ def build_context(
 
     content = "\n".join(parts)
 
-    output_file.write_text(
-        content,
-        encoding="utf-8",
+    save_context_state(
+        repo,
+        task=task,
+        source_hashes=source_hashes,
+        context_sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        generation_id=uuid.uuid4().hex,
     )
+    # Publish last: watchers cannot observe this generation before its hashes.
+    atomic_write_text(output_file, content, newline="\n")
 
     return output_file

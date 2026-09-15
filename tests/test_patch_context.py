@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import subprocess
 import tempfile
 import unittest
@@ -15,15 +16,18 @@ from chatcode.context_builder import (
     UPLOAD_INSTRUCTIONS,
     build_context,
     build_patch_context,
+    build_patch_source_context,
     build_tree,
     collect_relevant_files,
 )
-from chatcode.context_state import save_context_state
+from chatcode.context_state import get_stale_context_reason, save_context_state
+from chatcode.cli import command_repair
 from chatcode.indexing.project_graph import load_map, save_map
 from chatcode.patch import PatchError, apply_patch, build_patch_repair_context
 from chatcode.workspace import (
     get_default_patch_file,
     get_repair_context_file,
+    get_repo_workspace,
 )
 
 
@@ -405,18 +409,24 @@ class PatchContextTests(unittest.TestCase):
         internal_file.parent.mkdir(parents=True, exist_ok=True)
         internal_file.write_text("def other():\n    pass\n", encoding="utf-8")
 
-        save_map(self.repo, {
-            "version": 2,
-            "files": {
-                "workspace/other-project/app.py": {
-                    "path": "workspace/other-project/app.py",
-                    "hash": "stale",
-                    "language": "python",
-                }
-            },
-        })
-
         update = Mock(effective_mode="ai")
+        with patch(
+            "chatcode.workspace.get_workspace_root",
+            return_value=internal_workspace,
+        ):
+            # Seed the same active workspace that ChatCode will purge and
+            # query; changing the provider after writing would create a
+            # different index file rather than a stale entry in this one.
+            save_map(self.repo, {
+                "version": 2,
+                "files": {
+                    "workspace/other-project/app.py": {
+                        "path": "workspace/other-project/app.py",
+                        "hash": "stale",
+                        "language": "python",
+                    }
+                },
+            })
         with patch(
             "chatcode.workspace.get_workspace_root",
             return_value=internal_workspace,
@@ -432,10 +442,14 @@ class PatchContextTests(unittest.TestCase):
         indexed_paths = update_map.call_args.kwargs["paths"]
         self.assertIn("src/widget.py", indexed_paths)
         self.assertNotIn("workspace/other-project/app.py", indexed_paths)
-        self.assertNotIn(
-            "workspace/other-project/app.py",
-            load_map(self.repo).get("files", {}),
-        )
+        with patch(
+            "chatcode.workspace.get_workspace_root",
+            return_value=internal_workspace,
+        ):
+            self.assertNotIn(
+                "workspace/other-project/app.py",
+                load_map(self.repo).get("files", {}),
+            )
         self.assertEqual(selected, [source])
 
     def commit_all(self) -> None:
@@ -457,6 +471,86 @@ class PatchContextTests(unittest.TestCase):
         self.assertIn(self.repo.resolve().as_posix(), context)
         self.assertNotIn("[File truncated by ChatCode]", context)
         self.assertNotIn("## Unstaged changes", context)
+
+    def test_staged_file_uses_working_tree_contents(self) -> None:
+        source = self.write("src/staged.py", "value = 'A'\n")
+        self.commit_all()
+        source.write_text("value = 'B staged'\n", encoding="utf-8", newline="\n")
+        git(self.repo, "add", "src/staged.py")
+
+        context = build_patch_context(self.repo, "change src/staged.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("value = 'B staged'", context)
+        self.assertIn(hashlib.sha256(source.read_bytes()).hexdigest(), context)
+
+    def test_published_context_and_state_generation_must_match(self) -> None:
+        self.write("app.py", "value = 1\n")
+        self.commit_all()
+        output = build_patch_context(self.repo, "change app.py")
+
+        self.assertIsNone(get_stale_context_reason(self.repo, {"app.py"}))
+        output.write_text(
+            output.read_text(encoding="utf-8") + "\npartial newer generation",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        self.assertIn(
+            "inte till samma publicerade generation",
+            get_stale_context_reason(self.repo, {"app.py"}),
+        )
+
+    def test_staged_then_unstaged_file_uses_latest_working_tree_contents(self) -> None:
+        source = self.write("src/three_versions.py", "value = 'A'\n")
+        self.commit_all()
+        source.write_text("value = 'B index'\n", encoding="utf-8", newline="\n")
+        git(self.repo, "add", "src/three_versions.py")
+        source.write_text("value = 'C working tree'\n", encoding="utf-8", newline="\n")
+
+        context = build_patch_context(
+            self.repo, "change src/three_versions.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("value = 'C working tree'", context)
+        self.assertNotIn("value = 'B index'", context)
+        self.assertNotIn("value = 'A'", context)
+        self.assertIn(hashlib.sha256(source.read_bytes()).hexdigest(), context)
+
+    def test_selected_untracked_file_uses_working_tree_contents(self) -> None:
+        source = self.write("src/new_file.py", "def newly_created():\n    return 'disk'\n")
+
+        context = build_patch_context(self.repo, "change src/new_file.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("def newly_created", context)
+        self.assertIn(hashlib.sha256(source.read_bytes()).hexdigest(), context)
+
+    def test_regeneration_and_symbol_context_do_not_reuse_stale_source(self) -> None:
+        padding = "".join(f"padding_{index} = {index}\n" for index in range(3000))
+        source = self.write(
+            "src/fresh_large.py", padding + "def old_symbol():\n    return 'old'\n"
+        )
+        self.commit_all()
+        first = build_patch_source_context(
+            self.repo, "change old_symbol", files=[source]
+        )
+        source.write_text(
+            padding + "def new_symbol():\n    return 'new'\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        second = build_patch_source_context(
+            self.repo, "change new_symbol", files=[source]
+        )
+
+        self.assertIn("def old_symbol", first)
+        self.assertIn("def new_symbol", second)
+        self.assertNotIn("def old_symbol", second)
+        self.assertIn(hashlib.sha256(source.read_bytes()).hexdigest(), second)
 
     def test_dirty_likely_target_is_included_in_full(self) -> None:
         source = self.write("src/handler.py", "def handler():\n    return 'base'\n")
@@ -498,6 +592,20 @@ class PatchContextTests(unittest.TestCase):
         self.assertIn("value = 99", repair)
         self.assertEqual(source.read_text(encoding="utf-8"), "value = 99\n")
 
+    def test_captured_source_hash_is_not_overwritten_by_later_state_scan(self) -> None:
+        source = self.write("app.py", "value = 'context version'\n")
+        self.commit_all()
+        captured_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+        source.write_text("value = 'later version'\n", encoding="utf-8", newline="\n")
+
+        save_context_state(
+            self.repo,
+            task="change app",
+            source_hashes={"app.py": captured_hash},
+        )
+
+        self.assertIsNotNone(get_stale_context_reason(self.repo, {"app.py"}))
+
     def test_large_file_uses_labeled_symbol_aware_current_excerpt(self) -> None:
         padding = "".join(f"padding_{index} = {index}\n" for index in range(6000))
         source = self.write(
@@ -511,12 +619,147 @@ class PatchContextTests(unittest.TestCase):
             "change wanted_symbol",
         ).read_text(encoding="utf-8")
 
-        self.assertIn("EXCERPTS FROM CURRENT FILE: src/large.py", context)
-        self.assertIn("EXCERPT src/large.py lines ", context)
+        self.assertIn("===== SYMBOL CONTEXT: src/large.py =====", context)
+        self.assertIn("EXCERPT src/large.py source lines ", context)
         self.assertIn("import os", context)
         self.assertIn("def wanted_symbol", context)
         self.assertIn(hashlib.sha256(source.read_bytes()).hexdigest(), context)
         self.assertNotIn("[File truncated by ChatCode]", context)
+
+    def test_small_relevant_file_is_included_in_full(self) -> None:
+        source = self.write("src/small.py", "def wanted():\n    return 1\n")
+
+        context = build_patch_source_context(
+            self.repo,
+            "change wanted",
+            files=[source],
+        )
+
+        self.assertIn("===== FULL FILE: src/small.py =====", context)
+        self.assertIn("Source line range: 1-2", context)
+
+    def test_large_file_uses_symbol_context_instead_of_full_file(self) -> None:
+        padding = "".join(f"padding_{index} = {index}\n" for index in range(3000))
+        source = self.write(
+            "src/large_service.py",
+            "import os\n\n"
+            + padding
+            + "def wanted_feature():\n    return os.getcwd()\n",
+        )
+
+        context = build_patch_source_context(
+            self.repo,
+            "change wanted_feature",
+            files=[source],
+        )
+
+        self.assertIn("===== SYMBOL CONTEXT: src/large_service.py =====", context)
+        self.assertIn("EXCERPT src/large_service.py source lines", context)
+        self.assertIn("def wanted_feature", context)
+        self.assertNotIn("padding_1500 = 1500", context)
+
+    def test_large_test_file_selects_relevant_test_excerpt(self) -> None:
+        unrelated = "".join(
+            f"def test_unrelated_{index}():\n    assert {index} >= 0\n\n"
+            for index in range(500)
+        )
+        source = self.write(
+            "tests/test_transfer.py",
+            unrelated
+            + "def test_transfer_confirmation():\n"
+            + "    assert confirm_transfer()\n",
+        )
+
+        context = build_patch_source_context(
+            self.repo,
+            "fix transfer confirmation",
+            files=[source],
+        )
+
+        self.assertIn("test_transfer_confirmation", context)
+        self.assertNotIn("test_unrelated_250", context)
+
+    def test_context_budget_prioritizes_explicit_file(self) -> None:
+        target = self.write(
+            "src/target.py",
+            "def target_feature():\n"
+            + "".join(f"    value_{index} = {index}\n" for index in range(100))
+            + "    return value_99\n",
+        )
+        other = self.write(
+            "src/other.py",
+            "def other_feature():\n"
+            + "".join(f"    other_{index} = {index}\n" for index in range(100))
+            + "    return other_99\n",
+        )
+
+        with patch.dict(
+            "os.environ",
+            {"CHATCODE_CONTEXT_BUDGET_CHARS": "5000"},
+            clear=False,
+        ):
+            context = build_patch_source_context(
+                self.repo,
+                "update src/target.py",
+                files=[other, target],
+            )
+
+        self.assertIn("src/target.py", context)
+
+    def test_dependency_context_is_added_when_budget_allows(self) -> None:
+        source = self.write("src/service.py", "def service():\n    return helper()\n")
+        dependency = self.write("src/helper.py", "def helper():\n    return 1\n")
+        save_map(self.repo, {
+            "version": 2,
+            "files": {
+                "src/service.py": {
+                    "path": "src/service.py",
+                    "dependencies": ["src/helper.py"],
+                },
+                "src/helper.py": {
+                    "path": "src/helper.py",
+                    "dependencies": [],
+                },
+            },
+        })
+
+        context = build_patch_source_context(
+            self.repo,
+            "change service",
+            files=[source],
+        )
+
+        self.assertIn("src/service.py", context)
+        self.assertIn("src/helper.py", context)
+        self.assertIn(dependency.read_text(encoding="utf-8"), context)
+
+    def test_source_export_does_not_insert_blank_lines(self) -> None:
+        source = self.write("src/compact.py", "first = 1\nsecond = 2\n")
+
+        context = build_patch_source_context(
+            self.repo,
+            "change compact",
+            files=[source],
+        )
+
+        self.assertIn("first = 1\nsecond = 2", context)
+        self.assertNotIn("first = 1\n\nsecond = 2", context)
+
+    def test_symbol_fallback_keeps_bounded_start_of_unstructured_file(self) -> None:
+        source = self.write(
+            "src/fallback.java",
+            "".join(f"line_{index};\n" for index in range(3000)),
+        )
+
+        context = build_patch_source_context(
+            self.repo,
+            "change completely unrelated concept",
+            files=[source],
+        )
+
+        self.assertIn("===== SYMBOL CONTEXT: src/fallback.java =====", context)
+        self.assertIn("line_0;", context)
+        self.assertNotIn("line_2000;", context)
 
     def test_apply_check_success_preserves_existing_uncommitted_change(self) -> None:
         source = self.write("app.py", "first\nbase\n")
@@ -553,6 +796,46 @@ class PatchContextTests(unittest.TestCase):
             "@@ -1,1 +1,1 @@",
             incoming.read_text(encoding="utf-8"),
         )
+
+    def test_context_free_hunk_for_large_existing_file_is_rejected_before_apply(self) -> None:
+        source = self.write("app.py", "first\nold\nlast\n")
+        self.commit_all()
+        incoming = self.root / "fragile.diff"
+        incoming.write_text(
+            "--- a/app.py\n+++ b/app.py\n"
+            "@@ -2 +2 @@\n-old\n+new\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        with self.assertRaises(PatchError) as raised:
+            apply_patch(self.repo, incoming)
+
+        self.assertEqual(
+            raised.exception.failure_type,
+            "insufficient_patch_context",
+        )
+        repair = get_repair_context_file(self.repo).read_text(encoding="utf-8")
+        self.assertIn("Failure type: `insufficient_patch_context`", repair)
+        self.assertIn("hunk has only 0 unchanged context line(s)", repair)
+        self.assertEqual(source.read_text(encoding="utf-8"), "first\nold\nlast\n")
+
+    def test_hunk_with_fewer_than_three_available_context_lines_is_rejected(self) -> None:
+        source = self.write("app.py", "first\nsecond\nold\nfourth\nfifth\n")
+        self.commit_all()
+        incoming = self.root / "too-little-context.diff"
+        incoming.write_text(
+            "--- a/app.py\n+++ b/app.py\n"
+            "@@ -1,3 +1,3 @@\n first\n second\n-old\n+new\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        with self.assertRaises(PatchError) as raised:
+            apply_patch(self.repo, incoming)
+
+        self.assertEqual(raised.exception.failure_type, "insufficient_patch_context")
+        self.assertIn("only 2 unchanged context line(s)", str(raised.exception))
 
     def test_unrelated_uncommitted_change_is_preserved(self) -> None:
         source = self.write("app.py", "old\n")
@@ -644,6 +927,33 @@ class PatchContextTests(unittest.TestCase):
         self.assertIn("current = True", repair)
         self.assertIn(hashlib.sha256(source.read_bytes()).hexdigest(), repair)
 
+    def test_repair_command_activates_repair_generation_for_next_apply(self) -> None:
+        source = self.write("app.py", "current = True\n")
+        self.commit_all()
+        build_patch_repair_context(
+            self.repo,
+            "--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-stale = True\n+current = False\n",
+            "error: patch failed: app.py:1",
+        )
+
+        with patch("chatcode.cli.get_repo_root", return_value=self.repo), patch(
+            "builtins.print"
+        ):
+            returncode = command_repair()
+
+        state = json.loads(
+            (get_repo_workspace(self.repo) / "context-state.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(returncode, 0)
+        self.assertEqual(state["context_filename"], "PATCH_REPAIR_CONTEXT.md")
+        self.assertEqual(state["context_kind"], "repair")
+        self.assertIsNone(get_stale_context_reason(self.repo, {"app.py"}))
+
+        source.write_text("later = True\n", encoding="utf-8", newline="\n")
+        self.assertIsNotNone(get_stale_context_reason(self.repo, {"app.py"}))
+
     def test_out_of_range_hunk_recovers_matching_context_without_invalid_range(self) -> None:
         lines = [f"padding_{index} = {index}" for index in range(7000)]
         lines[120] = "needle = True"
@@ -663,7 +973,7 @@ class PatchContextTests(unittest.TestCase):
         with self.assertRaises(PatchError) as raised:
             apply_patch(self.repo, incoming)
 
-        self.assertEqual(raised.exception.failure_type, "patch_target_mismatch")
+        self.assertEqual(raised.exception.failure_type, "insufficient_patch_context")
         repair = get_repair_context_file(self.repo).read_text(encoding="utf-8")
         self.assertIn("needle = True", repair)
         self.assertNotRegex(repair, r"lines (\d{3,})-(\d{1,2})(?:\D|$)")

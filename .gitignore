@@ -1,4 +1,5 @@
 workspace/
+.tools/
 .chatcode/
 .env
 __pycache__/

@@ -3,13 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
+from typing import Mapping
 
 from .file_filter import is_ignored
 from .git_utils import (
     get_branch,
     run_git,
 )
-from .workspace import get_repo_workspace
+from .workspace import atomic_write_text, get_repo_workspace
 
 
 STATE_FILENAME = "context-state.json"
@@ -111,29 +112,58 @@ def _collect_file_hashes(
 def save_context_state(
     repo: Path,
     task: str | None = None,
+    source_hashes: Mapping[str, str] | None = None,
+    context_sha256: str | None = None,
+    generation_id: str | None = None,
+    context_filename: str = "UPLOAD_TO_CHATGPT.md",
+    context_kind: str = "normal",
+    repair_targets: list[str] | None = None,
 ) -> Path:
+    files = _collect_file_hashes(repo)
+    if source_hashes:
+        files.update(source_hashes)
     state = {
-        "version": 2,
+        "version": 3,
         "branch": get_branch(repo),
         "task": task,
-        "files": _collect_file_hashes(
-            repo
-        ),
+        "files": files,
+        "context_sha256": context_sha256,
+        "generation_id": generation_id,
+        "context_filename": context_filename,
+        "context_kind": context_kind,
+        "repair_targets": sorted(set(repair_targets or [])),
     }
 
     state_file = _state_file(repo)
 
-    state_file.write_text(
+    atomic_write_text(
+        state_file,
         json.dumps(
             state,
             indent=2,
             ensure_ascii=False,
         )
         + "\n",
-        encoding="utf-8",
     )
 
     return state_file
+
+
+def get_active_repair_targets(repo: Path) -> frozenset[str]:
+    """Return failures the currently active repair context promises to fix."""
+    try:
+        state = json.loads(_state_file(repo).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return frozenset()
+    if state.get("context_kind") != "repair":
+        return frozenset()
+    targets = state.get("repair_targets")
+    if not isinstance(targets, list):
+        return frozenset()
+    return frozenset(
+        item for item in targets
+        if isinstance(item, str) and item
+    )
 
 
 def get_context_task(
@@ -175,6 +205,23 @@ def get_stale_context_reason(
             "Kör chatcode context igen "
             "innan du applicerar patchen."
         )
+
+    expected_context_hash = state.get("context_sha256")
+    if isinstance(expected_context_hash, str) and expected_context_hash:
+        context_filename = state.get("context_filename", "UPLOAD_TO_CHATGPT.md")
+        if not isinstance(context_filename, str) or Path(context_filename).name != context_filename:
+            return "Context state references an invalid context filename."
+        context_file = state_file.parent / context_filename
+        try:
+            actual_context_hash = _hash_file(context_file)
+        except OSError:
+            actual_context_hash = None
+        if actual_context_hash != expected_context_hash:
+            return (
+                "UPLOAD_TO_CHATGPT.md och context-state hör inte till samma "
+                "publicerade generation. Kör chatcode context igen innan du "
+                "applicerar patchen."
+            )
 
     expected_branch = state.get(
         "branch"

@@ -739,7 +739,7 @@ def format_history(
     return "\n".join(lines).rstrip()
 
 
-def _open_code_diff(
+def open_code_diff(
     before: Path,
     after: Path,
 ) -> None:
@@ -755,6 +755,7 @@ def _open_code_diff(
         command_line = (
             subprocess.list2cmdline([
                 "code",
+                "--reuse-window",
                 "--diff",
                 str(before),
                 str(after),
@@ -772,6 +773,7 @@ def _open_code_diff(
     else:
         subprocess.Popen([
             code,
+            "--reuse-window",
             "--diff",
             str(before),
             str(after),
@@ -841,7 +843,7 @@ def open_history_review(
             )
             after.write_bytes(b"")
 
-        _open_code_diff(
+        open_code_diff(
             before.resolve(),
             after.resolve(),
         )

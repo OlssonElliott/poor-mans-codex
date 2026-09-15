@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 import re
+import hashlib
 from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -9,7 +10,6 @@ from pathlib import Path
 from typing import Any
 
 from ..config import get_index_mode
-from .hashes import hash_file
 from .project_graph import load_map, map_path, normalize_compact_index, save_map
 from .scanner import is_indexable, scan_project
 from .semantic_analyzer import (
@@ -297,14 +297,19 @@ def update_project_map(
 
     for relative, path in sorted(current.items()):
         try:
-            digest = hash_file(path)
+            source_bytes = path.read_bytes()
         except OSError:
             continue
+        digest = hashlib.sha256(source_bytes).hexdigest()
         previous = old_files.get(relative)
         if previous and previous.get("hash") == digest:
             unchanged.append(relative)
             continue
-        static = analyze_file(path, repo)
+        static = analyze_file(
+            path,
+            repo,
+            source=source_bytes.decode("utf-8", errors="replace"),
+        )
         old_files[relative] = {
             "path": relative,
             "hash": digest,
@@ -453,7 +458,35 @@ def update_project_map(
     stopped_early = False
     for relative, path, entry in eligible:
         try:
-            result = _normalize_analysis(analyzer.analyze(path, repo, entry))
+            semantic_source = path.read_bytes()
+        except OSError:
+            semantic_source = None
+        if (
+            semantic_source is None
+            or hashlib.sha256(semantic_source).hexdigest() != entry.get("hash")
+        ):
+            # The static metadata belongs to an older snapshot.  Do not attach
+            # semantic output from a newer (or missing) file to that hash; the
+            # next index update will rebuild both layers from one snapshot.
+            entry["semantic"] = _pending_semantic(
+                model, analyzer_version, "source_changed"
+            )
+            _reset_semantic_metadata(relative, entry)
+            normalize_compact_index(graph)
+            output = save_map(repo, graph)
+            continue
+        try:
+            if isinstance(analyzer, QwenSemanticAnalyzer):
+                result = _normalize_analysis(
+                    analyzer.analyze(
+                        path,
+                        repo,
+                        entry,
+                        source=semantic_source.decode("utf-8", errors="replace"),
+                    )
+                )
+            else:
+                result = _normalize_analysis(analyzer.analyze(path, repo, entry))
         except KeyboardInterrupt:
             completed = completed_before + processed
             _emit(progress, IndexProgress(
@@ -466,6 +499,21 @@ def update_project_map(
             result = SemanticAnalysis(
                 "failed", error=str(exc), failure_reason="unexpected_exception"
             )
+
+        try:
+            unchanged_since_analysis = (
+                hashlib.sha256(path.read_bytes()).hexdigest() == entry.get("hash")
+            )
+        except OSError:
+            unchanged_since_analysis = False
+        if not unchanged_since_analysis:
+            entry["semantic"] = _pending_semantic(
+                model, analyzer_version, "source_changed"
+            )
+            _reset_semantic_metadata(relative, entry)
+            normalize_compact_index(graph)
+            output = save_map(repo, graph)
+            continue
 
         processed += 1
         if result.status == "complete":

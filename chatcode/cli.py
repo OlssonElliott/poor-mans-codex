@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 from .context_builder import (
@@ -11,7 +13,7 @@ from .context_builder import (
     build_context,
     build_patch_context,
 )
-from .context_state import save_context_state
+from .context_state import get_context_task, save_context_state
 from .git_utils import (
     GitError,
     get_branch,
@@ -30,6 +32,10 @@ from .patch import (
     PatchError,
     PatchUndoError,
     apply_patch,
+    get_repair_context_stale_reason,
+    get_repair_context_targets,
+    refresh_test_failure_repair_context,
+    show_repair_send_instructions,
     undo_last_patch,
 )
 from .test_runner import (
@@ -38,6 +44,7 @@ from .test_runner import (
 )
 from .workspace import (
     get_default_patch_file,
+    get_repair_context_file,
 )
 
 
@@ -219,11 +226,6 @@ def command_context(
             task,
             index_progress=reporter,
         )
-
-    save_context_state(
-        repo,
-        task=task,
-    )
 
     patch_file = get_default_patch_file(
         repo
@@ -511,6 +513,40 @@ def command_test() -> int:
     return result.returncode
 
 
+def command_repair() -> int:
+    repo = get_repo_root()
+    repair_context = get_repair_context_file(repo)
+    if not repair_context.is_file():
+        print(
+            "No repair context is available. Apply a patch first; ChatCode "
+            "creates one automatically when it detects a new regression."
+        )
+        return 1
+    stale_reason = get_repair_context_stale_reason(repo)
+    if stale_reason is not None:
+        refreshed = refresh_test_failure_repair_context(repo)
+        if refreshed is not None:
+            repair_context = refreshed
+            stale_reason = get_repair_context_stale_reason(repo)
+    if stale_reason is not None:
+        print("Repair context is stale and must not be sent to ChatGPT:")
+        print(stale_reason)
+        print("Run chatcode context again, or reproduce the failed apply/test flow.")
+        return 1
+    repair_bytes = repair_context.read_bytes()
+    save_context_state(
+        repo,
+        task=get_context_task(repo),
+        context_sha256=hashlib.sha256(repair_bytes).hexdigest(),
+        generation_id=uuid.uuid4().hex,
+        context_filename=repair_context.name,
+        context_kind="repair",
+        repair_targets=sorted(get_repair_context_targets(repo)),
+    )
+    show_repair_send_instructions(repair_context)
+    return 0
+
+
 def command_history() -> None:
     repo = get_repo_root()
 
@@ -669,6 +705,11 @@ def create_parser() -> argparse.ArgumentParser:
     )
 
     subparsers.add_parser(
+        "repair",
+        help="Show a freshness-validated context for the latest failed patch or test flow.",
+    )
+
+    subparsers.add_parser(
         "history",
         help=(
             "Show ChatCode patch history."
@@ -752,6 +793,11 @@ def main() -> None:
                     sys.exit(
                         returncode
                     )
+
+            case "repair":
+                returncode = command_repair()
+                if returncode != 0:
+                    sys.exit(returncode)
 
             case "history":
                 command_history()

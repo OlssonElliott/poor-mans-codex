@@ -88,9 +88,15 @@ class QwenSemanticAnalyzer:
         )
 
     def analyze(
-        self, path: Path, repo: Path, static_result: dict[str, Any]
+        self,
+        path: Path,
+        repo: Path,
+        static_result: dict[str, Any],
+        source: str | None = None,
     ) -> SemanticAnalysis:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        text = source if source is not None else path.read_text(
+            encoding="utf-8", errors="replace"
+        )
         return self._analyze_source(path, repo, static_result, text)
 
     def preflight(self, repo: Path) -> SemanticAnalysis:

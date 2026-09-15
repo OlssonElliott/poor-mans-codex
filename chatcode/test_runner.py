@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -33,6 +34,7 @@ class TestResult:
     returncode: int
     duration_seconds: float
     output_file: Path
+    failed_tests: frozenset[str] = frozenset()
 
 
 def _read_json(path: Path) -> dict:
@@ -195,12 +197,6 @@ def _uses_pytest(
     if (repo / "conftest.py").exists():
         return True
 
-    if (
-        (repo / "tests").is_dir()
-        and _is_python_project(repo)
-    ):
-        return True
-
     for config_name in (
         "setup.cfg",
         "tox.ini",
@@ -236,6 +232,7 @@ def _project_python(
         candidates = [
             repo / ".venv" / "Scripts" / "python.exe",
             repo / "venv" / "Scripts" / "python.exe",
+            repo / ".tools" / "python313" / "python.exe",
         ]
     else:
         candidates = [
@@ -259,18 +256,23 @@ def _project_python(
 def _detect_python_tests(
     repo: Path,
 ) -> TestCommand | None:
-    if not _uses_pytest(repo):
+    if not _is_python_project(repo):
         return None
 
     python = _project_python(repo)
 
+    if _uses_pytest(repo):
+        return TestCommand(
+            display=f"{python} -m pytest",
+            args=[python, "-m", "pytest"],
+        )
+
+    if not (repo / "tests").is_dir():
+        return None
+
     return TestCommand(
-        display=f"{python} -m pytest",
-        args=[
-            python,
-            "-m",
-            "pytest",
-        ],
+        display=f"{python} -m unittest discover",
+        args=[python, "-m", "unittest", "discover", "-s", "tests"],
     )
 
 
@@ -444,10 +446,37 @@ def _write_test_report(
     return output_file
 
 
-def run_project_tests(
+def _failed_test_ids(
+    stdout: str,
+    stderr: str,
+) -> frozenset[str]:
+    """Extract stable failure identifiers from common Python test runners.
+
+    An empty result is intentional: a non-zero command without a recognizable
+    test identifier must be reported as unclear, rather than guessed at.
+    """
+    failures: set[str] = set()
+    for line in (stdout + "\n" + stderr).splitlines():
+        unittest_match = re.match(
+            r"^(?:FAIL|ERROR): .+ \((.+)\)$",
+            line.strip(),
+        )
+        pytest_match = re.match(
+            # pytest's summary line is e.g. ``FAILED (failures=1)``;
+            # accept only node IDs, never that aggregate summary.
+            r"^FAILED (\S+::\S+)",
+            line.strip(),
+        )
+        match = unittest_match or pytest_match
+        if match:
+            failures.add(match.group(1))
+    return frozenset(failures)
+
+
+def _run_test_command(
     repo: Path,
+    command: TestCommand,
 ) -> TestResult:
-    command = detect_test_command(repo)
     args = _prepare_command(command)
 
     started = time.perf_counter()
@@ -466,10 +495,7 @@ def run_project_tests(
             f"Kunde inte starta testerna: {exc}"
         ) from exc
 
-    duration = (
-        time.perf_counter() - started
-    )
-
+    duration = time.perf_counter() - started
     output_file = _write_test_report(
         repo=repo,
         command=command,
@@ -478,10 +504,75 @@ def run_project_tests(
         stdout=process.stdout,
         stderr=process.stderr,
     )
-
     return TestResult(
         command=command.display,
         returncode=process.returncode,
         duration_seconds=duration,
         output_file=output_file,
+        failed_tests=_failed_test_ids(process.stdout, process.stderr),
     )
+
+
+def _relevant_python_test_files(
+    repo: Path,
+    paths: set[str],
+) -> list[Path]:
+    tests_root = repo / "tests"
+    if not tests_root.is_dir():
+        return []
+
+    matches: set[Path] = set()
+    for raw_path in paths:
+        path = Path(raw_path.replace("\\", "/"))
+        if path.parts and path.parts[0] == "tests" and path.name.startswith("test_"):
+            candidate = repo / path
+            if candidate.is_file():
+                matches.add(candidate)
+            continue
+
+        candidate_name = f"test_{path.stem}.py"
+        candidates = list(tests_root.rglob(candidate_name))
+        if len(candidates) == 1:
+            matches.add(candidates[0])
+
+    return sorted(matches)
+
+
+def run_relevant_tests(
+    repo: Path,
+    changed_paths: set[str],
+) -> TestResult | None:
+    """Run a narrow Python test selection when it can be chosen safely.
+
+    Unknown mappings deliberately fall back to the mandatory full-suite run.
+    """
+    if not _is_python_project(repo):
+        return None
+
+    test_files = _relevant_python_test_files(repo, changed_paths)
+    if not test_files:
+        return None
+
+    python = _project_python(repo)
+    if _uses_pytest(repo):
+        target_args = [str(path.relative_to(repo)) for path in test_files]
+        targeted = TestCommand(
+            display=f"{python} -m pytest {' '.join(target_args)}",
+            args=[python, "-m", "pytest", *target_args],
+        )
+    elif len(test_files) == 1:
+        targeted = TestCommand(
+            display=f"{python} -m unittest discover -s tests -p {test_files[0].name}",
+            args=[python, "-m", "unittest", "discover", "-s", "tests", "-p", test_files[0].name],
+        )
+    else:
+        return None
+
+    return _run_test_command(repo, targeted)
+
+
+def run_project_tests(
+    repo: Path,
+) -> TestResult:
+    command = detect_test_command(repo)
+    return _run_test_command(repo, command)
