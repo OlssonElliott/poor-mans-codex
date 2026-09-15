@@ -9,10 +9,60 @@ from pathlib import Path
 from unittest.mock import patch
 
 from chatcode.cli import ConsoleIndexReporter, main
-from chatcode.indexing.index_manager import IndexProgress, SemanticIndexInterrupted
+from chatcode.indexing.index_manager import (
+    IndexProgress,
+    SemanticFailureExample,
+    SemanticIndexInterrupted,
+)
 
 
 class IndexProgressCliTests(unittest.TestCase):
+    def test_preflight_failure_reports_static_fallback(self) -> None:
+        output = io.StringIO()
+        reporter = ConsoleIndexReporter()
+        with redirect_stdout(output):
+            reporter(IndexProgress(
+                "semantic_preflight", "started", model="missing-model"
+            ))
+            reporter(IndexProgress(
+                "semantic_preflight",
+                "failed",
+                model="missing-model",
+                reason="model_not_found",
+                error="model not found",
+            ))
+        rendered = output.getvalue()
+        self.assertIn("Checking semantic model missing-model", rendered)
+        self.assertIn("model_not_found", rendered)
+        self.assertIn("Continuing with static retrieval", rendered)
+
+    def test_failure_summary_shows_classification_and_bounded_examples(self) -> None:
+        output = io.StringIO()
+        reporter = ConsoleIndexReporter()
+        event = IndexProgress(
+            "semantic",
+            "complete",
+            completed=3,
+            total=3,
+            processed=3,
+            failed=3,
+            failure_counts=(("invalid_json", 2), ("timeout", 1)),
+            failure_examples=(
+                SemanticFailureExample(
+                    "app.py", "invalid_json", "bad JSON", "Here is JSON:\n..."
+                ),
+            ),
+        )
+
+        with redirect_stdout(output):
+            reporter(event)
+
+        rendered = output.getvalue()
+        self.assertIn("invalid JSON: 2", rendered)
+        self.assertIn("timeout: 1", rendered)
+        self.assertIn("file: app.py", rendered)
+        self.assertIn("response: Here is JSON:\\n...", rendered)
+
     def test_interrupted_progress_has_clean_user_message(self) -> None:
         output = io.StringIO()
         reporter = ConsoleIndexReporter()

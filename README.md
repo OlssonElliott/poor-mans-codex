@@ -148,19 +148,34 @@ metadata ranking and shallow dependency expansion supplement the existing
 filename, content and Git-change ranking. Low-level calls and state accesses are
 not persisted.
 
-Optional semantic indexing uses a local Qwen model through Ollama. It is off by
-default; enable it in ChatCode's local `.env` (copy `.env.example`) by setting
-`CHATCODE_QWEN_ENABLED=true`, or set both variables for a terminal session:
+ChatCode has two explicit indexing modes. `ai` uses compact Qwen metadata as the
+primary file selector and does not run the repository-wide legacy content
+ranker. `static` never invokes Ollama and uses deterministic path, symbol,
+import and content ranking. Both modes retain only lightweight hashes,
+languages, symbols, imports and direct dependencies in `project-map.json`.
+
+Select a mode in ChatCode's local `.env` (copy `.env.example`):
 
 ```powershell
 $env:CHATCODE_QWEN_MODEL = "qwen2.5-coder:7b"
-$env:CHATCODE_QWEN_ENABLED = "true"
+$env:CHATCODE_INDEX_MODE = "ai"
 chatcode context "why does the door reopen?"
 ```
 
-Qwen only returns validated semantic relations and never writes code. Missing
-Ollama, timeouts, invalid JSON and low-confidence responses are ignored, leaving
-the deterministic graph available.
+An explicit `CHATCODE_INDEX_MODE` always wins. If it is omitted, the older
+`CHATCODE_QWEN_ENABLED` toggle remains supported; otherwise a configured
+`CHATCODE_QWEN_MODEL` selects AI mode and no model selects static mode.
+
+Before AI indexing starts, ChatCode invokes the configured model through the
+same prompt, structured-output and parser path used for real files. A failed
+preflight skips the semantic phase and uses static retrieval for that run. A
+circuit breaker also stops a run when at least four of its first five file
+analyses fail for the same reason. Completed semantic results remain cached.
+
+Qwen only returns a compact summary, tags and important symbol names; it never
+writes code or produces a relation graph. Missing Ollama, timeouts, model errors
+and malformed responses are classified while deterministic metadata remains
+available as a fallback.
 
 The deterministic map is saved before Qwen starts. Semantic state is cached per
 file using its source hash, model name and analyzer version, and each completed

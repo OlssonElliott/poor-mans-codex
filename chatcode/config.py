@@ -35,3 +35,22 @@ def get_boolean_setting(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def get_index_mode() -> str:
+    """Resolve the explicit index mode with backwards-compatible Qwen settings."""
+    configured = get_setting("CHATCODE_INDEX_MODE")
+    if configured is not None:
+        mode = configured.strip().lower()
+        if mode not in {"ai", "static"}:
+            raise ValueError(
+                "CHATCODE_INDEX_MODE must be either 'ai' or 'static'"
+            )
+        return mode
+
+    model = get_setting("CHATCODE_QWEN_MODEL")
+    legacy_toggle = get_setting("CHATCODE_QWEN_ENABLED")
+    if legacy_toggle is not None:
+        enabled = legacy_toggle.strip().lower() in {"1", "true", "yes", "on"}
+        return "ai" if enabled and model else "static"
+    return "ai" if model else "static"

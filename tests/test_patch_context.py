@@ -5,11 +5,12 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from chatcode.context_builder import (
     PATCH_CONTEXT_HEADER,
     build_patch_context,
+    collect_relevant_files,
 )
 from chatcode.context_state import save_context_state
 from chatcode.patch import PatchError, apply_patch
@@ -56,6 +57,26 @@ class PatchContextTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8", newline="\n")
         return path
+
+    def test_ai_mode_does_not_run_legacy_repository_content_ranker(self) -> None:
+        source = self.write("src/widget.py", "def widget():\n    return 1\n")
+        update = Mock(effective_mode="ai")
+        with patch(
+            "chatcode.context_builder.update_project_map", return_value=update
+        ), patch(
+            "chatcode.context_builder.retrieve_files", return_value=[source]
+        ) as retrieve, patch(
+            "chatcode.context_builder.get_changed_files", return_value=set()
+        ), patch(
+            "chatcode.context_builder.iter_repository_files"
+        ) as legacy_scan:
+            selected = collect_relevant_files(self.repo, "change widget")
+
+        self.assertEqual(selected, [source])
+        retrieve.assert_called_once_with(
+            self.repo, "change widget", max_files=12, index_mode="ai"
+        )
+        legacy_scan.assert_not_called()
 
     def commit_all(self) -> None:
         git(self.repo, "add", ".")

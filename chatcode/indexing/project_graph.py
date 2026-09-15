@@ -48,8 +48,8 @@ def save_map(repo: Path, index: dict[str, Any]) -> Path:
     return path
 
 
-def rebuild_graph(index: dict[str, Any]) -> None:
-    """Normalize the compact file index and resolve direct source imports."""
+def normalize_compact_index(index: dict[str, Any]) -> None:
+    """Normalize compact file metadata and cheaply resolve direct imports."""
     index["version"] = SCHEMA_VERSION
     index.pop("symbols", None)
     index.pop("relations", None)
@@ -59,6 +59,11 @@ def rebuild_graph(index: dict[str, Any]) -> None:
         entry.pop("relations", None)
         entry.pop("semantic_relations", None)
     _resolve_dependencies(files)
+
+
+def rebuild_graph(index: dict[str, Any]) -> None:
+    """Backward-compatible name for the compact index normalizer."""
+    normalize_compact_index(index)
 
 
 def _resolve_dependencies(files: dict[str, dict[str, Any]]) -> None:

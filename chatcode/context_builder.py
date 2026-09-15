@@ -495,14 +495,32 @@ def collect_relevant_files(
     # ChatCode invocation. Indexing is an enhancement, so a damaged/unwritable
     # cache must not prevent the established retrieval path from working.
     graph_files: list[Path] = []
+    effective_mode = "static"
     try:
-        update_project_map(repo, progress=index_progress)
-        graph_files = retrieve_files(repo, task, max_files=MAX_FILES)
+        update = update_project_map(repo, progress=index_progress)
+        effective_mode = update.effective_mode
+        graph_files = retrieve_files(
+            repo,
+            task,
+            max_files=MAX_FILES,
+            index_mode=effective_mode,
+        )
     except Exception:
         graph_files = []
 
     task_words = get_task_words(task)
     changed_files = get_changed_files(repo)
+
+    if effective_mode == "ai":
+        # AI retrieval is the primary selector in AI mode. Do not also scan
+        # every source file's contents through the legacy static ranker.
+        selected: list[Path] = []
+        for path in [*sorted(changed_files), *graph_files]:
+            if path.is_file() and is_source_file(path) and path not in selected:
+                selected.append(path)
+            if len(selected) >= MAX_FILES:
+                break
+        return selected
 
     candidate_scores: dict[Path, int] = {}
 

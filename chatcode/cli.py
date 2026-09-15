@@ -100,7 +100,9 @@ class ConsoleIndexReporter:
             self._progress_line = False
 
     def __call__(self, event: IndexProgress) -> None:
-        if event.phase == "index" and event.status == "initial":
+        if event.phase == "index_mode" and event.status == "selected":
+            print(f"Index mode: {event.reason}.")
+        elif event.phase == "index" and event.status == "initial":
             self._initial = True
             print("Project map not found. Building initial project index...")
         elif event.phase == "scan" and event.status == "started":
@@ -122,6 +124,11 @@ class ConsoleIndexReporter:
                     f"{event.deleted} removed."
                 )
         elif event.phase == "semantic" and event.status == "started":
+            print(
+                "Semantic cache: "
+                f"{event.reused} reused, {event.invalidated} invalidated, "
+                f"{event.pending} pending."
+            )
             print(f"Running semantic analysis with {event.model}...")
         elif event.phase == "semantic" and event.status == "progress":
             width = 20
@@ -148,10 +155,43 @@ class ConsoleIndexReporter:
             else:
                 print(f"Semantic analysis updated: {event.processed} files.")
             if event.failed:
+                labels = {
+                    "timeout": "timeout",
+                    "ollama_not_found": "Ollama not found",
+                    "model_not_found": "model not found",
+                    "ollama_process_error": "Ollama process error",
+                    "empty_response": "empty response",
+                    "invalid_json": "invalid JSON",
+                    "schema_validation_error": "schema validation",
+                    "unexpected_exception": "unexpected exception",
+                }
+                print("Qwen semantic analysis failures:")
+                for reason, count in event.failure_counts:
+                    print(f"  {labels.get(reason, reason)}: {count}")
+                print("Example semantic failures:")
+                for example in event.failure_examples:
+                    print(f"  file: {example.file}")
+                    print(f"  reason: {example.reason}")
+                    print(f"  error: {example.error}")
+                    if example.response:
+                        response = example.response.replace("\n", "\\n")
+                        print(f"  response: {response}")
+                print("Continuing with static index.")
+            if event.stopped_early:
                 print(
-                    f"Qwen semantic analysis failed for {event.failed} files; "
-                    "continuing with static index."
+                    "Semantic circuit breaker stopped indexing after "
+                    f"{event.processed} files ({event.reason}); "
+                    f"{event.remaining} files remain pending."
                 )
+                print("Continuing with static retrieval for this run.")
+        elif event.phase == "semantic_preflight" and event.status == "started":
+            print(f"Checking semantic model {event.model}...")
+        elif event.phase == "semantic_preflight" and event.status == "complete":
+            print("Semantic model check passed.")
+        elif event.phase == "semantic_preflight" and event.status == "failed":
+            print(f"Semantic model check failed ({event.reason}): {event.error}")
+            print("Skipping AI semantic indexing.")
+            print("Continuing with static retrieval.")
         elif event.phase == "semantic" and event.status == "interrupted":
             self._finish_progress_line()
             print("Semantic indexing interrupted by user.")
