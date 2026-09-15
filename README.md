@@ -32,30 +32,22 @@ Your target project also needs its normal test tooling installed if you want Cha
 
 Clone the repository:
 
-```bash
-git clone git@github.com:OlssonElliott/poor-mans-codex.git
+git clone git@github.com:OlssonElliott/poor-mans-codex.git  
 cd poor-mans-codex
-```
 
 Install it in editable mode.
 
 Windows:
 
-```powershell
 py -m pip install -e .
-```
 
 macOS or Linux:
 
-```bash
 python3 -m pip install -e .
-```
 
 Verify the installation:
 
-```text
 chatcode --help
-```
 
 The repository is named `poor-mans-codex`, but the CLI command is `chatcode`.
 
@@ -65,19 +57,15 @@ Run ChatCode from inside the Git repository you want ChatGPT to work on.
 
 Create a task:
 
-```text
 chatcode patch-context "Add validation to the contact form"
-```
 
 ChatCode creates a repository-specific workspace and opens it automatically.
 
 The two files you normally care about are:
 
-```text
-UPLOAD_TO_CHATGPT.md
-patches/
-    incoming.diff
-```
+UPLOAD_TO_CHATGPT.md  
+patches/  
+ incoming.diff
 
 Upload `UPLOAD_TO_CHATGPT.md` to ChatGPT.
 
@@ -85,21 +73,15 @@ The generated file contains the task, relevant source files, Git state and respo
 
 Copy the contents of that code block into:
 
-```text
 patches/incoming.diff
-```
 
 Then run:
 
-```text
 chatcode apply
-```
 
 ChatCode validates and applies the patch locally. It then runs tests when possible and asks:
 
-```text
 ChatCode: Do you want to review changes? (y/n):
-```
 
 Enter `y` to open the exact before and after change as a side-by-side diff in VS Code.
 
@@ -109,17 +91,13 @@ Enter `y` to open the exact before and after change as a side-by-side diff in VS
 
 Show the current repository and Git status.
 
-```text
 chatcode status
-```
 
 ### `chatcode context`
 
 Generate a new ChatGPT context file for a task.
 
-```text
 chatcode context "Describe the task here"
-```
 
 Each new context clears `patches/incoming.diff` so an old patch is not accidentally reused.
 
@@ -127,9 +105,7 @@ Each new context clears `patches/incoming.diff` so an old patch is not accidenta
 
 Generate patch-oriented context from the exact current working-tree files:
 
-```text
 chatcode patch-context "Describe the code change here"
-```
 
 This is the preferred command when asking ChatGPT to produce a patch. Relevant files are read directly from disk; modified patch targets are preferentially included in full, while very large files use labeled, symbol-aware excerpts. Every included source file has a SHA-256 digest. Paths in the generated context use forward slashes.
 
@@ -156,11 +132,9 @@ languages, symbols, imports and direct dependencies in `project-map.json`.
 
 Select a mode in ChatCode's local `.env` (copy `.env.example`):
 
-```powershell
-$env:CHATCODE_QWEN_MODEL = "qwen2.5-coder:7b"
-$env:CHATCODE_INDEX_MODE = "ai"
+$env:CHATCODE_QWEN_MODEL = "qwen2.5-coder:7b"  
+$env:CHATCODE_INDEX_MODE = "ai"  
 chatcode context "why does the door reopen?"
-```
 
 An explicit `CHATCODE_INDEX_MODE` always wins. If it is omitted, the older
 `CHATCODE_QWEN_ENABLED` toggle remains supported; otherwise a configured
@@ -188,27 +162,19 @@ immediately and leaves semantic enrichment for the next context command.
 
 Apply the default `patches/incoming.diff`.
 
-```text
 chatcode apply
-```
 
 Apply a specific patch file:
 
-```text
 chatcode apply path/to/change.diff
-```
 
 Skip automatic tests:
 
-```text
 chatcode apply --no-test
-```
 
 Skip the review prompt:
 
-```text
 chatcode apply --no-review
-```
 
 ChatCode also strips an outer Markdown `diff`, `patch` or unlabeled code fence from `incoming.diff` before applying it.
 
@@ -220,9 +186,7 @@ Malformed syntax, stale context, and valid patches that do not match the working
 
 Run the detected project test suite manually.
 
-```text
 chatcode test
-```
 
 ChatCode currently detects test setups for:
 
@@ -238,15 +202,11 @@ If no supported test command is found, ChatCode reports that tests could not be 
 
 Reverse the latest patch applied by ChatCode.
 
-```text
 chatcode undo
-```
 
 Undo without running tests afterwards:
 
-```text
 chatcode undo --no-test
-```
 
 Undo uses the stored patch and refuses to force a reversal when the current files no longer match safely.
 
@@ -254,9 +214,7 @@ Undo uses the stored patch and refuses to force a reversal when the current file
 
 Show ChatCode patch history.
 
-```text
 chatcode history
-```
 
 History records whether an entry is applied or undone, the affected files and available test status.
 
@@ -264,15 +222,11 @@ History records whether an entry is applied or undone, the affected files and av
 
 Review the latest ChatCode history entry in VS Code:
 
-```text
 chatcode review
-```
 
 Review another history entry by number:
 
-```text
 chatcode review 2
-```
 
 New history entries include before and after snapshots, so review shows the exact change ChatCode applied even if the working tree later changes.
 
@@ -282,19 +236,17 @@ Generated files are stored under ChatCode's own `workspace` directory rather tha
 
 A workspace looks roughly like this:
 
-```text
-workspace/
-    my-project/
-        _<repo-hash>/
-            UPLOAD_TO_CHATGPT.md
-            patches/
-                incoming.diff
-            test-results/
-                latest.md
-            history/
-                applied/
-                undone/
-```
+workspace/  
+ my-project/  
+ \_<repo-hash>/  
+ UPLOAD_TO_CHATGPT.md  
+ patches/  
+ incoming.diff  
+ test-results/  
+ latest.md  
+ history/  
+ applied/  
+ undone/
 
 `UPLOAD_TO_CHATGPT.md` is the request you upload to ChatGPT.
 
@@ -320,28 +272,20 @@ ChatCode itself contains no AI model and does not automate the ChatGPT interface
 
 The workflow is deliberately simple:
 
-```text
-local repository
-      |
-      v
-chatcode context
-      |
-      v
-UPLOAD_TO_CHATGPT.md
-      |
-      v
-ChatGPT
-      |
-      v
-incoming.diff
-      |
-      v
-chatcode apply
-      |
-      +--> tests
-      +--> history
-      +--> review
-      +--> undo
-```
+local repository  
+↓  
+chatcode context  
+↓  
+UPLOAD_TO_CHATGPT.md  
+↓  
+ChatGPT  
+↓  
+incoming.diff  
+↓  
+chatcode apply  
+├── tests  
+├── history  
+├── review  
+└── undo
 
 This keeps your local Git repository under your control while still allowing ChatGPT to work with local, unpushed and uncommitted code.

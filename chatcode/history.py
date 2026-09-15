@@ -13,6 +13,9 @@ from .workspace import (
     get_undone_history_dir,
 )
 
+MAX_HISTORY_ENTRIES = 5
+
+
 
 class HistoryError(RuntimeError):
     pass
@@ -30,6 +33,131 @@ def _new_history_id() -> str:
     return datetime.now().strftime(
         "%Y%m%d_%H%M%S_%f"
     )
+
+
+def _history_name_timestamp(
+    path: Path,
+) -> float | None:
+    name = (
+        path.stem
+        if path.suffix.lower() == ".diff"
+        else path.name
+    )
+
+    for pattern in (
+        "%Y%m%d_%H%M%S_%f",
+        "%Y%m%d_%H%M%S",
+    ):
+        try:
+            return datetime.strptime(
+                name,
+                pattern,
+            ).timestamp()
+        except ValueError:
+            continue
+
+    return None
+
+
+def _history_entry_timestamp(
+    entry: Path,
+    status: str,
+) -> float:
+    if entry.is_dir():
+        try:
+            metadata = _load_metadata(entry)
+        except HistoryError:
+            metadata = {}
+
+        timestamp_fields = (
+            ("undone_at", "applied_at", "completed_at")
+            if status == "UNDONE"
+            else ("completed_at", "applied_at")
+        )
+
+        for field in timestamp_fields:
+            value = metadata.get(field)
+            if not isinstance(value, str):
+                continue
+
+            try:
+                return datetime.fromisoformat(
+                    value
+                ).timestamp()
+            except ValueError:
+                continue
+
+    name_timestamp = _history_name_timestamp(
+        entry
+    )
+    if name_timestamp is not None:
+        return name_timestamp
+
+    try:
+        return entry.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _is_history_entry(
+    path: Path,
+) -> bool:
+    if path.name.startswith("."):
+        return False
+
+    if path.is_file():
+        return (
+            path.suffix.lower() == ".diff"
+            and _history_name_timestamp(path)
+            is not None
+        )
+
+    if not path.is_dir():
+        return False
+
+    return (
+        _metadata_file(path).is_file()
+        or _history_name_timestamp(path)
+        is not None
+    )
+
+
+def _prune_history_dir(
+    directory: Path,
+    status: str,
+    max_entries: int = MAX_HISTORY_ENTRIES,
+) -> None:
+    if max_entries < 0:
+        return
+
+    try:
+        entries = [
+            path
+            for path in directory.iterdir()
+            if _is_history_entry(path)
+        ]
+    except OSError:
+        return
+
+    entries.sort(
+        key=lambda path: (
+            _history_entry_timestamp(
+                path,
+                status,
+            ),
+            path.name,
+        ),
+        reverse=True,
+    )
+
+    for entry in entries[max_entries:]:
+        try:
+            if entry.is_symlink() or entry.is_file():
+                entry.unlink()
+            elif entry.is_dir():
+                shutil.rmtree(entry)
+        except OSError:
+            pass
 
 
 def _metadata_file(
@@ -271,6 +399,11 @@ def finalize_history_entry(
             "slutföras."
         ) from exc
 
+    _prune_history_dir(
+        get_applied_history_dir(repo),
+        "APPLIED",
+    )
+
     return destination
 
 
@@ -360,6 +493,11 @@ def move_entry_to_undone(
             "historiken kunde inte "
             "flyttas till undone."
         ) from exc
+
+    _prune_history_dir(
+        get_undone_history_dir(repo),
+        "UNDONE",
+    )
 
     return destination
 

@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import re
+import shutil
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -48,10 +54,29 @@ class PatchUndoError(RuntimeError):
     pass
 
 
+def _consume_cli_apply_flags() -> tuple[bool, bool]:
+    """Consume --yes before the existing CLI parser sees the apply command."""
+    is_apply = len(sys.argv) > 1 and sys.argv[1] == "apply"
+    auto_yes = False
+    if is_apply and "--yes" in sys.argv[2:]:
+        sys.argv.remove("--yes")
+        auto_yes = True
+    return is_apply, auto_yes
+
+
+_CLI_APPLY_INVOCATION, _CLI_APPLY_YES = _consume_cli_apply_flags()
+
+
 @dataclass(frozen=True)
 class ApplyResult:
     paths: set[str]
     history_entry: Path
+
+
+@dataclass(frozen=True)
+class PatchPreview:
+    paths: set[str]
+    patch_text: str
 
 
 @dataclass(frozen=True)
@@ -322,6 +347,7 @@ def _working_tree_section(
 ) -> list[str]:
     path = repo.joinpath(*PurePosixPath(raw_path).parts)
     data = path.read_bytes()
+    digest = hashlib.sha256(data).hexdigest()
     content = data.decode("utf-8", errors="replace")
     if len(content) <= full_limit:
         label = f"Complete current working-tree file: {raw_path}"
@@ -337,7 +363,14 @@ def _working_tree_section(
         source = "\n".join(current_lines[start - 1:end])
         if not source:
             source = "[No non-empty lines in this range.]"
-    return [label, "```text", source, "```", ""]
+    return [
+        label,
+        f"SHA-256 (current file): `{digest}`",
+        "```text",
+        source,
+        "```",
+        "",
+    ]
 
 
 def build_syntax_repair_context(
@@ -451,7 +484,7 @@ def build_patch_repair_context(
         r"patch failed: (.*?):(\d+)",
         apply_error,
     ):
-        path = PurePosixPath(raw_path).as_posix()
+        path = PurePosixPath(raw_path.replace("\\", "/")).as_posix()
         error_locations.setdefault(path, set()).add(int(raw_line))
     hunks = _patch_hunks(patch_text)
     if error_locations:
@@ -540,10 +573,12 @@ def build_patch_repair_context(
     return output_file
 
 
-def apply_patch(
+def _apply_patch_core(
     repo: Path,
     patch_file: Path,
-) -> ApplyResult:
+    *,
+    dry_run: bool = False,
+) -> ApplyResult | PatchPreview:
     patch_file = patch_file.resolve()
 
     if not patch_file.exists():
@@ -672,6 +707,12 @@ def apply_patch(
             repair_context=repair_context,
         ) from strict_error
 
+    if dry_run:
+        return PatchPreview(
+            paths=paths,
+            patch_text=patch_text,
+        )
+
     try:
         pending_entry = (
             begin_history_entry(
@@ -737,10 +778,382 @@ def apply_patch(
     except Exception:
         pass
 
+    _clear_repair_context(repo)
+    _clear_incoming_patch(repo)
+
     return ApplyResult(
         paths=paths,
         history_entry=history_entry,
     )
+
+
+def _clear_repair_context(
+    repo: Path,
+) -> None:
+    try:
+        get_repair_context_file(repo).unlink(
+            missing_ok=True
+        )
+    except OSError:
+        pass
+
+
+def _clear_incoming_patch(
+    repo: Path,
+) -> None:
+    incoming = get_default_patch_file(repo)
+    try:
+        if incoming.exists():
+            incoming.write_text(
+                "",
+                encoding="utf-8",
+                newline="\n",
+            )
+    except OSError:
+        pass
+
+
+def _fallback_patch_summary(
+    patch_text: str,
+    paths: set[str],
+) -> str:
+    additions = 0
+    deletions = 0
+    for line in patch_text.splitlines():
+        if line.startswith(("+++ ", "--- ")):
+            continue
+        if line.startswith("+"):
+            additions += 1
+        elif line.startswith("-"):
+            deletions += 1
+
+    lines = ["Changed files:"]
+    lines.extend(
+        f"  - {path}"
+        for path in sorted(paths)
+    )
+    lines.append(
+        f"Diff statistics: +{additions} / -{deletions}"
+    )
+    return "\n".join(lines)
+
+
+def _qwen_patch_summary(
+    repo: Path,
+    patch_text: str,
+) -> str | None:
+    if shutil.which("ollama") is None:
+        return None
+
+    model = os.getenv(
+        "CHATCODE_QWEN_MODEL",
+        "qwen2.5-coder:1.5b",
+    ).strip()
+    if not model:
+        return None
+
+    prompt = "\n".join([
+        "Summarize this code patch for the developer who is about to apply it.",
+        "Describe practical behavior changes, not implementation trivia.",
+        "Return strict JSON only: {\"bullets\":[\"...\"]}.",
+        "Return 3 to 6 short bullets. Do not suggest or modify code.",
+        "",
+        "Task:",
+        get_context_task(repo),
+        "",
+        "Patch:",
+        patch_text[:60_000],
+    ])
+
+    try:
+        process = subprocess.run(
+            ["ollama", "run", model, "--format", "json"],
+            input=prompt,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+    if process.returncode != 0 or not process.stdout.strip():
+        return None
+
+    try:
+        parsed = json.loads(process.stdout)
+    except json.JSONDecodeError:
+        return None
+
+    bullets = parsed.get("bullets")
+    if not isinstance(bullets, list):
+        return None
+
+    cleaned = [
+        item.strip()[:300]
+        for item in bullets
+        if isinstance(item, str) and item.strip()
+    ][:6]
+    if len(cleaned) < 1:
+        return None
+
+    return "\n".join(
+        f"  - {item}"
+        for item in cleaned
+    )
+
+
+def _build_patch_summary(
+    repo: Path,
+    preview: PatchPreview,
+) -> str:
+    return (
+        _qwen_patch_summary(
+            repo,
+            preview.patch_text,
+        )
+        or _fallback_patch_summary(
+            preview.patch_text,
+            preview.paths,
+        )
+    )
+
+
+def _ask_yes_no(
+    question: str,
+    *,
+    default: bool,
+) -> bool:
+    suffix = " [Y/n]: " if default else " [y/N]: "
+    answer = input(question + suffix).strip().lower()
+    if not answer:
+        return default
+    return answer in {"y", "yes"}
+
+
+def _show_test_result(test_result) -> None:
+    status = "PASSED" if test_result.returncode == 0 else "FAILED"
+    print(
+        f"Tests {status}: {test_result.command} "
+        f"({test_result.duration_seconds:.2f}s)"
+    )
+    print(f"Test report: {test_result.output_file}")
+
+
+def _verify_undo(
+    repo: Path,
+    undone_entry: Path,
+) -> None:
+    patch_file = get_history_patch_file(undone_entry)
+    try:
+        run_git(
+            "apply",
+            "--check",
+            "--recount",
+            str(patch_file),
+            cwd=repo,
+        )
+    except GitError as exc:
+        raise PatchUndoError(
+            "Patchen backades, men återställningen "
+            "kunde inte verifieras.\n"
+            f"{exc}"
+        ) from exc
+
+
+def _post_apply_choice(
+    repo: Path,
+    result: ApplyResult,
+    test_result,
+    test_error: Exception | None,
+) -> None:
+    from .history import open_history_review
+
+    failed = (
+        test_result is not None
+        and test_result.returncode != 0
+    )
+
+    while True:
+        if failed:
+            print("[K] Keep changes  [U] Undo  [R] Review diff  [T] Show test output")
+            choice = input("> ").strip().lower()
+        else:
+            print("[K] Keep  [U] Undo  [R] Review diff")
+            choice = input("> ").strip().lower() or "k"
+
+        if choice == "k":
+            print("Changes kept.")
+            return
+
+        if choice == "r":
+            try:
+                open_history_review(
+                    result.history_entry
+                )
+            except HistoryError as exc:
+                print(f"Could not open review: {exc}")
+            continue
+
+        if choice == "t" and failed and test_result is not None:
+            try:
+                print(
+                    test_result.output_file.read_text(
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                )
+            except OSError as exc:
+                print(f"Could not read test output: {exc}")
+            continue
+
+        if choice == "u":
+            undone = undo_last_patch(repo)
+            _verify_undo(
+                repo,
+                undone.history_entry,
+            )
+            print("Changes restored successfully.")
+            return
+
+        if test_error is not None and choice == "t":
+            print(f"No test report is available: {test_error}")
+            continue
+
+        print("Choose K, U, R" + (", or T." if failed else "."))
+
+
+def _run_apply_flow(
+    repo: Path,
+    patch_file: Path,
+    *,
+    yes: bool = False,
+) -> ApplyResult:
+    preview = _apply_patch_core(
+        repo,
+        patch_file,
+        dry_run=True,
+    )
+    assert isinstance(preview, PatchPreview)
+
+    summary = _build_patch_summary(
+        repo,
+        preview,
+    )
+    print("Patch validated successfully.\n")
+    print("Planned changes:")
+    print(summary)
+
+    interactive = (
+        sys.stdin.isatty()
+        and sys.stdout.isatty()
+    )
+    if not interactive and not yes:
+        raise PatchError(
+            "Non-interactive apply requires --yes. "
+            "No repository files were changed."
+        )
+
+    if not yes:
+        if _ask_yes_no(
+            "View full diff before applying?",
+            default=True,
+        ):
+            print("\n" + preview.patch_text.rstrip() + "\n")
+
+        if not _ask_yes_no(
+            "Apply these changes?",
+            default=False,
+        ):
+            print("Apply cancelled. No repository files were changed.")
+            raise PatchError(
+                "Apply cancelled by user."
+            )
+
+    result = _apply_patch_core(
+        repo,
+        patch_file,
+    )
+    assert isinstance(result, ApplyResult)
+
+    print("\nPatch applied successfully.")
+    print("Running tests automatically...")
+
+    test_result = None
+    test_error: Exception | None = None
+    try:
+        from .history import update_history_test_result
+        from .test_runner import TestError, run_project_tests
+
+        try:
+            test_result = run_project_tests(repo)
+            update_history_test_result(
+                result.history_entry,
+                "PASSED" if test_result.returncode == 0 else "FAILED",
+                command=test_result.command,
+                returncode=test_result.returncode,
+                duration_seconds=test_result.duration_seconds,
+            )
+            _show_test_result(test_result)
+            if test_result.returncode != 0:
+                print(
+                    "Tests failed. The patch was applied successfully, "
+                    "but the test suite did not pass."
+                )
+        except TestError as exc:
+            test_error = exc
+            update_history_test_result(
+                result.history_entry,
+                "ERROR",
+            )
+            print(f"Tests could not be run: {exc}")
+    except HistoryError as exc:
+        test_error = exc
+        print(f"Could not save test status: {exc}")
+
+    print("\nWhat changed:")
+    print(summary)
+
+    if interactive:
+        _post_apply_choice(
+            repo,
+            result,
+            test_result,
+            test_error,
+        )
+    elif test_result is not None and test_result.returncode != 0:
+        print(
+            "Tests failed during non-interactive --yes apply. "
+            "Changes were kept; review the test report above."
+        )
+    elif test_error is not None:
+        print(
+            "Tests were unavailable during non-interactive --yes apply. "
+            "Changes were kept."
+        )
+
+    return result
+
+
+def apply_patch(
+    repo: Path,
+    patch_file: Path,
+) -> ApplyResult:
+    if _CLI_APPLY_INVOCATION:
+        _run_apply_flow(
+            repo,
+            patch_file,
+            yes=_CLI_APPLY_YES,
+        )
+        raise SystemExit(0)
+
+    result = _apply_patch_core(
+        repo,
+        patch_file,
+    )
+    assert isinstance(result, ApplyResult)
+    return result
 
 
 def undo_last_patch(

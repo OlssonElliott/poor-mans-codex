@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Callable
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .file_filter import (
     is_ignored,
@@ -19,6 +19,7 @@ from .git_utils import (
     get_unstaged_diff,
 )
 from .indexing.index_manager import IndexProgress, update_project_map
+from .indexing.project_graph import load_map, save_map
 from .retrieval.graph_retriever import retrieve_files
 from .workspace import (
     get_repo_workspace,
@@ -125,6 +126,11 @@ MAX_TOTAL_CHARS = 120_000
 MAX_TEST_RESULT_CHARS = 60_000
 PATCH_FULL_FILE_CHARS = 80_000
 PATCH_EXCERPT_RADIUS = 45
+CONTEXT_CAPTURE_RETRIES = 3
+
+CONTEXT_PURPOSE = (
+    "This request concerns maintenance of the users own local software repository."
+)
 
 PATCH_RESPONSE_INSTRUCTIONS = """\
 When this task requires code changes:
@@ -139,6 +145,8 @@ When this task requires code changes:
 8. Do not modify `.git` or sensitive files such as `.env`, credentials, private keys or secrets.
 9. For new files, use `/dev/null` as the old file.
 10. For deleted files, use `/dev/null` as the new file.
+11. Build `@@` hunk line numbers from the source-file line ranges shown in the
+    FILE/EXCERPT blocks, never from Markdown/document line numbers.
 
 The contents of the code block must be directly saveable as `incoming.diff`
 and applicable with:
@@ -152,6 +160,8 @@ Generate the patch against these contents.
 Uncommitted changes are intentional and must be preserved."""
 
 UPLOAD_INSTRUCTIONS = """\
+This request concerns maintenance of the users own local software repository.
+
 This file is an execution request.
 
 When this file is uploaded to ChatGPT, immediately perform the task described
@@ -294,7 +304,10 @@ def build_safe_status(
         for status_path in paths:
             path = repo / status_path.strip()
 
-            if is_ignored(path, repo):
+            if (
+                is_ignored(path, repo)
+                or _is_context_internal_artifact(path, repo)
+            ):
                 should_omit = True
                 break
 
@@ -351,6 +364,276 @@ def is_source_file(path: Path) -> bool:
     )
 
 
+def _internal_workspace_root(repo: Path) -> Path | None:
+    """Return ChatCode state root when that state lives inside the target repo."""
+    repo_root = repo.resolve()
+    try:
+        repo_workspace = get_repo_workspace(repo).resolve()
+    except OSError:
+        return None
+
+    for candidate in (repo_workspace, *repo_workspace.parents):
+        if candidate.parent == repo_root:
+            return candidate
+        if candidate == repo_root:
+            break
+
+    return None
+
+
+def _is_internal_workspace_path(
+    path: Path,
+    repo: Path,
+    workspace_root: Path | None = None,
+) -> bool:
+    workspace_root = workspace_root or _internal_workspace_root(repo)
+    if workspace_root is None:
+        return False
+
+    try:
+        path.resolve().relative_to(workspace_root)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _is_context_internal_artifact(
+    path: Path,
+    repo: Path,
+) -> bool:
+    """Identify ChatCode-owned state without hiding ordinary user files."""
+    if _is_internal_workspace_path(path, repo):
+        return True
+
+    try:
+        relative = path.resolve().relative_to(repo.resolve())
+    except (OSError, ValueError):
+        return False
+
+    parts = tuple(part.lower() for part in relative.parts)
+    if not parts:
+        return False
+
+    if parts[0] == ".chatcode":
+        return True
+
+    is_chatcode_source_repo = (
+        (repo / "chatcode" / "context_builder.py").is_file()
+        and (repo / "chatcode" / "workspace.py").is_file()
+    )
+    if not is_chatcode_source_repo:
+        return False
+
+    if len(parts) == 1 and parts[0] in {
+        "upload_to_chatgpt.md",
+        "patch_repair_context.md",
+        "context.md",
+        "context-state.json",
+        "project-map.json",
+    }:
+        return True
+
+    return parts[0] in {
+        "history",
+        "patches",
+        "test-results",
+    }
+
+
+def _iter_project_files(repo: Path):
+    workspace_root = _internal_workspace_root(repo)
+    for path in iter_repository_files(repo):
+        if _is_internal_workspace_path(path, repo, workspace_root):
+            continue
+        yield path
+
+
+def _iter_context_files(repo: Path):
+    for path in _iter_project_files(repo):
+        if _is_context_internal_artifact(path, repo):
+            continue
+        yield path
+
+
+def _task_file_tokens(task: str) -> list[str]:
+    tokens = re.findall(
+        r"(?:[A-Za-z0-9_.-]+[\\/])*[A-Za-z0-9_.-]+",
+        task,
+    )
+    cleaned: list[str] = []
+    for token in tokens:
+        token = token.strip(".,:;!?()[]{}'\"`")
+        if token:
+            cleaned.append(token)
+    return cleaned
+
+
+def _is_selectable_task_file(
+    path: Path,
+    repo: Path,
+) -> bool:
+    try:
+        path.resolve().relative_to(repo.resolve())
+    except (OSError, ValueError):
+        return False
+
+    return (
+        path.is_file()
+        and is_source_file(path)
+        and not is_ignored(path, repo)
+        and not _is_context_internal_artifact(path, repo)
+        and not _is_internal_workspace_path(path, repo)
+    )
+
+
+def _resolve_task_file_references(
+    repo: Path,
+    task: str,
+) -> list[Path]:
+    """Resolve deterministic file references from task text against the repo."""
+    repo_root = repo.resolve()
+    resolved: list[Path] = []
+    context_files: list[Path] | None = None
+
+    def all_context_files() -> list[Path]:
+        nonlocal context_files
+        if context_files is None:
+            context_files = [
+                path.resolve()
+                for path in _iter_context_files(repo)
+                if _is_selectable_task_file(path, repo)
+            ]
+        return context_files
+
+    for raw_token in _task_file_tokens(task):
+        normalized = raw_token.replace("\\", "/")
+        posix = PurePosixPath(normalized)
+        parts = posix.parts
+
+        if (
+            not parts
+            or posix.is_absolute()
+            or ".." in parts
+            or re.match(r"^[A-Za-z]:", normalized)
+        ):
+            continue
+
+        candidate = repo_root.joinpath(*parts)
+        if _is_selectable_task_file(candidate, repo):
+            candidate = candidate.resolve()
+            if candidate not in resolved:
+                resolved.append(candidate)
+            continue
+
+        lowered = normalized.lower()
+        matches: list[Path] = []
+
+        if "/" in normalized:
+            matches = [
+                path
+                for path in all_context_files()
+                if path.relative_to(repo_root).as_posix().lower() == lowered
+            ]
+        elif "." in normalized:
+            matches = [
+                path
+                for path in all_context_files()
+                if path.name.lower() == lowered
+            ]
+        else:
+            try:
+                matches = [
+                    path.resolve()
+                    for path in repo_root.iterdir()
+                    if _is_selectable_task_file(path, repo)
+                    and (
+                        path.name.lower() == lowered
+                        or path.stem.lower() == lowered
+                    )
+                ]
+            except OSError:
+                matches = []
+
+        if len(matches) == 1 and matches[0] not in resolved:
+            resolved.append(matches[0])
+
+    return resolved
+
+
+def _ensure_explicit_task_files(
+    repo: Path,
+    task: str,
+    files: list[Path],
+) -> list[Path]:
+    selected = list(files)
+    for path in _resolve_task_file_references(repo, task):
+        if path not in selected:
+            selected.append(path)
+    return selected
+
+
+def _purge_internal_workspace_from_index(repo: Path) -> None:
+    workspace_root = _internal_workspace_root(repo)
+    if workspace_root is None:
+        return
+
+    try:
+        graph = load_map(repo)
+    except Exception:
+        return
+
+    files = graph.get("files")
+    if not isinstance(files, dict):
+        return
+
+    removed = [
+        raw_path
+        for raw_path in files
+        if _is_internal_workspace_path(
+            repo.joinpath(*PurePosixPath(raw_path).parts),
+            repo,
+            workspace_root,
+        )
+    ]
+    if not removed:
+        return
+
+    for raw_path in removed:
+        files.pop(raw_path, None)
+
+    try:
+        save_map(repo, graph)
+    except Exception:
+        pass
+
+
+def _index_scope_paths(repo: Path) -> list[str] | None:
+    """Prevent a repo-local ChatCode workspace from entering the project index."""
+    workspace_root = _internal_workspace_root(repo)
+    if workspace_root is None:
+        return None
+
+    paths = {
+        path.relative_to(repo).as_posix()
+        for path in _iter_project_files(repo)
+        if is_source_file(path)
+    }
+
+    changed_paths = set(get_unstaged_changed_paths(repo))
+    changed_paths.update(get_staged_changed_paths(repo))
+    changed_paths.update(get_untracked_paths(repo))
+
+    for raw_path in changed_paths:
+        normalized = raw_path.replace("\\", "/")
+        candidate = (repo / normalized).resolve()
+        if _is_internal_workspace_path(candidate, repo, workspace_root):
+            continue
+        if is_source_file(Path(normalized)):
+            paths.add(normalized)
+
+    return sorted(paths)
+
+
 def build_tree(
     repo: Path,
     max_files: int = 500,
@@ -358,7 +641,7 @@ def build_tree(
     lines: list[str] = []
     file_count = 0
 
-    for path in iter_repository_files(repo):
+    for path in _iter_context_files(repo):
 
         file_count += 1
 
@@ -402,6 +685,12 @@ def get_changed_files(
             continue
 
         if not path.is_file():
+            continue
+
+        if _is_context_internal_artifact(path, repo):
+            continue
+
+        if _is_internal_workspace_path(path, repo):
             continue
 
         if is_ignored(path, repo):
@@ -497,34 +786,62 @@ def collect_relevant_files(
     graph_files: list[Path] = []
     effective_mode = "static"
     try:
-        update = update_project_map(repo, progress=index_progress)
-        effective_mode = update.effective_mode
-        graph_files = retrieve_files(
+        _purge_internal_workspace_from_index(repo)
+        index_paths = _index_scope_paths(repo)
+        update = update_project_map(
             repo,
-            task,
-            max_files=MAX_FILES,
-            index_mode=effective_mode,
+            paths=index_paths,
+            progress=index_progress,
         )
+        effective_mode = update.effective_mode
+        graph_files = [
+            path
+            for path in retrieve_files(
+                repo,
+                task,
+                max_files=MAX_FILES,
+                index_mode=effective_mode,
+            )
+            if (
+                not _is_internal_workspace_path(path, repo)
+                and not _is_context_internal_artifact(path, repo)
+            )
+        ]
     except Exception:
         graph_files = []
 
     task_words = get_task_words(task)
     changed_files = get_changed_files(repo)
+    explicit_files = _resolve_task_file_references(repo, task)
 
     if effective_mode == "ai":
         # AI retrieval is the primary selector in AI mode. Do not also scan
         # every source file's contents through the legacy static ranker.
-        selected: list[Path] = []
-        for path in [*sorted(changed_files), *graph_files]:
+        changed_source_files = sorted(
+            path
+            for path in changed_files
+            if path.is_file()
+            and is_source_file(path)
+            and not _is_context_internal_artifact(path, repo)
+        )
+        selected: list[Path] = list(changed_source_files)
+        for path in explicit_files:
+            if path not in selected:
+                selected.append(path)
+        selection_limit = max(
+            MAX_FILES,
+            len(selected),
+        )
+        for path in graph_files:
             if path.is_file() and is_source_file(path) and path not in selected:
                 selected.append(path)
-            if len(selected) >= MAX_FILES:
+            if len(selected) >= selection_limit:
                 break
         return selected
 
     candidate_scores: dict[Path, int] = {}
 
-    for path in iter_repository_files(repo):
+    for path in _iter_context_files(repo):
         if not is_source_file(path):
             continue
 
@@ -554,11 +871,29 @@ def collect_relevant_files(
         )
     )
 
-    return [
+    changed_source_files = sorted(
         path
-        for path, _
-        in candidates[:MAX_FILES]
-    ]
+        for path in changed_files
+        if path.is_file()
+        and is_source_file(path)
+        and not _is_context_internal_artifact(path, repo)
+    )
+    selected = list(changed_source_files)
+    for path in explicit_files:
+        if path not in selected:
+            selected.append(path)
+    selection_limit = max(
+        MAX_FILES,
+        len(selected),
+    )
+
+    for path, _ in candidates:
+        if path not in selected:
+            selected.append(path)
+        if len(selected) >= selection_limit:
+            break
+
+    return selected
 
 
 def build_source_context(
@@ -711,6 +1046,9 @@ def build_patch_source_context(
         files = collect_relevant_files(repo, task)
 
     changed_files = get_changed_files(repo)
+    explicit_files = set(
+        _resolve_task_file_references(repo, task)
+    )
     sections: list[str] = []
 
     for path in files:
@@ -725,13 +1063,14 @@ def build_patch_source_context(
         include_full = (
             len(content) <= PATCH_FULL_FILE_CHARS
             or path in changed_files
+            or path in explicit_files
         )
 
         if include_full:
             section = (
                 f"===== FULL FILE: {relative} =====\n"
                 f"SHA-256: {digest}\n"
-                f"Line range: 1-{max(1, len(content.splitlines()))}\n\n"
+                f"Source line range: 1-{max(1, len(content.splitlines()))}\n\n"
                 f"{content}\n"
             )
         else:
@@ -739,7 +1078,7 @@ def build_patch_source_context(
             excerpts: list[str] = []
             for start, end in _symbol_aware_ranges(content, task):
                 excerpts.append(
-                    f"----- EXCERPT {relative} lines {start}-{end} -----\n"
+                    f"----- EXCERPT {relative} source lines {start}-{end} -----\n"
                     + "".join(lines[start - 1:end])
                 )
             section = (
@@ -752,6 +1091,43 @@ def build_patch_source_context(
         sections.append(section)
 
     return "\n".join(sections) or "No relevant source files found."
+
+
+def _current_file_hashes(
+    files: list[Path],
+) -> dict[Path, str | None]:
+    hashes: dict[Path, str | None] = {}
+    for path in files:
+        try:
+            hashes[path] = hashlib.sha256(
+                path.read_bytes()
+            ).hexdigest()
+        except OSError:
+            hashes[path] = None
+    return hashes
+
+
+def _build_stable_patch_source_context(
+    repo: Path,
+    task: str,
+    files: list[Path],
+) -> str:
+    """Read source from disk and retry if it changes during context capture."""
+    for _attempt in range(CONTEXT_CAPTURE_RETRIES):
+        before = _current_file_hashes(files)
+        source_context = build_patch_source_context(
+            repo,
+            task,
+            files=files,
+        )
+        after = _current_file_hashes(files)
+        if before == after:
+            return source_context
+
+    raise RuntimeError(
+        "Source files changed while ChatCode was building context. "
+        "Run chatcode context again."
+    )
 
 
 def build_patch_context(
@@ -767,10 +1143,15 @@ def build_patch_context(
         task,
         index_progress=index_progress,
     )
-    source_context = build_patch_source_context(
+    files = _ensure_explicit_task_files(
         repo,
         task,
-        files=files,
+        files,
+    )
+    source_context = _build_stable_patch_source_context(
+        repo,
+        task,
+        files,
     )
     selected = [
         path.relative_to(repo).as_posix()
@@ -836,7 +1217,10 @@ def build_safe_diff(
     for raw_path in changed_paths:
         path = repo / raw_path
 
-        if is_ignored(path, repo):
+        if (
+            is_ignored(path, repo)
+            or _is_context_internal_artifact(path, repo)
+        ):
             omitted_count += 1
             continue
 
@@ -936,12 +1320,20 @@ def build_context(
 
     tree = build_tree(repo)
 
-    source_context = (
-        build_source_context(
-            repo,
-            task,
-            index_progress=index_progress,
-        )
+    files = collect_relevant_files(
+        repo,
+        task,
+        index_progress=index_progress,
+    )
+    files = _ensure_explicit_task_files(
+        repo,
+        task,
+        files,
+    )
+    source_context = _build_stable_patch_source_context(
+        repo,
+        task,
+        files,
     )
 
     failed_tests = (
@@ -971,6 +1363,12 @@ def build_context(
         "",
         "## Project structure",
         tree,
+        "",
+        "## Selected relevant files",
+        "\n".join(
+            f"- {path.relative_to(repo).as_posix()}"
+            for path in files
+        ) or "None",
         "",
         "## Relevant source files",
         source_context,

@@ -148,6 +148,44 @@ def _detect_gradle_tests(
     )
 
 
+def _is_python_project(
+    repo: Path,
+) -> bool:
+    markers = (
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "requirements.txt",
+        "Pipfile",
+        "tox.ini",
+    )
+
+    if any((repo / marker).exists() for marker in markers):
+        return True
+
+    try:
+        return any(repo.glob("*.py"))
+    except OSError:
+        return False
+
+
+def _config_mentions_pytest(
+    path: Path,
+) -> bool:
+    if not path.exists():
+        return False
+
+    try:
+        content = path.read_text(
+            encoding="utf-8",
+            errors="replace",
+        ).lower()
+    except OSError:
+        return False
+
+    return "pytest" in content
+
+
 def _uses_pytest(
     repo: Path,
 ) -> bool:
@@ -156,6 +194,21 @@ def _uses_pytest(
 
     if (repo / "conftest.py").exists():
         return True
+
+    if (
+        (repo / "tests").is_dir()
+        and _is_python_project(repo)
+    ):
+        return True
+
+    for config_name in (
+        "setup.cfg",
+        "tox.ini",
+    ):
+        if _config_mentions_pytest(
+            repo / config_name
+        ):
+            return True
 
     pyproject = repo / "pyproject.toml"
 

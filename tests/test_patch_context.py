@@ -8,12 +8,19 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from chatcode.context_builder import (
+    CONTEXT_PURPOSE,
+    MAX_FILES,
     PATCH_CONTEXT_HEADER,
+    PATCH_RESPONSE_INSTRUCTIONS,
+    UPLOAD_INSTRUCTIONS,
+    build_context,
     build_patch_context,
+    build_tree,
     collect_relevant_files,
 )
 from chatcode.context_state import save_context_state
-from chatcode.patch import PatchError, apply_patch
+from chatcode.indexing.project_graph import load_map, save_map
+from chatcode.patch import PatchError, apply_patch, build_patch_repair_context
 from chatcode.workspace import (
     get_default_patch_file,
     get_repair_context_file,
@@ -77,6 +84,359 @@ class PatchContextTests(unittest.TestCase):
             self.repo, "change widget", max_files=12, index_mode="ai"
         )
         legacy_scan.assert_not_called()
+
+    def test_explicit_readme_filename_is_mandatory_context(self) -> None:
+        readme = self.write("README.md", "# Current README\n")
+        selected = collect_relevant_files(
+            self.repo,
+            "update README.md",
+        )
+        self.assertIn(readme.resolve(), selected)
+
+    def test_bare_readme_resolves_unambiguous_readme_md(self) -> None:
+        readme = self.write("README.md", "# Current README\n")
+        selected = collect_relevant_files(
+            self.repo,
+            "update the readme",
+        )
+        self.assertIn(readme.resolve(), selected)
+
+    def test_exact_and_windows_style_paths_select_exact_file(self) -> None:
+        source = self.write("chatcode/patch.py", "value = 1\n")
+        for task in (
+            "update chatcode/patch.py",
+            r"update chatcode\patch.py",
+        ):
+            with self.subTest(task=task):
+                selected = collect_relevant_files(
+                    self.repo,
+                    task,
+                )
+                self.assertIn(source.resolve(), selected)
+
+    def test_explicit_file_is_not_dropped_at_normal_cap(self) -> None:
+        readme = self.write("README.md", "# Current README\n")
+        graph_files = [
+            self.write(
+                f"src/result_{index}.py",
+                f"value = {index}\n",
+            )
+            for index in range(MAX_FILES)
+        ]
+        update = Mock(effective_mode="ai")
+        with patch(
+            "chatcode.context_builder.update_project_map",
+            return_value=update,
+        ), patch(
+            "chatcode.context_builder.retrieve_files",
+            return_value=graph_files,
+        ):
+            selected = collect_relevant_files(
+                self.repo,
+                "update README.md",
+            )
+
+        self.assertIn(readme.resolve(), selected)
+        self.assertGreaterEqual(len(selected), MAX_FILES)
+
+    def test_explicit_file_is_kept_alongside_many_dirty_files(self) -> None:
+        readme = self.write("README.md", "# Current README\n")
+        dirty = [
+            self.write(
+                f"src/dirty_{index}.py",
+                f"value = {index}\n",
+            )
+            for index in range(MAX_FILES + 1)
+        ]
+        self.commit_all()
+        for index, source in enumerate(dirty):
+            source.write_text(
+                f"value = {index + 100}\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+
+        update = Mock(effective_mode="ai")
+        with patch(
+            "chatcode.context_builder.update_project_map",
+            return_value=update,
+        ), patch(
+            "chatcode.context_builder.retrieve_files",
+            return_value=[readme],
+        ):
+            selected = collect_relevant_files(
+                self.repo,
+                "update README.md",
+            )
+
+        self.assertIn(readme.resolve(), selected)
+        for source in dirty:
+            self.assertIn(source.resolve(), selected)
+
+    def test_explicit_file_is_deduplicated_from_retrieval(self) -> None:
+        readme = self.write("README.md", "# Current README\n")
+        update = Mock(effective_mode="ai")
+        with patch(
+            "chatcode.context_builder.update_project_map",
+            return_value=update,
+        ), patch(
+            "chatcode.context_builder.retrieve_files",
+            return_value=[readme, readme],
+        ):
+            selected = collect_relevant_files(
+                self.repo,
+                "update README.md",
+            )
+
+        self.assertEqual(
+            selected.count(readme.resolve()),
+            1,
+        )
+
+    def test_explicit_dirty_file_uses_current_contents_and_hash(self) -> None:
+        readme = self.write("README.md", "# committed\n")
+        self.commit_all()
+        readme.write_text(
+            "# dirty current README\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        context = build_context(
+            self.repo,
+            "update the readme",
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("===== FULL FILE: README.md =====", context)
+        self.assertIn("# dirty current README", context)
+        self.assertIn(
+            hashlib.sha256(readme.read_bytes()).hexdigest(),
+            context,
+        )
+
+    def test_ambiguous_basename_is_not_selected_arbitrarily(self) -> None:
+        first = self.write("one/config.py", "value = 1\n")
+        second = self.write("two/config.py", "value = 2\n")
+        update = Mock(effective_mode="ai")
+        with patch(
+            "chatcode.context_builder.update_project_map",
+            return_value=update,
+        ), patch(
+            "chatcode.context_builder.retrieve_files",
+            return_value=[],
+        ):
+            selected = collect_relevant_files(
+                self.repo,
+                "update config.py",
+            )
+
+        self.assertNotIn(first.resolve(), selected)
+        self.assertNotIn(second.resolve(), selected)
+
+    def test_nonexistent_and_parent_traversal_references_are_ignored(self) -> None:
+        outside = self.root / "outside.py"
+        outside.write_text("secret = True\n", encoding="utf-8")
+        update = Mock(effective_mode="ai")
+        with patch(
+            "chatcode.context_builder.update_project_map",
+            return_value=update,
+        ), patch(
+            "chatcode.context_builder.retrieve_files",
+            return_value=[],
+        ):
+            selected = collect_relevant_files(
+                self.repo,
+                "update missing.py and ../outside.py",
+            )
+
+        self.assertNotIn(outside.resolve(), selected)
+        self.assertEqual(selected, [])
+
+    def test_internal_artifact_is_not_selected_by_explicit_ordinary_task(self) -> None:
+        self.write("chatcode/context_builder.py", "# source\n")
+        self.write("chatcode/workspace.py", "# source\n")
+        internal = self.write(
+            "PATCH_REPAIR_CONTEXT.md",
+            "generated repair context\n",
+        )
+        update = Mock(effective_mode="ai")
+        with patch(
+            "chatcode.context_builder.update_project_map",
+            return_value=update,
+        ), patch(
+            "chatcode.context_builder.retrieve_files",
+            return_value=[],
+        ):
+            selected = collect_relevant_files(
+                self.repo,
+                "summarize PATCH_REPAIR_CONTEXT.md",
+            )
+
+        self.assertNotIn(internal.resolve(), selected)
+
+    def test_context_instructions_use_source_file_line_numbers(self) -> None:
+        self.assertIn(
+            CONTEXT_PURPOSE,
+            UPLOAD_INSTRUCTIONS,
+        )
+        self.assertIn(
+            "never from Markdown/document line numbers",
+            PATCH_RESPONSE_INSTRUCTIONS,
+        )
+
+    def test_normal_context_reads_current_working_tree_directly(self) -> None:
+        source = self.write(
+            "src/widget.py",
+            "value = 'committed'\n",
+        )
+        self.commit_all()
+        source.write_text(
+            "value = 'current working tree'\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        with patch(
+            "chatcode.context_builder.collect_relevant_files",
+            return_value=[source],
+        ):
+            context = build_context(
+                self.repo,
+                "change widget",
+            ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "value = 'current working tree'",
+            context,
+        )
+        self.assertIn(
+            hashlib.sha256(source.read_bytes()).hexdigest(),
+            context,
+        )
+        self.assertIn(
+            "Source line range: 1-1",
+            context,
+        )
+
+    def test_chatcode_internal_artifacts_are_hidden_from_normal_tree(self) -> None:
+        self.write(
+            "chatcode/context_builder.py",
+            "# source\n",
+        )
+        self.write(
+            "chatcode/workspace.py",
+            "# source\n",
+        )
+        self.write(
+            "UPLOAD_TO_CHATGPT.md",
+            "old generated context\n",
+        )
+        self.write(
+            "PATCH_REPAIR_CONTEXT.md",
+            "old repair context\n",
+        )
+        self.write(
+            "history/applied/old/metadata.json",
+            "{}\n",
+        )
+        user_file = self.write(
+            "docs/context.md",
+            "legitimate user documentation\n",
+        )
+
+        tree = build_tree(self.repo)
+
+        self.assertNotIn(
+            "UPLOAD_TO_CHATGPT.md",
+            tree,
+        )
+        self.assertNotIn(
+            "PATCH_REPAIR_CONTEXT.md",
+            tree,
+        )
+        self.assertNotIn(
+            "history",
+            tree,
+        )
+        self.assertIn(
+            str(user_file.relative_to(self.repo)),
+            tree,
+        )
+
+    def test_changed_files_are_not_lost_when_they_exceed_normal_cap(self) -> None:
+        sources = [
+            self.write(
+                f"src/changed_{index}.py",
+                f"value = {index}\n",
+            )
+            for index in range(MAX_FILES + 2)
+        ]
+        self.commit_all()
+
+        for index, source in enumerate(sources):
+            source.write_text(
+                f"value = {index + 100}\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+
+        update = Mock(effective_mode="ai")
+        with patch(
+            "chatcode.context_builder.update_project_map",
+            return_value=update,
+        ), patch(
+            "chatcode.context_builder.retrieve_files",
+            return_value=[],
+        ):
+            selected = collect_relevant_files(
+                self.repo,
+                "update changed values",
+            )
+
+        self.assertEqual(
+            set(selected),
+            set(sources),
+        )
+
+    def test_internal_chatcode_workspace_is_not_sent_to_indexer(self) -> None:
+        source = self.write("src/widget.py", "def widget():\n    return 1\n")
+        internal_workspace = self.repo / "workspace"
+        internal_file = internal_workspace / "other-project" / "app.py"
+        internal_file.parent.mkdir(parents=True, exist_ok=True)
+        internal_file.write_text("def other():\n    pass\n", encoding="utf-8")
+
+        save_map(self.repo, {
+            "version": 2,
+            "files": {
+                "workspace/other-project/app.py": {
+                    "path": "workspace/other-project/app.py",
+                    "hash": "stale",
+                    "language": "python",
+                }
+            },
+        })
+
+        update = Mock(effective_mode="ai")
+        with patch(
+            "chatcode.workspace.get_workspace_root",
+            return_value=internal_workspace,
+        ), patch(
+            "chatcode.context_builder.update_project_map",
+            return_value=update,
+        ) as update_map, patch(
+            "chatcode.context_builder.retrieve_files",
+            return_value=[source, internal_file],
+        ):
+            selected = collect_relevant_files(self.repo, "change widget")
+
+        indexed_paths = update_map.call_args.kwargs["paths"]
+        self.assertIn("src/widget.py", indexed_paths)
+        self.assertNotIn("workspace/other-project/app.py", indexed_paths)
+        self.assertNotIn(
+            "workspace/other-project/app.py",
+            load_map(self.repo).get("files", {}),
+        )
+        self.assertEqual(selected, [source])
 
     def commit_all(self) -> None:
         git(self.repo, "add", ".")
@@ -256,9 +616,33 @@ class PatchContextTests(unittest.TestCase):
         repair = get_repair_context_file(self.repo).read_text(encoding="utf-8")
         self.assertIn("git apply error", repair)
         self.assertIn("current = True", repair)
+        self.assertIn(hashlib.sha256(source.read_bytes()).hexdigest(), repair)
         self.assertIn("-stale = True\n+current = False", repair)
         self.assertIn("only a corrected unified diff", repair)
         self.assertEqual(source.read_text(encoding="utf-8"), "current = True\n")
+
+    def test_repair_context_matches_windows_style_error_path(self) -> None:
+        source = self.write("pkg/app.py", "current = True\n")
+        self.commit_all()
+        patch_text = (
+            "--- a/pkg/app.py\n"
+            "+++ b/pkg/app.py\n"
+            "@@ -1 +1 @@\n"
+            "-stale = True\n"
+            "+current = False\n"
+        )
+
+        output = build_patch_repair_context(
+            self.repo,
+            patch_text,
+            "error: patch failed: pkg\\app.py:1\n"
+            "error: pkg\\app.py: patch does not apply",
+        )
+        repair = output.read_text(encoding="utf-8")
+
+        self.assertIn("### pkg/app.py", repair)
+        self.assertIn("current = True", repair)
+        self.assertIn(hashlib.sha256(source.read_bytes()).hexdigest(), repair)
 
     def test_out_of_range_hunk_recovers_matching_context_without_invalid_range(self) -> None:
         lines = [f"padding_{index} = {index}" for index in range(7000)]
