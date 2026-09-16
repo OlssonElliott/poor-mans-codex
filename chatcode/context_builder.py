@@ -33,6 +33,7 @@ from .retrieval.hybrid_retriever import (
     expand_candidates,
     implementation_closure,
     resolve_explicit_targets,
+    resolve_task_surface_roots,
     resolve_semantic_hints,
     test_callsite_closure,
 )
@@ -165,8 +166,8 @@ When this task requires code changes:
 8. Do not modify `.git` or sensitive files such as `.env`, credentials, private keys or secrets.
 9. For new files, use `/dev/null` as the old file.
 10. For deleted files, use `/dev/null` as the new file.
-11. Build `@@` hunk line numbers from the source-file line ranges shown in the
-    FILE/EXCERPT blocks, never from Markdown/document line numbers.
+11. Build `@@` hunk line numbers from source-file ranges shown in FULL FILE,
+    SYMBOL CONTEXT, or EXCERPT blocks, never from Markdown/document line numbers.
 12. For a change inside an existing file, include at least three unchanged
     context lines when those lines exist. Never return a one-line hunk based
     only on a guessed line number.
@@ -838,6 +839,7 @@ def collect_relevant_files(
     graph_files: list[Path] = []
     explicit_targets: list[Path] = []
     explicit_target_reasons: dict[Path, list[str]] = {}
+    surface_result = RetrievalResult([])
     semantic_targets: list[Path] = []
     semantic_target_reasons: dict[Path, list[str]] = {}
     semantic_hints: list[str] = []
@@ -856,6 +858,7 @@ def collect_relevant_files(
         explicit_target_result = resolve_explicit_targets(repo, task)
         explicit_targets = explicit_target_result.files
         explicit_target_reasons = explicit_target_result.reasons
+        surface_result = resolve_task_surface_roots(repo, task)
         graph_files = [
             path
             for path in retrieve_files(
@@ -886,12 +889,18 @@ def collect_relevant_files(
     # Graph retrieval is the semantic/Qwen seed in AI mode and a useful
     # deterministic seed in static mode.  In both cases it is deliberately
     # expanded by the same structural ranker rather than treated as authority.
-    seed_files = list(dict.fromkeys([*explicit_targets, *semantic_targets, *graph_files]))
+    seed_files = list(dict.fromkeys([
+        *explicit_targets, *surface_result.files, *semantic_targets, *graph_files,
+    ]))
     hybrid = expand_candidates(repo, task, seed_files, limit=MAX_FILES)
     for path, reasons in explicit_target_reasons.items():
         hybrid.reasons[path] = list(dict.fromkeys([
             *reasons,
             *hybrid.reasons.get(path, []),
+        ]))
+    for path, reasons in surface_result.reasons.items():
+        hybrid.reasons[path] = list(dict.fromkeys([
+            *reasons, *hybrid.reasons.get(path, []),
         ]))
     for path, reasons in semantic_target_reasons.items():
         hybrid.reasons[path] = list(dict.fromkeys([
@@ -900,7 +909,10 @@ def collect_relevant_files(
         ]))
     closure_focus = {
         symbol
-        for result in (locals().get("explicit_target_result"), locals().get("semantic_target_result"))
+        for result in (
+            locals().get("explicit_target_result"), surface_result,
+            locals().get("semantic_target_result"),
+        )
         if result is not None
         for symbols in result.required_symbols.values()
         for symbol in symbols
@@ -948,6 +960,9 @@ def collect_relevant_files(
     for path in explicit_targets:
         if path not in selected and path not in ambiguous_files:
             selected.append(path)
+    for path in surface_result.files:
+        if path not in selected and path not in ambiguous_files:
+            selected.append(path)
     for path in semantic_targets:
         if path not in selected and path not in ambiguous_files:
             selected.append(path)
@@ -965,6 +980,7 @@ def collect_relevant_files(
     target_symbols: dict[Path, list[str]] = {}
     for source in (
         value for value in (
+            surface_result,
             locals().get("explicit_target_result"),
             locals().get("semantic_target_result"),
             closure,
@@ -973,7 +989,10 @@ def collect_relevant_files(
     ):
         for path, symbols in source.required_symbols.items():
             if path in selected:
-                target_symbols[path] = list(dict.fromkeys(symbols))
+                target_symbols.setdefault(path, [])
+                target_symbols[path] = list(dict.fromkeys([
+                    *target_symbols[path], *symbols,
+                ]))
     if get_boolean_setting("CHATCODE_RETRIEVAL_DEBUG"):
         print("Retrieval diagnostics:", file=os.sys.stderr)
         print(
@@ -1007,6 +1026,10 @@ def collect_relevant_files(
                 print(f"- {diagnostic}", file=os.sys.stderr)
             for path in sorted(callsite_closure.reasons, key=lambda value: str(value).lower()):
                 print(f"- {path.relative_to(repo)}: {', '.join(callsite_closure.reasons[path])}", file=os.sys.stderr)
+        if surface_result.diagnostics:
+            print("Task surfaces:", file=os.sys.stderr)
+            for diagnostic in surface_result.diagnostics:
+                print(f"- {diagnostic}", file=os.sys.stderr)
         for path, symbols in target_symbols.items():
             print(f"Required symbols: {path.relative_to(repo)}::{', '.join(symbols)}", file=os.sys.stderr)
         for path in selected:
@@ -1331,8 +1354,10 @@ def _fresh_symbol_ranges(content: str, path: Path, symbols: list[str]) -> list[t
     ]
 
 
-def _fresh_symbol_node(path: Path, symbol: str) -> tuple[str, list[str]] | None:
-    """Return one complete current Python definition and its method calls."""
+def _fresh_symbol_node(
+    path: Path, symbol: str,
+) -> tuple[str, list[str], int, int] | None:
+    """Return one complete current definition, calls, and exact source range."""
     try:
         content = path.read_text(encoding="utf-8", errors="replace")
         tree = ast.parse(content)
@@ -1349,14 +1374,31 @@ def _fresh_symbol_node(path: Path, symbol: str) -> tuple[str, list[str]] | None:
             if node.decorator_list else [node.lineno]
         )
         calls = [
-            call.func.attr
+            call.func.attr if isinstance(call.func, ast.Attribute) else call.func.id
             for call in sorted(
                 (item for item in ast.walk(node) if isinstance(item, ast.Call)),
                 key=lambda item: (item.lineno, item.col_offset),
             )
-            if isinstance(call.func, ast.Attribute)
+            if isinstance(call.func, (ast.Attribute, ast.Name))
         ]
-        return "".join(lines[start - 1:node.end_lineno]), list(dict.fromkeys(calls))
+        # Decorator callbacks are implementation dependencies even though the
+        # callback is passed by name rather than invoked in the function body
+        # (for example ``@autocomplete(item=choice_provider)``).
+        for decorator in node.decorator_list:
+            for call in (
+                item for item in ast.walk(decorator) if isinstance(item, ast.Call)
+            ):
+                calls.extend(
+                    keyword.value.id
+                    for keyword in call.keywords
+                    if isinstance(keyword.value, ast.Name)
+                )
+        return (
+            "".join(lines[start - 1:node.end_lineno]),
+            list(dict.fromkeys(calls)),
+            start,
+            node.end_lineno,
+        )
     return None
 
 
@@ -1397,34 +1439,62 @@ def _materialization_targets(
     ]
     ordered: list[tuple[Path, str, str]] = []
     seen: set[tuple[Path, str]] = set()
-    inherited = 0
 
-    def visit(path: Path, symbol: str, depth: int, priority: str) -> None:
-        nonlocal inherited
+    def add(path: Path, symbol: str, priority: str) -> bool:
         key = (path, symbol)
         if key in seen:
-            return
+            return False
         seen.add(key)
         ordered.append((path, symbol, priority))
-        if depth >= 2 or inherited >= max_inherited:
+        return True
+
+    # Every command/task-surface root is patch-critical. Register all of them
+    # before walking dependencies so a broad first command cannot exhaust the
+    # budget before a disconnected later surface reaches materialization.
+    for path, symbol in command_roots:
+        add(path, symbol, "patch target")
+
+    # Complete same-file implementation chains first. They are part of the
+    # concrete patch surface, not optional project-wide dependency expansion;
+    # otherwise a broad sibling class can consume the external-dependency cap
+    # before a small renderer chain in the same module is materialized.
+    def add_same_file_dependencies(path: Path, symbol: str, depth: int) -> None:
+        if depth >= 2:
             return
         node = _fresh_symbol_node(path, symbol)
         if node is None:
             return
         for called in node[1]:
-            for owner, definition in sorted(owners.get(called.casefold(), []), key=lambda item: str(item[0]).lower()):
-                if (owner, definition) == key or inherited >= max_inherited:
+            for owner, definition in owners.get(called.casefold(), []):
+                if owner != path:
                     continue
-                if (owner, definition) in seen:
-                    continue
-                inherited += 1
-                visit(owner, definition, depth + 1, "direct implementation dependency")
+                if add(owner, definition, "direct implementation dependency"):
+                    add_same_file_dependencies(owner, definition, depth + 1)
 
     for path, symbol in command_roots:
-        inherited = 0
-        visit(path, symbol, 0, "patch target")
+        add_same_file_dependencies(path, symbol, 0)
+
+    frontier = [(path, symbol, 0) for path, symbol in command_roots]
+    inherited = 0
+    while frontier and inherited < max_inherited:
+        path, symbol, depth = frontier.pop(0)
+        if depth >= 2:
+            continue
+        node = _fresh_symbol_node(path, symbol)
+        if node is None:
+            continue
+        for called in node[1]:
+            for owner, definition in sorted(
+                owners.get(called.casefold(), []), key=lambda item: str(item[0]).lower()
+            ):
+                if inherited >= max_inherited:
+                    break
+                if add(owner, definition, "direct implementation dependency"):
+                    inherited += 1
+                    frontier.append((owner, definition, depth + 1))
+
     for path, symbol in original:
-        visit(path, symbol, 0, "required implementation")
+        add(path, symbol, "required implementation")
     return ordered
 
 
@@ -1448,7 +1518,8 @@ def _render_required_symbols(
             )
             continue
         section = (
-            f"===== REQUIRED SOURCE: {relative}::{symbol} [{priority}] =====\n"
+            f"===== SYMBOL CONTEXT: {relative}::{symbol} [{priority}] "
+            f"source lines {node[2]}-{node[3]} =====\n"
             f"{node[0]}\n"
         )
         if used + len(section) <= budget:
@@ -1477,7 +1548,11 @@ def _enforce_materialization_invariant(
         if unavailable in rendered:
             continue
         node = _fresh_symbol_node(path, symbol)
-        header = f"===== REQUIRED SOURCE: {relative}::{symbol} "
+        header = (
+            f"===== SYMBOL CONTEXT: {relative}::{symbol} [{_priority}] "
+            f"source lines {node[2]}-{node[3]} ====="
+            if node is not None else ""
+        )
         if node is not None and header in rendered and node[0] in rendered:
             continue
         repairs.append(
@@ -1593,9 +1668,23 @@ def build_patch_source_context(
         priorities = {(path, symbol): priority for path, symbol, priority in materialization_targets}
         diagnostic_items = list(materialization_states.items())
         for (path, symbol), (state, detail) in diagnostic_items[:40]:
+            node = _fresh_symbol_node(path, symbol)
+            relative = path.relative_to(repo).as_posix()
+            expected_header = (
+                f"===== SYMBOL CONTEXT: {relative}::{symbol} "
+                f"[{priorities[(path, symbol)]}] source lines {node[2]}-{node[3]} ====="
+                if node is not None else ""
+            )
             print(f"{path.relative_to(repo)}::{symbol}", file=os.sys.stderr)
             print(f"- priority: {priorities[(path, symbol)]}", file=os.sys.stderr)
+            print(f"- fresh AST: {'yes' if node is not None else 'no'}", file=os.sys.stderr)
+            if node is not None:
+                print(f"- source lines: {node[2]}-{node[3]}", file=os.sys.stderr)
             print(f"- rendered: {'yes' if state == 'rendered' else 'no'}", file=os.sys.stderr)
+            if state == "rendered":
+                verified = expected_header in rendered and node is not None and node[0] in rendered
+                print("- rendered block: SYMBOL CONTEXT", file=os.sys.stderr)
+                print(f"- range verified: {'yes' if verified else 'no'}", file=os.sys.stderr)
             if state != "rendered":
                 print(f"- reason: {detail}", file=os.sys.stderr)
                 print("- status: non-patchable", file=os.sys.stderr)

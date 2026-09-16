@@ -15,6 +15,7 @@ from .context_state import (
     get_active_repair_targets,
     get_context_task,
     get_stale_context_reason,
+    save_context_state,
 )
 from .git_utils import GitError, get_status, run_git
 from .history import (
@@ -681,6 +682,19 @@ def _write_repair_context(
         _repair_state_file(repo),
         json.dumps(state, indent=2, ensure_ascii=False) + "\n",
         newline="\n",
+    )
+    # A repair context is the source of truth for the next canonical incoming
+    # patch as soon as it is offered to the user. Persist its post-patch
+    # working-tree baseline instead of leaving the original task generation
+    # active until a separate ``chatcode repair`` invocation.
+    original_task = get_context_task(repo)
+    save_context_state(
+        repo,
+        task=original_task,
+        context_sha256=state["context_sha256"],
+        context_filename=output_file.name,
+        context_kind="repair",
+        repair_targets=sorted(repair_targets),
     )
     atomic_write_text(output_file, content, newline="\n")
     return output_file
@@ -1946,6 +1960,7 @@ def _post_apply_choice(
     test_error: Exception | None,
     *,
     recommend_undo: bool = False,
+    recommend_keep_for_repair: bool = False,
     validation: TestValidation | None = None,
 ) -> None:
     from .history import open_history_review
@@ -1959,13 +1974,19 @@ def _post_apply_choice(
     while True:
         if failed:
             undo_label = "[U] Undo (recommended)" if recommend_undo else "[U] Undo"
+            keep_label = (
+                "[K] Keep changes (recommended for repair)"
+                if recommend_keep_for_repair else "[K] Keep changes"
+            )
             if pre_existing_only:
-                print(f"[K] Keep changes  [F] Create fix context for existing failure  {undo_label}  [R] Review diff  [T] Show test output")
+                print(f"{keep_label}  [F] Create fix context for existing failure  {undo_label}  [R] Review diff  [T] Show test output")
             else:
-                print(f"[K] Keep changes  {undo_label}  [R] Review diff  [T] Show test output")
+                print(f"{keep_label}  {undo_label}  [R] Review diff  [T] Show test output")
             choice = input("> ").strip().lower()
             if not choice and recommend_undo:
                 choice = "u"
+            elif not choice and recommend_keep_for_repair:
+                choice = "k"
         else:
             print("[K] Keep  [U] Undo  [R] Review diff")
             choice = input("> ").strip().lower() or "k"
@@ -2013,20 +2034,11 @@ def _post_apply_choice(
                 undone.history_entry,
             )
             print("Changes restored successfully.")
-            if validation is not None and validation.status == "repair_failed":
-                try:
-                    refreshed = build_test_failure_repair_context(
-                        repo,
-                        ApplyResult(undone.paths, undone.history_entry),
-                        validation,
-                    )
-                    print("Repair context rebuilt against the restored working tree.")
-                    print(f"Run `chatcode repair` before sending: {refreshed}")
-                except OSError as exc:
-                    print(_status(
-                        f"Could not rebuild repair context after undo: {exc}",
-                        "yellow",
-                    ))
+            if recommend_keep_for_repair or (
+                validation is not None and validation.status == "repair_failed"
+            ):
+                _clear_repair_context(repo)
+                print("Repair context invalidated because its working-tree baseline was undone.")
             return
 
         if test_error is not None and choice == "t":
@@ -2200,7 +2212,7 @@ def _run_apply_flow(
                 else relevant_result
             ),
             test_error,
-            recommend_undo=validation.status in {"repair_failed", "regressions"},
+            recommend_keep_for_repair=not validation_passed,
             validation=validation,
         )
     elif not validation_passed:

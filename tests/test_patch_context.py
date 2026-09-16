@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 import tempfile
 import unittest
@@ -659,6 +660,106 @@ class PatchContextTests(unittest.TestCase):
     def commit_all(self) -> None:
         git(self.repo, "add", ".")
         git(self.repo, "commit", "-qm", "fixture")
+
+    def test_disconnected_surface_definitions_are_materialized_in_final_context(self) -> None:
+        self.write(
+            "commands/world.py",
+            "class WorldCommands:\n"
+            "    async def inventory_item_autocomplete(self):\n"
+            "        return 'CURRENT autocomplete'\n\n"
+            "    @app_commands.autocomplete(item=inventory_item_autocomplete)\n"
+            "    @app_commands.command(name='drop')\n"
+            "    async def drop(self):\n"
+            "        return 'drop stacks'\n",
+        )
+        self.write(
+            "commands/inventory.py",
+            "def inventory_embed():\n    return 'CURRENT inventory renderer'\n\n"
+            "def inventory_embeds():\n    return [inventory_embed()]\n\n"
+            "class InventoryItemSelect:\n    pass\n\n"
+            "class InventoryView:\n    def render(self):\n        return 'CURRENT inventory view'\n"
+            "\nasync def show_inventory():\n"
+            "    embeds = inventory_embeds()\n"
+            "    return embeds, InventoryView()\n",
+        )
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-qm", "fixture")
+        self.write(
+            "commands/inventory.py",
+            "# dirty working-tree lines inserted before every definition\n\n"
+            "def inventory_embed():\n    return 'DIRTY current inventory renderer'\n\n"
+            "def inventory_embeds():\n    return [inventory_embed()]\n\n"
+            "class InventoryItemSelect:\n    pass\n\n"
+            "class InventoryView:\n    def render(self):\n"
+            "        marker = 'DIRTY current inventory view'\n"
+            "        return InventoryItemSelect(), marker\n"
+            "\nasync def show_inventory():\n"
+            "    marker = 'DIRTY current show inventory'\n"
+            "    return inventory_embeds(), InventoryView(), marker\n",
+        )
+        self.write(
+            "commands/world.py",
+            "class WorldCommands:\n"
+            "    async def inventory_item_autocomplete(self):\n"
+            "        return 'DIRTY current inventory autocomplete'\n\n"
+            "    @app_commands.autocomplete(item=inventory_item_autocomplete)\n"
+            "    @app_commands.command(name='drop')\n"
+            "    async def drop(self):\n"
+            "        return 'drop stacks'\n",
+        )
+
+        output = build_context(
+            self.repo,
+            "right now stackable items like lockpicks are not displayed as if they are stacked in the "
+            "character inventory in discord. when you write /drop they are also displayed as different items.",
+        )
+        context = output.read_text(encoding="utf-8")
+
+        self.assertIn("def drop", context)
+        self.assertIn("def inventory_embed", context)
+        self.assertIn("DIRTY current inventory renderer", context)
+        self.assertIn("def show_inventory", context)
+        self.assertIn("DIRTY current show inventory", context)
+        self.assertIn("def inventory_item_autocomplete", context)
+        self.assertIn("DIRTY current inventory autocomplete", context)
+        self.assertIn("class InventoryView", context)
+        expected_symbols = (
+            ("commands/inventory.py", "inventory_embed"),
+            ("commands/inventory.py", "show_inventory"),
+            ("commands/inventory.py", "InventoryView"),
+            ("commands/inventory.py", "InventoryItemSelect"),
+            ("commands/world.py", "inventory_item_autocomplete"),
+            ("commands/world.py", "drop"),
+        )
+        for relative, symbol in expected_symbols:
+            match = re.search(
+                rf"^===== SYMBOL CONTEXT: {re.escape(relative)}::{symbol} "
+                rf"\[[^]]+\] source lines (\d+)-(\d+) =====$",
+                context,
+                re.MULTILINE,
+            )
+            self.assertIsNotNone(match, f"missing ranged source block for {symbol}")
+            start, end = map(int, match.groups())
+            source = (self.repo / relative).read_text(encoding="utf-8")
+            exact = "".join(source.splitlines(keepends=True)[start - 1:end])
+            self.assertTrue(
+                context.startswith(exact, match.end() + 1),
+                f"declared range does not reproduce {symbol}",
+            )
+            if symbol == "inventory_embed":
+                self.assertEqual(start, 3)  # committed range started at line 1
+
+        drop_header = re.search(
+            r"SYMBOL CONTEXT: commands/world.py::drop \[[^]]+\] "
+            r"source lines (\d+)-(\d+)",
+            context,
+        )
+        self.assertIsNotNone(drop_header)
+        drop_start = int(drop_header.group(1))
+        self.assertEqual(
+            (self.repo / "commands/world.py").read_text(encoding="utf-8").splitlines()[drop_start - 1],
+            "    @app_commands.autocomplete(item=inventory_item_autocomplete)",
+        )
 
     def test_clean_working_tree_uses_exact_current_file_and_hash(self) -> None:
         source = self.write("src/widget.py", "def widget():\n    return 1\n")

@@ -207,6 +207,8 @@ def get_stale_context_reason(
         )
 
     expected_context_hash = state.get("context_sha256")
+    context_kind = state.get("context_kind", "normal")
+    is_repair = context_kind == "repair"
     if isinstance(expected_context_hash, str) and expected_context_hash:
         context_filename = state.get("context_filename", "UPLOAD_TO_CHATGPT.md")
         if not isinstance(context_filename, str) or Path(context_filename).name != context_filename:
@@ -217,6 +219,12 @@ def get_stale_context_reason(
         except OSError:
             actual_context_hash = None
         if actual_context_hash != expected_context_hash:
+            if is_repair:
+                return (
+                    "Repair context is stale. PATCH_REPAIR_CONTEXT.md and its "
+                    "metadata belong to different generations. Regenerate the "
+                    "repair context before applying this repair patch."
+                )
             return (
                 "UPLOAD_TO_CHATGPT.md och context-state hör inte till samma "
                 "publicerade generation. Kör chatcode context igen innan du "
@@ -230,6 +238,13 @@ def get_stale_context_reason(
     current_branch = get_branch(repo)
 
     if expected_branch != current_branch:
+        if is_repair:
+            return (
+                "Repair context is stale.\n\n"
+                f"It was created on branch {expected_branch}, but the current "
+                f"branch is {current_branch}.\n\n"
+                "Regenerate the repair context before applying this repair patch."
+            )
         return (
             "Contexten är inaktuell.\n\n"
             "Den skapades på branch "
@@ -245,6 +260,11 @@ def get_stale_context_reason(
     )
 
     if not isinstance(snapshot, dict):
+        if is_repair:
+            return (
+                "Repair context metadata is invalid. Regenerate the repair "
+                "context before applying this repair patch."
+            )
         return (
             "Context state är ogiltig.\n\n"
             "Kör chatcode context igen "
@@ -307,6 +327,14 @@ def get_stale_context_reason(
         f"- {path}"
         for path in changed
     )
+
+    if is_repair:
+        return (
+            "Repair context is stale.\n\n"
+            "The following files changed after PATCH_REPAIR_CONTEXT.md was created:\n"
+            f"{file_list}\n\n"
+            "Regenerate the repair context before applying this repair patch."
+        )
 
     return (
         "Contexten är inaktuell.\n\n"

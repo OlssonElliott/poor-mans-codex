@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from chatcode.context_state import get_stale_context_reason, save_context_state
 from chatcode.patch import (
     PatchError,
     PatchPreview,
@@ -90,6 +91,20 @@ class ApplyFlowTests(unittest.TestCase):
             duration_seconds=0.1,
             output_file=report,
         )
+
+    def canonical_patch(self, old: int, new: int) -> Path:
+        incoming = get_default_patch_file(self.repo)
+        incoming.parent.mkdir(parents=True, exist_ok=True)
+        incoming.write_text(
+            "--- a/app.py\n"
+            "+++ b/app.py\n"
+            "@@ -1 +1 @@\n"
+            f"-value = {old}\n"
+            f"+value = {new}\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        return incoming
 
     def interactive(self):
         return (
@@ -651,7 +666,7 @@ class ApplyFlowTests(unittest.TestCase):
         self.assertIn("REPAIR SUCCESSFUL", rendered)
         self.assertIn("REPAIR: PASS | TARGET FAILURES REMAIN: 0", rendered)
 
-    def test_failed_repair_stops_after_targeted_test_and_defaults_to_undo(self) -> None:
+    def test_failed_repair_stops_after_targeted_test_and_defaults_to_keep(self) -> None:
         target = "test_dashboard_api.DashboardAPITests.test_traps"
         baseline = TestResult(**{
             **self.result(1).__dict__,
@@ -679,13 +694,61 @@ class ApplyFlowTests(unittest.TestCase):
             _run_apply_flow(self.repo, self.incoming)
 
         self.assertEqual(full.call_count, 1)
-        self.assertEqual(self.source.read_text(encoding="utf-8"), "value = 1\n")
+        self.assertEqual(self.source.read_text(encoding="utf-8"), "value = 2\n")
         rendered = "\n".join(
             str(call.args[0]) for call in output.call_args_list if call.args
         )
         self.assertIn("Repair candidate rejected by relevant tests", rendered)
-        self.assertIn("[U] Undo (recommended)", rendered)
-        self.assertIn("Repair context rebuilt against the restored working tree", rendered)
+        self.assertIn("[K] Keep changes (recommended for repair)", rendered)
+        self.assertNotIn("[U] Undo (recommended)", rendered)
+
+    def test_undo_invalidates_post_patch_repair_context(self) -> None:
+        baseline = self.result()
+        failed = TestResult(**{
+            **self.result(1).__dict__,
+            "failed_tests": frozenset({"tests.test_regression"}),
+        })
+        stdin, stdout = self.interactive()
+
+        with patch(
+            "chatcode.test_runner.run_project_tests",
+            side_effect=[baseline, failed],
+        ), patch(
+            "chatcode.test_runner.run_relevant_tests", return_value=None,
+        ), stdin, stdout, patch(
+            "builtins.input", side_effect=["n", "y", "u"],
+        ), patch("builtins.print") as output:
+            _run_apply_flow(self.repo, self.incoming)
+
+        self.assertEqual(self.source.read_text(encoding="utf-8"), "value = 1\n")
+        self.assertFalse(get_repair_context_file(self.repo).exists())
+        self.assertIsNotNone(get_stale_context_reason(self.repo, {"app.py"}))
+        with self.assertRaises(PatchError) as raised:
+            apply_patch(self.repo, self.canonical_patch(2, 3))
+        self.assertEqual(raised.exception.failure_type, "stale_context")
+        self.assertIn("Repair context is stale", str(raised.exception))
+        rendered = "\n".join(
+            str(call.args[0]) for call in output.call_args_list if call.args
+        )
+        self.assertIn("Repair context invalidated", rendered)
+
+    def test_normal_patch_uses_normal_context_baseline(self) -> None:
+        save_context_state(self.repo, task="normal task")
+
+        apply_patch(self.repo, self.canonical_patch(1, 2))
+
+        self.assertEqual(self.source.read_text(encoding="utf-8"), "value = 2\n")
+
+    def test_normal_patch_rejects_manual_edit_after_context(self) -> None:
+        save_context_state(self.repo, task="normal task")
+        self.source.write_text("value = 9\n", encoding="utf-8", newline="\n")
+
+        with self.assertRaises(PatchError) as raised:
+            apply_patch(self.repo, self.canonical_patch(1, 2))
+
+        self.assertEqual(raised.exception.failure_type, "stale_context")
+        self.assertIn("UPLOAD_TO_CHATGPT.md", str(raised.exception))
+        self.assertNotIn("Repair context is stale", str(raised.exception))
 
     def test_terminal_status_is_readable_when_color_is_disabled(self) -> None:
         with patch.dict("os.environ", {"NO_COLOR": "1"}, clear=False), patch(
@@ -733,6 +796,73 @@ class ApplyFlowTests(unittest.TestCase):
             "Working-tree files changed",
             get_repair_context_stale_reason(self.repo),
         )
+
+    def test_repair_patch_uses_post_patch_context_baseline(self) -> None:
+        save_context_state(self.repo, task="normal task")
+        first = apply_patch(self.repo, self.canonical_patch(1, 2))
+        failure = "tests.test_drop_autocomplete_lists_only_unequipped_inventory_items"
+        failed = TestResult(**{
+            **self.result(1).__dict__, "failed_tests": frozenset({failure}),
+        })
+        validation = TestValidation(
+            baseline=self.result(),
+            targeted=None,
+            full=failed,
+            status="regressions",
+            new_failures=frozenset({failure}),
+        )
+        build_test_failure_repair_context(self.repo, first, validation)
+
+        self.assertIsNone(get_stale_context_reason(self.repo, {"app.py"}))
+        second = apply_patch(self.repo, self.canonical_patch(2, 3))
+
+        self.assertIn("app.py", second.paths)
+        self.assertEqual(self.source.read_text(encoding="utf-8"), "value = 3\n")
+
+    def test_repair_patch_rejects_manual_edit_after_repair_context(self) -> None:
+        save_context_state(self.repo, task="normal task")
+        first = apply_patch(self.repo, self.canonical_patch(1, 2))
+        failed = TestResult(**{
+            **self.result(1).__dict__, "failed_tests": frozenset({"tests.test_regression"}),
+        })
+        build_test_failure_repair_context(
+            self.repo,
+            first,
+            TestValidation(
+                baseline=self.result(), targeted=None, full=failed,
+                status="regressions", new_failures=failed.failed_tests,
+            ),
+        )
+        self.source.write_text("value = 99\n", encoding="utf-8", newline="\n")
+
+        with self.assertRaises(PatchError) as raised:
+            apply_patch(self.repo, self.canonical_patch(2, 3))
+
+        self.assertEqual(raised.exception.failure_type, "stale_context")
+        self.assertIn("Repair context is stale", str(raised.exception))
+        self.assertIn("PATCH_REPAIR_CONTEXT.md", str(raised.exception))
+        self.assertNotIn("run chatcode context", str(raised.exception).lower())
+
+    def test_new_normal_context_replaces_completed_repair_baseline(self) -> None:
+        save_context_state(self.repo, task="normal task")
+        first = apply_patch(self.repo, self.canonical_patch(1, 2))
+        failed = TestResult(**{
+            **self.result(1).__dict__, "failed_tests": frozenset({"tests.test_regression"}),
+        })
+        build_test_failure_repair_context(
+            self.repo,
+            first,
+            TestValidation(
+                baseline=self.result(), targeted=None, full=failed,
+                status="regressions", new_failures=failed.failed_tests,
+            ),
+        )
+        apply_patch(self.repo, self.canonical_patch(2, 3))
+
+        save_context_state(self.repo, task="later normal task")
+        apply_patch(self.repo, self.canonical_patch(3, 4))
+
+        self.assertEqual(self.source.read_text(encoding="utf-8"), "value = 4\n")
 
     def test_repair_context_includes_failure_trace_sources_and_compacts_noise(self) -> None:
         applied = apply_patch(self.repo, self.incoming)
@@ -849,7 +979,7 @@ class ApplyFlowTests(unittest.TestCase):
             printed,
         )
         self.assertIn(
-            "[K] Keep changes  [U] Undo  [R] Review diff  [T] Show test output",
+            "[K] Keep changes (recommended for repair)  [U] Undo  [R] Review diff  [T] Show test output",
             printed,
         )
         self.assertNotIn("Keep changes anyway", printed)

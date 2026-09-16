@@ -14,6 +14,7 @@ from chatcode.retrieval.hybrid_retriever import (
     implementation_closure,
     test_callsite_closure,
     resolve_explicit_targets,
+    resolve_task_surface_roots,
     resolve_semantic_hints,
 )
 
@@ -52,6 +53,56 @@ class HybridRetrieverTests(unittest.TestCase):
         result = expand_candidates(self.repo, "fix inventory command", [command])
         self.assertIn(service, result.files)
         self.assertIn(test, result.files)
+
+    def test_disconnected_explicit_task_surfaces_receive_separate_roots(self) -> None:
+        command = self.write("commands/world.py")
+        inventory = self.write("ui/inventory_ui.py")
+        self.map({
+            "commands/world.py": {"dependencies": [], "symbols": [{"name": "drop"}]},
+            "ui/inventory_ui.py": {"dependencies": [], "symbols": [
+                {"name": "inventory_embed"}, {"name": "InventoryView"},
+            ]},
+        })
+
+        result = resolve_task_surface_roots(
+            self.repo,
+            "right now stackable items are not displayed as stacked in the character inventory. "
+            "when you write /drop they are displayed as different items.",
+        )
+
+        self.assertIn(command, result.files)
+        self.assertIn(inventory, result.files)
+        self.assertIn("drop", result.required_symbols[command])
+        self.assertIn("inventory_embed", result.required_symbols[inventory])
+        self.assertIn("InventoryView", result.required_symbols[inventory])
+
+    def test_explicit_command_follows_only_the_resolved_entry_point_body(self) -> None:
+        command = self.write(
+            "commands/world.py",
+            "class WorldCommands:\n"
+            "    @app.command(name='drop')\n"
+            "    async def drop(self):\n        return self.drop_item()\n\n"
+            "    async def unrelated(self):\n        return self.erase_everything()\n",
+        )
+        service = self.write(
+            "services/world.py",
+            "def drop_item(): pass\n\ndef erase_everything(): pass\n",
+        )
+        self.map({
+            "commands/world.py": {"dependencies": [], "symbols": [
+                {"name": "drop", "definition_name": "drop"},
+                {"name": "unrelated"},
+            ]},
+            "services/world.py": {"dependencies": [], "symbols": [
+                {"name": "drop_item"}, {"name": "erase_everything"},
+            ]},
+        })
+
+        result = resolve_explicit_targets(self.repo, "fix /drop")
+
+        self.assertIn("drop", result.required_symbols[command])
+        self.assertIn("drop_item", result.required_symbols[service])
+        self.assertNotIn("erase_everything", result.required_symbols[service])
 
     def test_generic_dependency_does_not_force_large_expansion(self) -> None:
         command = self.write("commands/payments.py")

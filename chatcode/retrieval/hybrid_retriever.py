@@ -24,6 +24,11 @@ MAX_COMPLETENESS_RESOLVED = 3
 MAX_EXPLICIT_TARGETS = 8
 MAX_SEMANTIC_HINTS = 12
 MAX_CLOSURE_FILES = 8
+MAX_TASK_SURFACES = 4
+# A surface can have a small set of equally strong concrete definitions (for
+# example renderer, view, presenter, and autocomplete). Keep this bounded,
+# while allowing each independently promoted root to reach materialization.
+MAX_SURFACE_ROOTS = 4
 GENERIC_PATH_PARTS = {"utils", "util", "common", "config", "settings", "constants", "helpers"}
 
 
@@ -40,6 +45,96 @@ class RetrievalResult:
 class CompletenessResult:
     files: list[Path] = field(default_factory=list)
     reasons: dict[Path, str] = field(default_factory=dict)
+
+
+def _task_surfaces(task: str) -> list[str]:
+    """Split only explicit functional clauses, never arbitrary nouns."""
+    clauses = re.split(
+        r"\s*(?:;|\n+|[.!?]\s+(?=(?:when|make|show|render|display|use|update|save|delete|drop|take|/))|"
+        r"\band\s+(?=(?:make|show|render|display|use|update|save|delete|drop|take|/)))\s*",
+        task,
+        flags=re.IGNORECASE,
+    )
+    return list(dict.fromkeys(clause.strip() for clause in clauses if clause.strip()))[:MAX_TASK_SURFACES]
+
+
+def resolve_task_surface_roots(repo: Path, task: str) -> RetrievalResult:
+    """Find a few real indexed roots for every explicit task surface."""
+    surfaces = _task_surfaces(task)
+    # Preserve established single-surface ranking/materialization exactly.
+    if len(surfaces) < 2:
+        return RetrievalResult([])
+    index = load_map(repo).get("files", {})
+    paths: list[Path] = []
+    reasons: dict[Path, list[str]] = defaultdict(list)
+    required: dict[Path, list[str]] = defaultdict(list)
+    diagnostics: list[str] = []
+    presentation_terms = {"display", "displayed", "show", "render", "rendering", "view", "embed", "ui"}
+    for surface in surfaces:
+        tokens = {
+            token.casefold()
+            for token in re.findall(r"[A-Za-z0-9]+", surface.replace("_", " "))
+            if len(token) >= 3
+        }
+        candidates: list[tuple[int, str, str]] = []
+        for relative, entry in index.items():
+            if not (repo / relative).is_file():
+                continue
+            # Surface roots are patchable implementation definitions. Tests
+            # remain available through the dedicated test/call-site closure,
+            # but cannot consume this bounded implementation-root set.
+            if _is_test(relative):
+                continue
+            important = {
+                str(value).casefold()
+                for value in entry.get("important_symbols", [])
+                if isinstance(value, str)
+            }
+            file_tokens = set(re.findall(r"[a-z0-9]+", relative.casefold().replace("_", " ")))
+            for symbol in entry.get("symbols", []):
+                if not isinstance(symbol, dict) or not symbol.get("name"):
+                    continue
+                name = str(symbol["name"])
+                symbol_text = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", name)
+                symbol_tokens = set(re.findall(r"[a-z0-9]+", symbol_text.casefold().replace("_", " ")))
+                overlap = tokens & (symbol_tokens | file_tokens)
+                if not overlap:
+                    continue
+                score = 70 * len(tokens & symbol_tokens) + 25 * len(tokens & file_tokens)
+                if name.casefold() in tokens:
+                    score += 120
+                # Normalize the already-supported presentation vocabulary so
+                # inflected task wording ("displayed") can resolve concrete
+                # show/render/view/embed definitions for the same noun surface.
+                if tokens & presentation_terms and symbol_tokens & presentation_terms:
+                    score += 180
+                # The index already records a bounded set of central symbols.
+                # Use that existing definition metadata only to break close
+                # matches; it does not add files or candidates to the search.
+                if name.casefold() in important:
+                    score += 80
+                # A surface must have meaningful evidence, not a lone generic
+                # filename coincidence.
+                if score >= 70:
+                    candidates.append((score, relative, str(symbol.get("definition_name") or name)))
+        selected = sorted(candidates, key=lambda item: (-item[0], item[1].lower(), item[2].lower()))[:MAX_SURFACE_ROOTS]
+        if not selected:
+            diagnostics.append(f"surface unresolved: {surface}")
+            continue
+        # This means concrete definition roots were resolved. Rendering is
+        # verified later by the shared required-source materializer; references
+        # or imports alone never produce this state.
+        diagnostics.append(f"surface definition roots resolved: {surface}")
+        for _score, relative, symbol in selected:
+            path = repo / relative
+            if path not in paths:
+                paths.append(path)
+            label = f"explicit task surface: {surface}"
+            if label not in reasons[path]:
+                reasons[path].append(label)
+            if symbol not in required[path]:
+                required[path].append(symbol)
+    return RetrievalResult(paths, dict(reasons), paths.copy(), dict(required), diagnostics)
 
 
 def resolve_explicit_targets(repo: Path, task: str) -> RetrievalResult:
@@ -105,10 +200,14 @@ def resolve_explicit_targets(repo: Path, task: str) -> RetrievalResult:
             if relative in inspected:
                 continue
             inspected.add(relative)
-            try:
-                source = (repo / relative).read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
+            # Follow the resolved entry-point definitions, not every call in
+            # their containing module. Scanning the whole file makes one
+            # explicit command (for example /drop) promote unrelated commands
+            # and their dependency trees ahead of other task surfaces.
+            source = "\n".join(
+                _fresh_python_symbol_text(repo / relative, symbol)
+                for symbol in required[relative]
+            )
             for method in re.findall(r"\.([a-z_][A-Za-z0-9_]*)\s*\(", source):
                 for owner in symbol_owners.get(method.lower(), set()):
                     if owner != relative:
