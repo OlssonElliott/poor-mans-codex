@@ -13,6 +13,7 @@ from .file_filter import (
     iter_repository_files,
 )
 from .git_utils import (
+    GitError,
     get_branch,
     get_staged_changed_paths,
     get_staged_diff,
@@ -20,6 +21,7 @@ from .git_utils import (
     get_untracked_paths,
     get_unstaged_changed_paths,
     get_unstaged_diff,
+    run_git,
 )
 from .context_state import save_context_state
 from .config import get_boolean_setting
@@ -753,6 +755,79 @@ def get_changed_files(
     return changed
 
 
+def _changed_python_definition_roots(
+    repo: Path,
+    paths: list[Path],
+) -> dict[Path, list[str]]:
+    """Resolve dirty definitions when an oversized file cannot render in full."""
+    roots: dict[Path, list[str]] = {}
+    hunk_pattern = re.compile(
+        r"^@@ -\d+(?:,\d+)? \+(?P<start>\d+)(?:,(?P<count>\d+))? @@",
+        re.MULTILINE,
+    )
+    for path in paths:
+        if path.suffix.casefold() != ".py" or not path.is_file():
+            continue
+        relative = path.relative_to(repo).as_posix()
+        try:
+            diff = run_git(
+                "diff", "HEAD", "--unified=0", "--no-renames", "--", relative,
+                cwd=repo,
+            )
+            source = path.read_text(encoding="utf-8", errors="replace")
+            # Small files already render as authoritative FULL FILE source.
+            # Larger dirty files can lose the expanded dirty-file allowance
+            # when the primary budget is shared, so their changed definitions
+            # still need deterministic symbol materialization.
+            if len(source) <= PATCH_FULL_FILE_CHARS:
+                continue
+            tree = ast.parse(source)
+        except (GitError, OSError, SyntaxError):
+            continue
+        changed_ranges = []
+        for match in hunk_pattern.finditer(diff):
+            start = int(match.group("start"))
+            count = int(match.group("count") or "1")
+            changed_ranges.append((max(1, start), max(1, start + count - 1)))
+        if not changed_ranges:
+            continue
+
+        # Patchable identities are module definitions and direct class
+        # members. Nested helpers remain part of their enclosing definition,
+        # avoiding ambiguous unqualified identities such as nested on_submit.
+        definitions: list[tuple[int, int, str]] = []
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                start = min(
+                    [node.lineno, *(item.lineno for item in node.decorator_list)]
+                    if node.decorator_list else [node.lineno]
+                )
+                definitions.append((start, node.end_lineno, node.name))
+            if isinstance(node, ast.ClassDef):
+                for member in node.body:
+                    if not isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        continue
+                    start = min(
+                        [member.lineno, *(item.lineno for item in member.decorator_list)]
+                        if member.decorator_list else [member.lineno]
+                    )
+                    definitions.append((start, member.end_lineno, member.name))
+
+        for changed_start, changed_end in changed_ranges:
+            overlaps = [
+                item for item in definitions
+                if item[0] <= changed_end and changed_start <= item[1]
+            ]
+            if not overlaps:
+                continue
+            _start, _end, name = min(
+                overlaps, key=lambda item: (item[1] - item[0], item[0], item[2])
+            )
+            if name not in roots.setdefault(path, []):
+                roots[path].append(name)
+    return roots
+
+
 def get_task_words(task: str) -> set[str]:
     words = {
         word.lower()
@@ -950,6 +1025,9 @@ def collect_relevant_files(
         if path.is_file() and is_source_file(path)
         and not _is_context_internal_artifact(path, repo)
     )
+    changed_definition_roots = _changed_python_definition_roots(
+        repo, changed_source_files
+    )
     selected: list[Path] = [path for path in changed_source_files if path not in ambiguous_files]
     for path in explicit_files:
         if path not in selected:
@@ -993,6 +1071,13 @@ def collect_relevant_files(
                 target_symbols[path] = list(dict.fromkeys([
                     *target_symbols[path], *symbols,
                 ]))
+    for path, symbols in changed_definition_roots.items():
+        if path not in selected:
+            continue
+        target_symbols.setdefault(path, [])
+        target_symbols[path] = list(dict.fromkeys([
+            *target_symbols[path], *symbols,
+        ]))
     if get_boolean_setting("CHATCODE_RETRIEVAL_DEBUG"):
         print("Retrieval diagnostics:", file=os.sys.stderr)
         print(

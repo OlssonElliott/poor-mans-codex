@@ -761,6 +761,73 @@ class PatchContextTests(unittest.TestCase):
             "    @app_commands.autocomplete(item=inventory_item_autocomplete)",
         )
 
+    def test_dirty_take_definition_and_autocomplete_are_patchable_final_source(self) -> None:
+        padding = "PADDING = " + repr("x" * 49_000) + "\n\n"
+        world = self.write(
+            "rpg_bot/commands/world.py",
+            padding
+            + "class WorldCommands:\n"
+            "    async def loose_item_autocomplete(self, interaction, current):\n"
+            "        return ['committed loose items']\n\n"
+            "    @app_commands.command(name='take')\n"
+            "    @app_commands.autocomplete(item=loose_item_autocomplete)\n"
+            "    async def take(self, interaction, item, quantity=1):\n"
+            "        return self.world.take_loose_item(item, quantity)\n",
+        )
+        self.commit_all()
+        world.write_text(
+            padding
+            + "class WorldCommands:\n"
+            "    async def loose_item_autocomplete(self, interaction, current):\n"
+            "        return ['committed loose items']\n\n"
+            "    @app_commands.command(name='take')\n"
+            "    @app_commands.autocomplete(item=loose_item_autocomplete)\n"
+            "    async def take(self, interaction, item, quantity=1):\n"
+            "        dirty_marker = 'CURRENT dirty take source'\n"
+            "        class TakeQuantityModal:\n"
+            "            async def on_submit(self, value):\n"
+            "                try:\n"
+            "                    amount = int(value)\n"
+            "                    return self.world.take_loose_item(item, amount)\n"
+            "                except ValueError:\n"
+            "                    return 'Enter a whole number of at least 1.'\n"
+            "        return TakeQuantityModal(), dirty_marker\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        context = build_context(
+            self.repo,
+            "picking up stacked items does not work; entering quantity 2 still opens the window",
+        ).read_text(encoding="utf-8")
+
+        for symbol in ("take", "loose_item_autocomplete"):
+            match = re.search(
+                rf"^===== SYMBOL CONTEXT: rpg_bot/commands/world\.py::{symbol} "
+                rf"\[[^]]+\] source lines (\d+)-(\d+) =====$",
+                context,
+                re.MULTILINE,
+            )
+            self.assertIsNotNone(match, f"missing current source block for {symbol}")
+            start, end = map(int, match.groups())
+            exact = "".join(
+                world.read_text(encoding="utf-8").splitlines(keepends=True)[start - 1:end]
+            )
+            self.assertTrue(
+                context.startswith(exact, match.end() + 1),
+                f"declared range does not reproduce dirty current {symbol} source",
+            )
+
+        take_header = context.index(
+            "===== SYMBOL CONTEXT: rpg_bot/commands/world.py::take "
+        )
+        take_end = context.find("\n===== ", take_header + 10)
+        take_block = context[take_header:take_end if take_end >= 0 else None]
+        self.assertIn("CURRENT dirty take source", take_block)
+        self.assertIn("class TakeQuantityModal", take_block)
+        self.assertIn("## Unstaged changes", context)
+        self.assertIn("+        dirty_marker = 'CURRENT dirty take source'", context)
+
     def test_clean_working_tree_uses_exact_current_file_and_hash(self) -> None:
         source = self.write("src/widget.py", "def widget():\n    return 1\n")
         self.commit_all()
