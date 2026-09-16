@@ -12,7 +12,7 @@ from chatcode.indexing.index_manager import (
     SemanticIndexInterrupted,
     update_project_map,
 )
-from chatcode.indexing.project_graph import load_map, map_path, save_map
+from chatcode.indexing.project_graph import SCHEMA_VERSION, load_map, map_path, save_map
 from chatcode.indexing.semantic_analyzer import (
     QwenSemanticAnalyzer,
     SemanticAnalysis,
@@ -101,6 +101,74 @@ class ProjectMapTests(unittest.TestCase):
         self.assertNotIn("symbols", graph)
         self.assertNotIn("semantic_relations", app)
         self.assertFalse(map_path(self.repo).is_relative_to(self.repo))
+
+    def test_force_rebuild_reanalyzes_unchanged_files(self) -> None:
+        self.write("app.py", "def app():\n    return 1\n")
+        update_project_map(self.repo, run_semantic=False, index_mode="static")
+        with patch("chatcode.indexing.index_manager.analyze_file") as analyze:
+            analyze.return_value = {"language": "python", "symbols": [], "imports": []}
+            result = update_project_map(
+                self.repo,
+                run_semantic=False,
+                index_mode="static",
+                force_rebuild=True,
+            )
+        analyze.assert_called_once()
+        self.assertEqual(result.added, ("app.py",))
+        self.assertEqual(load_map(self.repo)["version"], SCHEMA_VERSION)
+
+    def test_schema_change_invalidates_old_map_automatically(self) -> None:
+        source = self.write("app.py", "def current():\n    return 1\n")
+        old = map_path(self.repo)
+        old.parent.mkdir(parents=True, exist_ok=True)
+        old.write_text('{"version":2,"files":{"stale.py":{}}}\n', encoding="utf-8")
+        update_project_map(self.repo, run_semantic=False, index_mode="static")
+        graph = load_map(self.repo)
+        self.assertEqual(graph["version"], SCHEMA_VERSION)
+        self.assertIn(source.relative_to(self.repo).as_posix(), graph["files"])
+        self.assertNotIn("stale.py", graph["files"])
+
+    def test_rebuilt_index_contains_decorator_command_alias(self) -> None:
+        self.write(
+            "commands.py",
+            "class Commands:\n"
+            "    @app_commands.command(name='take')\n"
+            "    async def take_item(self):\n"
+            "        pass\n"
+            "    @app_commands.command(name='drop')\n"
+            "    async def drop(self):\n"
+            "        pass\n",
+        )
+        update_project_map(
+            self.repo,
+            run_semantic=False,
+            index_mode="static",
+            force_rebuild=True,
+        )
+        symbols = load_map(self.repo)["files"]["commands.py"]["symbols"]
+        alias = next(symbol for symbol in symbols if symbol["name"] == "take")
+        self.assertEqual(alias["kind"], "command")
+        self.assertEqual(alias["definition_name"], "take_item")
+        same_name = next(symbol for symbol in symbols if symbol["name"] == "drop")
+        self.assertEqual(same_name["kind"], "command")
+        self.assertEqual(same_name["definition_name"], "drop")
+
+    def test_full_rebuild_excludes_repo_local_chatcode_workspace(self) -> None:
+        self.write("app.py", "def app(): pass\n")
+        self.write("workspace/other/history/old.py", "def stale(): pass\n")
+        with patch(
+            "chatcode.indexing.scanner.get_workspace_root",
+            return_value=self.repo / "workspace",
+        ):
+            update_project_map(
+                self.repo,
+                run_semantic=False,
+                index_mode="static",
+                force_rebuild=True,
+            )
+        files = load_map(self.repo)["files"]
+        self.assertIn("app.py", files)
+        self.assertNotIn("workspace/other/history/old.py", files)
 
     def test_low_level_ast_operations_are_not_persisted(self) -> None:
         calls = "\n".join(f"    helper_{number}()" for number in range(200))
@@ -238,7 +306,7 @@ class ProjectMapTests(unittest.TestCase):
         runtime_path = ".runtime/python312/tools/Lib/random.py"
         source = self.write(runtime_path, "def random():\n    pass\n")
         save_map(self.repo, {
-            "version": 2,
+            "version": 3,
             "files": {
                 runtime_path: {
                     "hash": "old",
@@ -770,7 +838,7 @@ class ProjectMapTests(unittest.TestCase):
         self.assertEqual(result.semantic_preflight_failure, "ollama_not_found")
 
     def test_atomic_save_preserves_previous_valid_map_when_replace_fails(self) -> None:
-        original = {"version": 2, "files": {}}
+        original = {"version": 3, "files": {}}
         output = save_map(self.repo, original)
         with patch("pathlib.Path.replace", side_effect=OSError("replace failed")):
             with self.assertRaises(OSError):

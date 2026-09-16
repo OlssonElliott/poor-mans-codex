@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config import get_index_mode
-from .project_graph import load_map, map_path, normalize_compact_index, save_map
+from .project_graph import empty_map, load_map, map_path, normalize_compact_index, save_map
 from .scanner import is_indexable, scan_project
 from .semantic_analyzer import (
     FORMAT_FAILURES,
@@ -230,6 +230,7 @@ def update_project_map(
     progress: ProgressCallback | None = None,
     run_semantic: bool = True,
     index_mode: str | None = None,
+    force_rebuild: bool = False,
 ) -> IndexUpdate:
     repo = repo.resolve()
     requested_mode = (
@@ -239,14 +240,18 @@ def update_project_map(
     )
     if requested_mode not in {"ai", "static"}:
         raise ValueError("index_mode must be either 'ai' or 'static'")
-    existed = map_path(repo).is_file()
-    graph = load_map(repo)
+    cache_existed = map_path(repo).is_file()
+    existed = cache_existed and not force_rebuild
+    graph = empty_map() if force_rebuild else load_map(repo)
     old_files = graph["files"]
     analyzer = semantic_analyzer if semantic_analyzer is not None else QwenSemanticAnalyzer()
     model, analyzer_version = _analyzer_identity(analyzer)
     _emit(progress, IndexProgress("index_mode", "selected", reason=requested_mode))
 
-    if not existed:
+    if force_rebuild:
+        _emit(progress, IndexProgress("index", "forced"))
+        _emit(progress, IndexProgress("scan", "started"))
+    elif not existed:
         _emit(progress, IndexProgress("index", "initial"))
         _emit(progress, IndexProgress("scan", "started"))
 

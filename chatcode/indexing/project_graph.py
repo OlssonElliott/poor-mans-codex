@@ -8,7 +8,7 @@ from typing import Any
 from ..workspace import get_repo_workspace
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 INDEX_FILENAME = "project-map.json"
 
 

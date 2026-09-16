@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import os
 import re
@@ -25,7 +26,16 @@ from .config import get_boolean_setting
 from .indexing.index_manager import IndexProgress, update_project_map
 from .indexing.project_graph import load_map, save_map
 from .retrieval.graph_retriever import retrieve_files
-from .retrieval.hybrid_retriever import QwenCompletenessChecker, expand_candidates
+from .retrieval.hybrid_retriever import (
+    QwenCompletenessChecker,
+    QwenTaskHintAnalyzer,
+    RetrievalResult,
+    expand_candidates,
+    implementation_closure,
+    resolve_explicit_targets,
+    resolve_semantic_hints,
+    test_callsite_closure,
+)
 from .workspace import (
     atomic_write_text,
     get_repo_workspace,
@@ -820,11 +830,19 @@ def collect_relevant_files(
     repo: Path,
     task: str,
     index_progress: Callable[[IndexProgress], None] | None = None,
-) -> list[Path]:
+    include_target_symbols: bool = False,
+) -> list[Path] | tuple[list[Path], dict[Path, list[str]]]:
     # Synchronizing here also catches edits made manually since the previous
     # ChatCode invocation. Indexing is an enhancement, so a damaged/unwritable
     # cache must not prevent the established retrieval path from working.
     graph_files: list[Path] = []
+    explicit_targets: list[Path] = []
+    explicit_target_reasons: dict[Path, list[str]] = {}
+    semantic_targets: list[Path] = []
+    semantic_target_reasons: dict[Path, list[str]] = {}
+    semantic_hints: list[str] = []
+    semantic_hint_status = "not_run"
+    task_hint_analyzer: QwenTaskHintAnalyzer | None = None
     effective_mode = "static"
     try:
         _purge_internal_workspace_from_index(repo)
@@ -835,6 +853,9 @@ def collect_relevant_files(
             progress=index_progress,
         )
         effective_mode = update.effective_mode
+        explicit_target_result = resolve_explicit_targets(repo, task)
+        explicit_targets = explicit_target_result.files
+        explicit_target_reasons = explicit_target_result.reasons
         graph_files = [
             path
             for path in retrieve_files(
@@ -848,6 +869,13 @@ def collect_relevant_files(
                 and not _is_context_internal_artifact(path, repo)
             )
         ]
+        if effective_mode == "ai":
+            task_hint_analyzer = QwenTaskHintAnalyzer()
+            semantic_hints = task_hint_analyzer.hints(repo, task, graph_files)
+            semantic_hint_status = task_hint_analyzer.last_status
+            semantic_target_result = resolve_semantic_hints(repo, semantic_hints)
+            semantic_targets = semantic_target_result.files
+            semantic_target_reasons = semantic_target_result.reasons
     except Exception:
         graph_files = []
 
@@ -858,7 +886,42 @@ def collect_relevant_files(
     # Graph retrieval is the semantic/Qwen seed in AI mode and a useful
     # deterministic seed in static mode.  In both cases it is deliberately
     # expanded by the same structural ranker rather than treated as authority.
-    hybrid = expand_candidates(repo, task, graph_files, limit=MAX_FILES)
+    seed_files = list(dict.fromkeys([*explicit_targets, *semantic_targets, *graph_files]))
+    hybrid = expand_candidates(repo, task, seed_files, limit=MAX_FILES)
+    for path, reasons in explicit_target_reasons.items():
+        hybrid.reasons[path] = list(dict.fromkeys([
+            *reasons,
+            *hybrid.reasons.get(path, []),
+        ]))
+    for path, reasons in semantic_target_reasons.items():
+        hybrid.reasons[path] = list(dict.fromkeys([
+            *reasons,
+            *hybrid.reasons.get(path, []),
+        ]))
+    closure_focus = {
+        symbol
+        for result in (locals().get("explicit_target_result"), locals().get("semantic_target_result"))
+        if result is not None
+        for symbols in result.required_symbols.values()
+        for symbol in symbols
+    }
+    closure = (
+        implementation_closure(repo, task, [*hybrid.files, *graph_files], closure_focus)
+        if closure_focus else RetrievalResult([])
+    )
+    callsite_closure = test_callsite_closure(repo, task, [*hybrid.files, *graph_files])
+    for path in callsite_closure.files:
+        if path not in hybrid.files:
+            hybrid.files.append(path)
+        hybrid.reasons[path] = list(dict.fromkeys([
+            *callsite_closure.reasons.get(path, []), *hybrid.reasons.get(path, []),
+        ]))
+    for path in closure.files:
+        if path not in hybrid.files:
+            hybrid.files.append(path)
+        hybrid.reasons[path] = list(dict.fromkeys([
+            *closure.reasons.get(path, []), *hybrid.reasons.get(path, []),
+        ]))
     completeness_files: list[Path] = []
     if effective_mode == "ai":
         completeness = QwenCompletenessChecker().check(repo, task, hybrid)
@@ -879,6 +942,18 @@ def collect_relevant_files(
     for path in explicit_files:
         if path not in selected:
             selected.append(path)
+    for path in callsite_closure.files:
+        if path not in selected and path not in ambiguous_files:
+            selected.append(path)
+    for path in explicit_targets:
+        if path not in selected and path not in ambiguous_files:
+            selected.append(path)
+    for path in semantic_targets:
+        if path not in selected and path not in ambiguous_files:
+            selected.append(path)
+    for path in closure.files:
+        if path not in selected and path not in ambiguous_files:
+            selected.append(path)
     selection_limit = max(MAX_FILES, len(selected))
     # Completeness additions have been specifically confirmed after the first
     # ranking pass, so reserve their place ahead of lower-ranked seed results.
@@ -887,12 +962,57 @@ def collect_relevant_files(
             selected.append(path)
         if len(selected) >= selection_limit:
             break
+    target_symbols: dict[Path, list[str]] = {}
+    for source in (
+        value for value in (
+            locals().get("explicit_target_result"),
+            locals().get("semantic_target_result"),
+            closure,
+            callsite_closure,
+        ) if value is not None
+    ):
+        for path, symbols in source.required_symbols.items():
+            if path in selected:
+                target_symbols[path] = list(dict.fromkeys(symbols))
     if get_boolean_setting("CHATCODE_RETRIEVAL_DEBUG"):
         print("Retrieval diagnostics:", file=os.sys.stderr)
+        print(
+            "Runtime modules: " + __file__ + " | " + QwenTaskHintAnalyzer.__module__,
+            file=os.sys.stderr,
+        )
+        if task_hint_analyzer is not None:
+            print(f"Task-hint vocabulary: count {len(task_hint_analyzer.last_vocabulary)}", file=os.sys.stderr)
+            print("Vocabulary sample: " + ", ".join(task_hint_analyzer.last_vocabulary[:30]), file=os.sys.stderr)
+            print("Raw Qwen task-hint response: " + (task_hint_analyzer.last_raw_response or "<none>"), file=os.sys.stderr)
+            print("Parsed symbol hints: " + (", ".join(task_hint_analyzer.last_parsed_hints) or "none"), file=os.sys.stderr)
+            print("Normalized symbol hints: " + (", ".join(task_hint_analyzer.last_normalized_hints) or "none"), file=os.sys.stderr)
+            if task_hint_analyzer.last_rejections:
+                print("Rejected symbol hints: " + "; ".join(task_hint_analyzer.last_rejections), file=os.sys.stderr)
+        print(
+            "Qwen symbol hints (" + semantic_hint_status + "): "
+            + (", ".join(semantic_hints) if semantic_hints else "none"),
+            file=os.sys.stderr,
+        )
+        if semantic_target_reasons:
+            print("Resolved semantic symbols:", file=os.sys.stderr)
+            for path in sorted(semantic_target_reasons, key=lambda value: str(value).lower()):
+                print(f"- {path.relative_to(repo)}: {', '.join(semantic_target_reasons[path])}", file=os.sys.stderr)
+        if closure.reasons:
+            print("Implementation closure additions:", file=os.sys.stderr)
+            for path in sorted(closure.reasons, key=lambda value: str(value).lower()):
+                print(f"- {path.relative_to(repo)}: {', '.join(closure.reasons[path])}", file=os.sys.stderr)
+        if callsite_closure.reasons:
+            print("Deterministic call-site roots and expansion:", file=os.sys.stderr)
+            for diagnostic in callsite_closure.diagnostics:
+                print(f"- {diagnostic}", file=os.sys.stderr)
+            for path in sorted(callsite_closure.reasons, key=lambda value: str(value).lower()):
+                print(f"- {path.relative_to(repo)}: {', '.join(callsite_closure.reasons[path])}", file=os.sys.stderr)
+        for path, symbols in target_symbols.items():
+            print(f"Required symbols: {path.relative_to(repo)}::{', '.join(symbols)}", file=os.sys.stderr)
         for path in selected:
             labels = ", ".join(hybrid.reasons.get(path, ["explicit or changed file"]))
             print(f"- {path.relative_to(repo)}: {labels}", file=os.sys.stderr)
-    return selected
+    return (selected, target_symbols) if include_target_symbols else selected
 
 
 def build_source_context(
@@ -1075,6 +1195,7 @@ def _render_patch_file_context(
     changed_files: set[Path],
     explicit_files: set[Path],
     max_chars: int | None = None,
+    required_symbols: list[str] | None = None,
 ) -> str:
     content, digest = _read_current_text_and_hash(path)
     relative = path.relative_to(repo).as_posix()
@@ -1104,11 +1225,9 @@ def _render_patch_file_context(
     lines = content.splitlines(keepends=True)
     excerpts = []
     test_file = "test" in path.stem.casefold() or "spec" in path.stem.casefold()
-    for start, end in _symbol_aware_ranges(
-        content,
-        task,
-        test_file=test_file,
-    ):
+    target_ranges = _fresh_symbol_ranges(content, path, required_symbols or [])
+    ranges = target_ranges or _symbol_aware_ranges(content, task, test_file=test_file)
+    for start, end in ranges:
         excerpts.append(
             f"----- EXCERPT {relative} source lines {start}-{end} -----\n"
             + "".join(lines[start - 1:end])
@@ -1121,6 +1240,23 @@ def _render_patch_file_context(
     )
     if max_chars is None or len(section) <= max_chars:
         return section
+    if target_ranges:
+        # Keep each requested node atomic, but do not make every requested
+        # handler an all-or-nothing bundle. A large sibling handler must not
+        # prevent smaller, independently resolved targets from materializing.
+        header = f"===== SELECTED SOURCE: {relative} =====\n"
+        kept: list[str] = []
+        used = len(header)
+        for start, end in target_ranges:
+            excerpt = (
+                f"----- EXCERPT {relative} source lines {start}-{end} -----\n"
+                + "".join(lines[start - 1:end])
+                + "\n"
+            )
+            if used + len(excerpt) <= max_chars:
+                kept.append(excerpt)
+                used += len(excerpt)
+        return header + "".join(kept) if kept else ""
 
     # Every primary selection gets a fresh, exact (though possibly shorter)
     # excerpt before supporting dependencies consume the budget. Never splice
@@ -1135,19 +1271,220 @@ def _render_patch_file_context(
     excerpt_lines: list[str] = []
     used = 0
     for start, end in _symbol_aware_ranges(content, task, test_file=test_file):
-        marker = f"----- source lines {start}-{end} -----\n"
+        marker = f"----- source lines "
         if used + len(marker) > available:
             break
-        excerpt_lines.append(marker)
-        used += len(marker)
-        for line in lines[start - 1:end]:
-            if used + len(line) > available:
+        captured: list[str] = []
+        actual_end = start - 1
+        for line_number, line in enumerate(lines[start - 1:end], start=start):
+            # Reserve the final, truthful range marker before accepting a line.
+            possible_marker = f"----- source lines {start}-{line_number} -----\n"
+            if used + len(possible_marker) + sum(map(len, captured)) + len(line) > available:
                 break
-            excerpt_lines.append(line)
-            used += len(line)
-        if used >= available:
+            captured.append(line)
+            actual_end = line_number
+        if actual_end < start:
+            break
+        final_marker = f"----- source lines {start}-{actual_end} -----\n"
+        excerpt_lines.append(final_marker)
+        excerpt_lines.extend(captured)
+        used += len(final_marker) + sum(map(len, captured))
+        if used >= available or actual_end < end:
             break
     return header + "".join(excerpt_lines) + "\n" if excerpt_lines else ""
+
+
+def _fresh_symbol_ranges(content: str, path: Path, symbols: list[str]) -> list[tuple[int, int]]:
+    """Locate requested Python definitions in fresh source, never cached text."""
+    if path.suffix.lower() != ".py" or not symbols:
+        return []
+    wanted = set(symbols)
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return []
+    ranges: list[tuple[int, int, bool, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if node.name not in wanted or not hasattr(node, "end_lineno"):
+            continue
+        start = min([node.lineno, *(item.lineno for item in node.decorator_list)] if node.decorator_list else [node.lineno])
+        ranges.append((start, node.end_lineno, isinstance(node, ast.ClassDef), node.name))
+    # When an explicit class and concrete methods inside it are both targets,
+    # the methods are the precise patch surface. Emitting the enclosing class
+    # would turn distant methods into one enormous range and waste the budget.
+    filtered = [
+        (start, end, name)
+        for start, end, is_class, name in ranges
+        if not is_class or not any(
+            not other_is_class and start <= other_start and other_end <= end
+            for other_start, other_end, other_is_class, _other_name in ranges
+        )
+    ]
+    order = {name: index for index, name in enumerate(symbols)}
+    return [
+        (start, end)
+        for start, end, _name in sorted(
+            filtered, key=lambda item: (order.get(item[2], len(order)), item[0])
+        )
+    ]
+
+
+def _fresh_symbol_node(path: Path, symbol: str) -> tuple[str, list[str]] | None:
+    """Return one complete current Python definition and its method calls."""
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(content)
+    except (OSError, SyntaxError):
+        return None
+    lines = content.splitlines(keepends=True)
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if node.name != symbol or not hasattr(node, "end_lineno"):
+            continue
+        start = min(
+            [node.lineno, *(item.lineno for item in node.decorator_list)]
+            if node.decorator_list else [node.lineno]
+        )
+        calls = [
+            call.func.attr
+            for call in sorted(
+                (item for item in ast.walk(node) if isinstance(item, ast.Call)),
+                key=lambda item: (item.lineno, item.col_offset),
+            )
+            if isinstance(call.func, ast.Attribute)
+        ]
+        return "".join(lines[start - 1:node.end_lineno]), list(dict.fromkeys(calls))
+    return None
+
+
+def _materialization_targets(
+    repo: Path, target_symbols: dict[Path, list[str]], max_inherited: int = 64,
+) -> list[tuple[Path, str, str]]:
+    """Order patch targets first and inherit priority through two direct calls."""
+    index = load_map(repo).get("files", {})
+    owners: dict[str, list[tuple[Path, str]]] = {}
+    for relative, entry in index.items():
+        for symbol in entry.get("symbols", []):
+            if not isinstance(symbol, dict) or not symbol.get("name"):
+                continue
+            owners.setdefault(str(symbol["name"]).casefold(), []).append((
+                repo / relative,
+                str(symbol.get("definition_name") or symbol["name"]),
+            ))
+    # Large or dirty files can contain fresh methods not represented by the
+    # cached symbol list. Required files are already in scope, so supplement
+    # owner lookup from their current AST without broadening retrieval.
+    for path in target_symbols:
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, SyntaxError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            owner = (path, node.name)
+            bucket = owners.setdefault(node.name.casefold(), [])
+            if owner not in bucket:
+                bucket.append(owner)
+
+    original = [(path, symbol) for path, symbols in target_symbols.items() for symbol in symbols]
+    command_roots = [
+        item for item in original
+        if "commands" in {part.casefold() for part in item[0].relative_to(repo).parts}
+    ]
+    ordered: list[tuple[Path, str, str]] = []
+    seen: set[tuple[Path, str]] = set()
+    inherited = 0
+
+    def visit(path: Path, symbol: str, depth: int, priority: str) -> None:
+        nonlocal inherited
+        key = (path, symbol)
+        if key in seen:
+            return
+        seen.add(key)
+        ordered.append((path, symbol, priority))
+        if depth >= 2 or inherited >= max_inherited:
+            return
+        node = _fresh_symbol_node(path, symbol)
+        if node is None:
+            return
+        for called in node[1]:
+            for owner, definition in sorted(owners.get(called.casefold(), []), key=lambda item: str(item[0]).lower()):
+                if (owner, definition) == key or inherited >= max_inherited:
+                    continue
+                if (owner, definition) in seen:
+                    continue
+                inherited += 1
+                visit(owner, definition, depth + 1, "direct implementation dependency")
+
+    for path, symbol in command_roots:
+        inherited = 0
+        visit(path, symbol, 0, "patch target")
+    for path, symbol in original:
+        visit(path, symbol, 0, "required implementation")
+    return ordered
+
+
+def _render_required_symbols(
+    repo: Path,
+    targets: list[tuple[Path, str, str]],
+    budget: int,
+) -> tuple[str, dict[tuple[Path, str], tuple[str, str]]]:
+    sections: list[str] = []
+    states: dict[tuple[Path, str], tuple[str, str]] = {}
+    used = 0
+    for path, symbol, priority in targets:
+        relative = path.relative_to(repo).as_posix()
+        node = _fresh_symbol_node(path, symbol)
+        if node is None:
+            reason = "definition not found in current working tree"
+            states[(path, symbol)] = ("unavailable", reason)
+            sections.append(
+                f"===== REQUIRED SOURCE UNAVAILABLE: {relative}::{symbol} "
+                f"[reason: {reason}; do not patch] =====\n"
+            )
+            continue
+        section = (
+            f"===== REQUIRED SOURCE: {relative}::{symbol} [{priority}] =====\n"
+            f"{node[0]}\n"
+        )
+        if used + len(section) <= budget:
+            sections.append(section)
+            used += len(section)
+            states[(path, symbol)] = ("rendered", priority)
+        else:
+            states[(path, symbol)] = ("unavailable", "budget")
+            sections.append(
+                f"===== REQUIRED SOURCE UNAVAILABLE: {relative}::{symbol} "
+                "[reason: budget; do not patch] =====\n"
+            )
+    return "\n".join(sections), states
+
+
+def _enforce_materialization_invariant(
+    repo: Path,
+    rendered: str,
+    targets: list[tuple[Path, str, str]],
+) -> str:
+    """Ensure every required symbol is complete or explicitly non-patchable."""
+    repairs: list[str] = []
+    for path, symbol, _priority in targets:
+        relative = path.relative_to(repo).as_posix()
+        unavailable = f"===== REQUIRED SOURCE UNAVAILABLE: {relative}::{symbol} "
+        if unavailable in rendered:
+            continue
+        node = _fresh_symbol_node(path, symbol)
+        header = f"===== REQUIRED SOURCE: {relative}::{symbol} "
+        if node is not None and header in rendered and node[0] in rendered:
+            continue
+        repairs.append(
+            f"===== REQUIRED SOURCE UNAVAILABLE: {relative}::{symbol} "
+            "[reason: post-render validation; do not patch] =====\n"
+        )
+    return rendered + ("\n" + "\n".join(repairs) if repairs else "")
 
 
 def _dependency_paths(repo: Path, files: list[Path]) -> set[Path]:
@@ -1181,12 +1518,15 @@ def build_patch_source_context(
     repo: Path,
     task: str,
     files: list[Path] | None = None,
+    target_symbols: dict[Path, list[str]] | None = None,
 ) -> str:
     if files is None:
         files = collect_relevant_files(repo, task)
 
     changed_files = get_changed_files(repo)
     explicit_files = set(_resolve_task_file_references(repo, task))
+    target_metadata = target_symbols or resolve_explicit_targets(repo, task).required_symbols
+    materialization_targets = _materialization_targets(repo, target_metadata)
     dependencies = _dependency_paths(repo, files)
     primary = list(dict.fromkeys([
         *[path for path in files if path in explicit_files],
@@ -1196,15 +1536,25 @@ def build_patch_source_context(
     supporting = [path for path in sorted(dependencies) if path not in primary]
 
     budget = _context_budget_chars()
-    dependency_reserve = int(budget * PATCH_DEPENDENCY_RESERVE_RATIO)
-    primary_budget = max(1, budget - dependency_reserve)
-    sections: list[str] = []
+    required_context, materialization_states = _render_required_symbols(
+        repo, materialization_targets, budget
+    )
+    required_rendered_chars = sum(
+        len(section) for section in required_context.splitlines(keepends=True)
+        if "REQUIRED SOURCE UNAVAILABLE:" not in section
+    )
+    remaining_budget = max(0, budget - required_rendered_chars)
+    dependency_reserve = int(remaining_budget * PATCH_DEPENDENCY_RESERVE_RATIO)
+    primary_budget = max(0, remaining_budget - dependency_reserve)
+    sections: list[str] = [required_context] if required_context else []
     used = 0
 
     # Selected files are possible patch targets. Allocate their share first so
     # a broad dependency, README, or an early oversized selection cannot make
     # a later selected test silently vanish from the authoritative source.
     for position, path in enumerate(primary):
+        if path in target_metadata:
+            continue
         try:
             remaining = len(primary) - position
             allowance = max(1, (primary_budget - used) // remaining)
@@ -1215,6 +1565,7 @@ def build_patch_source_context(
                 changed_files,
                 explicit_files,
                 max_chars=allowance,
+                required_symbols=target_metadata.get(path),
             )
         except OSError:
             continue
@@ -1224,6 +1575,8 @@ def build_patch_source_context(
         used += len(section)
 
     for path in supporting:
+        if path in target_metadata:
+            continue
         try:
             section = _render_patch_file_context(repo, path, task, changed_files, explicit_files)
         except OSError:
@@ -1233,7 +1586,25 @@ def build_patch_source_context(
         sections.append(section)
         used += len(section)
 
-    return "\n".join(sections) or "No relevant source files found."
+    rendered = "\n".join(sections) or "No relevant source files found."
+    rendered = _enforce_materialization_invariant(repo, rendered, materialization_targets)
+    if get_boolean_setting("CHATCODE_RETRIEVAL_DEBUG") and materialization_states:
+        print("Final materialization:", file=os.sys.stderr)
+        priorities = {(path, symbol): priority for path, symbol, priority in materialization_targets}
+        diagnostic_items = list(materialization_states.items())
+        for (path, symbol), (state, detail) in diagnostic_items[:40]:
+            print(f"{path.relative_to(repo)}::{symbol}", file=os.sys.stderr)
+            print(f"- priority: {priorities[(path, symbol)]}", file=os.sys.stderr)
+            print(f"- rendered: {'yes' if state == 'rendered' else 'no'}", file=os.sys.stderr)
+            if state != "rendered":
+                print(f"- reason: {detail}", file=os.sys.stderr)
+                print("- status: non-patchable", file=os.sys.stderr)
+        if len(diagnostic_items) > 40:
+            print(
+                f"- {len(diagnostic_items) - 40} lower-priority symbol states omitted",
+                file=os.sys.stderr,
+            )
+    return rendered
 
 
 def _current_file_hashes(
@@ -1267,15 +1638,28 @@ def _build_stable_patch_source_context(
     repo: Path,
     task: str,
     files: list[Path],
+    target_symbols: dict[Path, list[str]] | None = None,
 ) -> tuple[str, dict[str, str]]:
     """Read source from disk and retry if it changes during context capture."""
     for _attempt in range(CONTEXT_CAPTURE_RETRIES):
-        captured_paths = _captured_source_paths(repo, files)
+        expanded_targets = _materialization_targets(repo, target_symbols or {})
+        captured_paths = list(dict.fromkeys([
+            *_captured_source_paths(repo, files),
+            *(path for path, _symbol, _priority in expanded_targets),
+        ]))
         before = _current_file_hashes(captured_paths)
+        expanded_metadata: dict[Path, list[str]] = {
+            path: list(symbols) for path, symbols in (target_symbols or {}).items()
+        }
+        for owner, symbol, _priority in expanded_targets:
+            expanded_metadata.setdefault(owner, [])
+            if symbol not in expanded_metadata[owner]:
+                expanded_metadata[owner].append(symbol)
         source_context = build_patch_source_context(
             repo,
             task,
             files=files,
+            target_symbols=expanded_metadata,
         )
         # Re-resolve dependencies in case graph metadata was refreshed while
         # rendering, then verify every path that could have been emitted.
@@ -1304,6 +1688,11 @@ def _format_selected_files(files: list[Path], repo: Path, source_context: str) -
         source_context,
         re.MULTILINE,
     ))
+    materialized.update(re.findall(
+        r"^===== REQUIRED SOURCE: ([^:\n]+?)::[^\n]+ =====$",
+        source_context,
+        re.MULTILINE,
+    ))
     lines = []
     for path in files:
         relative = path.relative_to(repo).as_posix()
@@ -1320,11 +1709,13 @@ def build_patch_context(
     output_file = get_repo_workspace(repo) / "UPLOAD_TO_CHATGPT.md"
     repo_display = repo.resolve().as_posix()
     status = build_safe_status(repo).replace("\\", "/")
-    files = collect_relevant_files(
+    retrieved = collect_relevant_files(
         repo,
         task,
         index_progress=index_progress,
+        include_target_symbols=True,
     )
+    files, target_symbols = retrieved if isinstance(retrieved, tuple) else (retrieved, {})
     files = _ensure_explicit_task_files(
         repo,
         task,
@@ -1334,6 +1725,7 @@ def build_patch_context(
         repo,
         task,
         files,
+        target_symbols,
     )
     parts = [
         "# ChatCode Patch Context",
@@ -1502,11 +1894,13 @@ def build_context(
 
     tree = build_tree(repo)
 
-    files = collect_relevant_files(
+    retrieved = collect_relevant_files(
         repo,
         task,
         index_progress=index_progress,
+        include_target_symbols=True,
     )
+    files, target_symbols = retrieved if isinstance(retrieved, tuple) else (retrieved, {})
     files = _ensure_explicit_task_files(
         repo,
         task,
@@ -1523,6 +1917,7 @@ def build_context(
         repo,
         task,
         files,
+        target_symbols,
     )
 
     parts = [

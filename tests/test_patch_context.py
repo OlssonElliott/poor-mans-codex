@@ -104,6 +104,126 @@ class PatchContextTests(unittest.TestCase):
         self.assertIn(command, selected)
         self.assertIn(service, selected)
 
+    def test_real_split_take_drop_tests_promote_both_command_handlers(self) -> None:
+        service_test = self.write(
+            "tests/test_world.py",
+            "def test_takes_and_drops_loose_stacked_items_without_duplication():\n"
+            "    world.take_loose_item()\n"
+            "    world.drop_item()\n",
+        )
+        command_test = self.write(
+            "tests/test_world_commands.py",
+            "async def test_take_names_character_and_refreshes_open_inventory():\n"
+            "    await self.cog.take.callback(self.cog.take.binding, interaction, 'potion', 1)\n\n"
+            "async def test_drop_posts_character_action_in_game():\n"
+            "    await self.cog.drop.callback(self.cog.drop.binding, interaction, 'potion', 1)\n\n"
+            "async def test_take_autocomplete_lists_loose_items_with_quantities():\n"
+            "    await self.cog.loose_item_autocomplete(interaction, '')\n",
+        )
+        commands = self.write(
+            "rpg_bot/commands/world.py",
+            "async def take(): world.take_loose_item()\n"
+            "async def drop(): world.drop_item()\n"
+            "async def loose_item_autocomplete(): pass\n",
+        )
+        service = self.write(
+            "rpg_bot/world_service.py",
+            "def take_loose_item(self): self.place_item()\n"
+            "def drop_item(self): self.place_catalog_item()\n"
+            "def place_item(self): pass\n"
+            "def place_catalog_item(self): pass\n",
+        )
+        save_map(self.repo, {"version": 3, "files": {
+            "tests/test_world.py": {"symbols": [], "dependencies": []},
+            "tests/test_world_commands.py": {"symbols": [], "dependencies": []},
+            "rpg_bot/commands/world.py": {"symbols": [
+                {"name": "take"}, {"name": "drop"}, {"name": "loose_item_autocomplete"},
+            ], "dependencies": []},
+            "rpg_bot/world_service.py": {"symbols": [
+                {"name": "take_loose_item"}, {"name": "drop_item"},
+                {"name": "place_item"}, {"name": "place_catalog_item"},
+            ], "dependencies": []},
+        }})
+        task = (
+            "When you drop many of the same thing into a room, they should stack. "
+            "when you pick up a stack, you should be asked how many you want to pick up of the items"
+        )
+        update = Mock(effective_mode="static")
+        with patch("chatcode.context_builder.update_project_map", return_value=update), patch(
+            "chatcode.context_builder.retrieve_files", return_value=[service_test, command_test]
+        ):
+            _files, required = collect_relevant_files(
+                self.repo, task, include_target_symbols=True
+            )
+        self.assertIn("take", required[commands])
+        self.assertIn("drop", required[commands])
+        self.assertIn("loose_item_autocomplete", required[commands])
+        for symbol in ("take_loose_item", "drop_item", "place_item", "place_catalog_item"):
+            self.assertIn(symbol, required[service])
+
+    def test_required_drop_chain_outranks_supporting_context_in_final_export(self) -> None:
+        command = self.write(
+            "rpg_bot/commands/world.py",
+            "async def drop(self, interaction):\n"
+            "    return self.world.drop_item(interaction.user.id, 'potion')\n",
+        )
+        service = self.write(
+            "rpg_bot/world_service.py",
+            "def drop_item(self, character_id, item):\n"
+            "    return self.database.transfer_to_room(character_id, item)\n",
+        )
+        database = self.write(
+            "rpg_bot/database.py",
+            "def generic_helper(self):\n    return 'low priority'\n\n"
+            "def transfer_to_room(self, character_id, item):\n"
+            "    return 'dirty current transfer implementation'\n",
+        )
+        support = self.write("docs/support.md", "irrelevant support\n" * 300)
+        self.commit_all()
+        database.write_text(
+            database.read_text(encoding="utf-8").replace(
+                "dirty current transfer implementation", "dirty working-tree transfer implementation"
+            ), encoding="utf-8", newline="\n",
+        )
+        save_map(self.repo, {"version": 3, "files": {
+            "rpg_bot/commands/world.py": {"symbols": [{"name": "drop"}], "dependencies": []},
+            "rpg_bot/world_service.py": {"symbols": [{"name": "drop_item"}], "dependencies": []},
+            # Deliberately omit transfer_to_room: materialization must resolve
+            # the direct callee from fresh required-file source.
+            "rpg_bot/database.py": {"symbols": [{"name": "generic_helper"}], "dependencies": []},
+            "docs/support.md": {"symbols": [], "dependencies": []},
+        }})
+        required = {
+            command: ["drop"], service: ["drop_item"], database: ["generic_helper"],
+        }
+        with patch(
+            "chatcode.context_builder.collect_relevant_files",
+            return_value=([command, service, database, support], required),
+        ), patch.dict("os.environ", {"CHATCODE_CONTEXT_BUDGET_CHARS": "700"}, clear=False):
+            context = build_context(self.repo, "drop an item into the room").read_text(encoding="utf-8")
+        self.assertIn("async def drop(self, interaction):", context)
+        self.assertIn("def drop_item(self, character_id, item):", context)
+        self.assertIn("def transfer_to_room(self, character_id, item):", context)
+        self.assertIn("dirty working-tree transfer implementation", context)
+        self.assertNotIn("irrelevant support", context)
+
+    def test_tiny_budget_marks_each_required_symbol_non_patchable(self) -> None:
+        source = self.write(
+            "service.py",
+            "def required_operation():\n    return 'complete but too large for budget'\n",
+        )
+        save_map(self.repo, {"version": 3, "files": {
+            "service.py": {"symbols": [{"name": "required_operation"}], "dependencies": []},
+        }})
+        with patch.dict("os.environ", {"CHATCODE_CONTEXT_BUDGET_CHARS": "10"}, clear=False):
+            context = build_patch_source_context(
+                self.repo, "change operation", [source], {source: ["required_operation"]}
+            )
+        self.assertIn(
+            "REQUIRED SOURCE UNAVAILABLE: service.py::required_operation", context
+        )
+        self.assertIn("reason: budget; do not patch", context)
+
     def test_constrained_budget_materializes_dirty_selected_patch_targets_first(self) -> None:
         database = self.write(
             "rpg_bot/database.py",
@@ -124,7 +244,7 @@ class PatchContextTests(unittest.TestCase):
             + "    padding = 1\n" * 120,
             encoding="utf-8", newline="\n",
         )
-        save_map(self.repo, {"version": 2, "files": {
+        save_map(self.repo, {"version": 3, "files": {
             "rpg_bot/database.py": {"dependencies": ["docs/architecture.md"]},
             "tests/test_world_commands.py": {"dependencies": []},
             "docs/architecture.md": {"dependencies": []},
@@ -147,6 +267,31 @@ class PatchContextTests(unittest.TestCase):
             context = build_context(self.repo, "change value").read_text(encoding="utf-8")
         self.assertIn("src/large.py [source unavailable; do not patch]", context)
         self.assertNotIn("===== FULL FILE: src/large.py =====", context)
+
+    def test_large_explicit_command_handlers_materialize_complete_fresh_nodes(self) -> None:
+        command = self.write(
+            "rpg_bot/commands/world.py",
+            "def unrelated_prefix():\n    return 'not a target'\n\n" + "# padding\n" * 2500
+            + "@app_commands.command(name='take')\nasync def take(interaction):\n    return 'dirty take handler'\n\n"
+            + "@app_commands.command(name='drop')\nasync def drop(interaction):\n    return 'dirty drop handler'\n",
+        )
+        service = self.write(
+            "rpg_bot/world_service.py",
+            "def unrelated_service():\n    return 0\n\n" + "# padding\n" * 2500
+            + "class WorldService:\n    def take_loose_item(self):\n        return 'take target'\n\n    def drop_item(self):\n        return 'drop target'\n",
+        )
+        save_map(self.repo, {"version": 3, "files": {
+            "rpg_bot/commands/world.py": {"symbols": [], "dependencies": []},
+            "rpg_bot/world_service.py": {"symbols": [{"name": "take_loose_item"}, {"name": "drop_item"}], "dependencies": []},
+        }})
+        context = build_patch_source_context(
+            self.repo, "make /take and /drop use take_loose_item() and drop_item()", files=[command, service],
+        )
+        self.assertIn("dirty take handler", context)
+        self.assertIn("dirty drop handler", context)
+        self.assertIn("return 'take target'", context)
+        self.assertIn("return 'drop target'", context)
+        self.assertNotIn("unrelated_prefix", context)
 
     def test_explicit_readme_filename_is_mandatory_context(self) -> None:
         readme = self.write("README.md", "# Current README\n")
@@ -477,7 +622,7 @@ class PatchContextTests(unittest.TestCase):
             # query; changing the provider after writing would create a
             # different index file rather than a stale entry in this one.
             save_map(self.repo, {
-                "version": 2,
+                "version": 3,
                 "files": {
                     "workspace/other-project/app.py": {
                         "path": "workspace/other-project/app.py",
@@ -769,7 +914,7 @@ class PatchContextTests(unittest.TestCase):
         source = self.write("src/service.py", "def service():\n    return helper()\n")
         dependency = self.write("src/helper.py", "def helper():\n    return 1\n")
         save_map(self.repo, {
-            "version": 2,
+            "version": 3,
             "files": {
                 "src/service.py": {
                     "path": "src/service.py",

@@ -5,9 +5,15 @@ import unittest
 from unittest.mock import patch
 
 from chatcode.config import get_boolean_setting, get_index_mode, get_setting
+from chatcode.cli import create_parser
 
 
 class ConfigTests(unittest.TestCase):
+    def test_status_accepts_force_reindex_option(self) -> None:
+        args = create_parser().parse_args(["status", "--reindex"])
+        self.assertEqual(args.command, "status")
+        self.assertTrue(args.reindex)
+
     def test_process_environment_overrides_dotenv(self) -> None:
         with patch.dict(os.environ, {"CHATCODE_QWEN_MODEL": "session-model"}):
             self.assertEqual(get_setting("CHATCODE_QWEN_MODEL"), "session-model")

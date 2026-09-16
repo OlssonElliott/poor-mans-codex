@@ -26,7 +26,11 @@ from .history import (
     review_history_by_index,
     update_history_test_result,
 )
-from .indexing.index_manager import IndexProgress, SemanticIndexInterrupted
+from .indexing.index_manager import (
+    IndexProgress,
+    SemanticIndexInterrupted,
+    update_project_map,
+)
 from .patch import (
     PatchAlreadyApplied,
     PatchError,
@@ -77,8 +81,17 @@ def open_folder(
         )
 
 
-def command_status() -> None:
+def command_status(reindex: bool = False) -> None:
     repo = get_repo_root()
+
+    if reindex:
+        print("Forcing a full project-index rebuild...")
+        update_project_map(
+            repo,
+            progress=ConsoleIndexReporter(),
+            force_rebuild=True,
+        )
+        print()
 
     print(f"Repository: {repo}")
     print(
@@ -112,6 +125,9 @@ class ConsoleIndexReporter:
         elif event.phase == "index" and event.status == "initial":
             self._initial = True
             print("Project map not found. Building initial project index...")
+        elif event.phase == "index" and event.status == "forced":
+            self._initial = True
+            print("Cached project map discarded. Rebuilding from source...")
         elif event.phase == "scan" and event.status == "started":
             print("Scanning project files...")
         elif event.phase == "index" and event.status == "updating":
@@ -595,7 +611,7 @@ def create_parser() -> argparse.ArgumentParser:
         )
     )
 
-    subparsers.add_parser(
+    status_parser = subparsers.add_parser(
         "status",
         help=(
             "Show current repository "
@@ -620,6 +636,11 @@ def create_parser() -> argparse.ArgumentParser:
             "Describe what you want "
             "ChatGPT to work on."
         ),
+    )
+    status_parser.add_argument(
+        "--reindex",
+        action="store_true",
+        help="Discard and rebuild the cached project index before showing status.",
     )
 
     patch_context_parser = (
@@ -748,7 +769,7 @@ def main() -> None:
     try:
         match args.command:
             case "status":
-                command_status()
+                command_status(args.reindex)
 
             case "context":
                 command_context(

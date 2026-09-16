@@ -29,6 +29,38 @@ class _PythonVisitor(ast.NodeVisitor):
         if self.function_depth == 0:
             qualified = f"{self.class_name}.{node.name}" if self.class_name else node.name
             self._symbol(node.name, qualified, "method" if self.class_name else "function")
+            for decorator in node.decorator_list:
+                if not isinstance(decorator, ast.Call):
+                    continue
+                decorator_name = (
+                    decorator.func.attr if isinstance(decorator.func, ast.Attribute)
+                    else decorator.func.id if isinstance(decorator.func, ast.Name)
+                    else ""
+                )
+                if decorator_name != "command":
+                    continue
+                command_name = next((
+                    keyword.value.value
+                    for keyword in decorator.keywords
+                    if keyword.arg == "name"
+                    and isinstance(keyword.value, ast.Constant)
+                    and isinstance(keyword.value.value, str)
+                ), node.name)
+                if command_name == node.name:
+                    # The command name is still meaningful metadata even when
+                    # it matches the Python handler name.
+                    for symbol in reversed(self.symbols):
+                        if symbol.get("qualified_name") == qualified:
+                            symbol["kind"] = "command"
+                            symbol["definition_name"] = node.name
+                            break
+                elif len(self.symbols) < MAX_SYMBOLS:
+                    self.symbols.append({
+                        "name": command_name,
+                        "qualified_name": qualified,
+                        "kind": "command",
+                        "definition_name": node.name,
+                    })
         self.function_depth += 1
         self.generic_visit(node)
         self.function_depth -= 1
