@@ -23,6 +23,7 @@ from chatcode.context_builder import (
 from chatcode.context_state import get_stale_context_reason, save_context_state
 from chatcode.cli import command_repair
 from chatcode.indexing.project_graph import load_map, save_map
+from chatcode.retrieval.hybrid_retriever import CompletenessResult
 from chatcode.patch import PatchError, apply_patch, build_patch_repair_context
 from chatcode.workspace import (
     get_default_patch_file,
@@ -88,6 +89,64 @@ class PatchContextTests(unittest.TestCase):
             self.repo, "change widget", max_files=12, index_mode="ai"
         )
         legacy_scan.assert_not_called()
+
+    def test_completeness_symbol_resolution_file_reaches_final_context(self) -> None:
+        command = self.write("commands/transfer.py", "def transfer():\n    pass\n")
+        service = self.write("services/inventory_transfer.py", "class InventoryTransferService:\n    pass\n")
+        update = Mock(effective_mode="ai")
+        completion = CompletenessResult(
+            [service], {service: "Qwen completeness symbol resolution"}
+        )
+        with patch("chatcode.context_builder.update_project_map", return_value=update), patch(
+            "chatcode.context_builder.retrieve_files", return_value=[command]
+        ), patch("chatcode.context_builder.QwenCompletenessChecker.check", return_value=completion):
+            selected = collect_relevant_files(self.repo, "transfer an inventory item")
+        self.assertIn(command, selected)
+        self.assertIn(service, selected)
+
+    def test_constrained_budget_materializes_dirty_selected_patch_targets_first(self) -> None:
+        database = self.write(
+            "rpg_bot/database.py",
+            "class Database:\n" + "    value = 1\n" * 120,
+        )
+        test_file = self.write(
+            "tests/test_world_commands.py",
+            "def test_trap_disarm_kit():\n"
+            "    confirmation = 'committed'\n"
+            + "    padding = 1\n" * 120,
+        )
+        supporting = self.write("docs/architecture.md", "support\n" * 200)
+        self.commit_all()
+        test_file.write_text(
+            "def test_trap_disarm_kit():\n"
+            "    confirmation = 'dirty current working tree'\n"
+            "    durability = 0\n"
+            + "    padding = 1\n" * 120,
+            encoding="utf-8", newline="\n",
+        )
+        save_map(self.repo, {"version": 2, "files": {
+            "rpg_bot/database.py": {"dependencies": ["docs/architecture.md"]},
+            "tests/test_world_commands.py": {"dependencies": []},
+            "docs/architecture.md": {"dependencies": []},
+        }})
+        with patch("chatcode.context_builder.collect_relevant_files", return_value=[database, test_file]), patch.dict(
+            "os.environ", {"CHATCODE_CONTEXT_BUDGET_CHARS": "1800"}, clear=False,
+        ):
+            context = build_context(self.repo, "Trap disarm kit durability").read_text(encoding="utf-8")
+        self.assertIn("rpg_bot/database.py", context)
+        self.assertIn("tests/test_world_commands.py", context)
+        self.assertIn("dirty current working tree", context)
+        self.assertNotIn("docs/architecture.md =====", context)
+        self.assertNotIn("tests/test_world_commands.py [source unavailable", context)
+
+    def test_unmaterialized_selection_is_explicitly_marked_non_patchable(self) -> None:
+        source = self.write("src/large.py", "value = 1\n")
+        with patch("chatcode.context_builder.collect_relevant_files", return_value=[source]), patch.dict(
+            "os.environ", {"CHATCODE_CONTEXT_BUDGET_CHARS": "1"}, clear=False,
+        ):
+            context = build_context(self.repo, "change value").read_text(encoding="utf-8")
+        self.assertIn("src/large.py [source unavailable; do not patch]", context)
+        self.assertNotIn("===== FULL FILE: src/large.py =====", context)
 
     def test_explicit_readme_filename_is_mandatory_context(self) -> None:
         readme = self.write("README.md", "# Current README\n")

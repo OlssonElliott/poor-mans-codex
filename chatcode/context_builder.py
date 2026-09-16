@@ -21,9 +21,11 @@ from .git_utils import (
     get_unstaged_diff,
 )
 from .context_state import save_context_state
+from .config import get_boolean_setting
 from .indexing.index_manager import IndexProgress, update_project_map
 from .indexing.project_graph import load_map, save_map
 from .retrieval.graph_retriever import retrieve_files
+from .retrieval.hybrid_retriever import QwenCompletenessChecker, expand_candidates
 from .workspace import (
     atomic_write_text,
     get_repo_workspace,
@@ -195,6 +197,11 @@ code changes in chat. ChatCode will handle applying, testing, reviewing and
 undoing those changes locally.
 
 Do not attempt to directly edit the user's local repository or filesystem.
+
+Do not modify an existing file unless the current source for the affected area
+appears in a `FULL FILE`, `SYMBOL CONTEXT`, or `EXCERPT` block in this context. A file listed as
+selected but marked source-unavailable is reference-only: do not guess its
+contents or generate a patch for it.
 
 Use the repository context, source files, Git changes and test results contained
 in this file as the basis for the work.
@@ -844,101 +851,47 @@ def collect_relevant_files(
     except Exception:
         graph_files = []
 
-    task_words = get_task_words(task)
     changed_files = get_changed_files(repo)
     explicit_files = _resolve_task_file_references(repo, task)
     ambiguous_files = _ambiguous_task_file_paths(repo, task)
 
+    # Graph retrieval is the semantic/Qwen seed in AI mode and a useful
+    # deterministic seed in static mode.  In both cases it is deliberately
+    # expanded by the same structural ranker rather than treated as authority.
+    hybrid = expand_candidates(repo, task, graph_files, limit=MAX_FILES)
+    completeness_files: list[Path] = []
     if effective_mode == "ai":
-        # AI retrieval is the primary selector in AI mode. Do not also scan
-        # every source file's contents through the legacy static ranker.
-        changed_source_files = sorted(
-            path
-            for path in changed_files
-            if path.is_file()
-            and is_source_file(path)
-            and not _is_context_internal_artifact(path, repo)
-        )
-        selected: list[Path] = [
-            path for path in changed_source_files if path not in ambiguous_files
-        ]
-        for path in explicit_files:
-            if path not in selected:
-                selected.append(path)
-        selection_limit = max(
-            MAX_FILES,
-            len(selected),
-        )
-        for path in graph_files:
-            if (
-                path.is_file()
-                and is_source_file(path)
-                and path not in ambiguous_files
-                and path not in selected
-            ):
-                selected.append(path)
-            if len(selected) >= selection_limit:
-                break
-        return selected
-
-    candidate_scores: dict[Path, int] = {}
-
-    for path in _iter_context_files(repo):
-        if path.resolve() in ambiguous_files:
-            continue
-        if not is_source_file(path):
-            continue
-
-        score = score_file(
-            path,
-            repo,
-            task_words,
-            changed_files,
-        )
-
-        if score > 0:
-            candidate_scores[path] = score
-
-    # Graph hits complement keyword/content scoring. Earlier graph results get
-    # a larger boost while dirty files retain their existing highest priority.
-    for rank, path in enumerate(graph_files):
-        if path in ambiguous_files:
-            continue
-        candidate_scores[path] = candidate_scores.get(path, 0) + max(
-            100,
-            300 - rank * 15,
-        )
-
-    candidates = sorted(
-        candidate_scores.items(),
-        key=lambda item: (
-            -item[1],
-            str(item[0]).lower(),
-        )
-    )
+        completeness = QwenCompletenessChecker().check(repo, task, hybrid)
+        for path in completeness.files:
+            completeness_files.append(path)
+            label = completeness.reasons[path]
+            if label not in hybrid.reasons.setdefault(path, []):
+                hybrid.reasons[path].append(label)
+            if path not in hybrid.files:
+                hybrid.files.append(path)
 
     changed_source_files = sorted(
-        path
-        for path in changed_files
-        if path.is_file()
-        and is_source_file(path)
+        path for path in changed_files
+        if path.is_file() and is_source_file(path)
         and not _is_context_internal_artifact(path, repo)
     )
-    selected = [path for path in changed_source_files if path not in ambiguous_files]
+    selected: list[Path] = [path for path in changed_source_files if path not in ambiguous_files]
     for path in explicit_files:
         if path not in selected:
             selected.append(path)
-    selection_limit = max(
-        MAX_FILES,
-        len(selected),
-    )
-
-    for path, _ in candidates:
-        if path not in selected:
+    selection_limit = max(MAX_FILES, len(selected))
+    # Completeness additions have been specifically confirmed after the first
+    # ranking pass, so reserve their place ahead of lower-ranked seed results.
+    for path in [*completeness_files, *hybrid.files]:
+        if path.is_file() and is_source_file(path) and path not in ambiguous_files and path not in selected:
             selected.append(path)
         if len(selected) >= selection_limit:
             break
-
+    if get_boolean_setting("CHATCODE_RETRIEVAL_DEBUG"):
+        print("Retrieval diagnostics:", file=os.sys.stderr)
+        for path in selected:
+            labels = ", ".join(hybrid.reasons.get(path, ["explicit or changed file"]))
+            print(f"- {path.relative_to(repo)}: {labels}", file=os.sys.stderr)
     return selected
 
 
@@ -1106,7 +1059,7 @@ def _symbol_aware_ranges(
             [*ranges, (1, fallback_end)] if count else ranges
         )
 
-    for line_number in matches:
+    for line_number in sorted(matches):
         ranges.append((
             max(1, line_number - PATCH_EXCERPT_RADIUS),
             min(count, line_number + PATCH_EXCERPT_RADIUS),
@@ -1121,6 +1074,7 @@ def _render_patch_file_context(
     task: str,
     changed_files: set[Path],
     explicit_files: set[Path],
+    max_chars: int | None = None,
 ) -> str:
     content, digest = _read_current_text_and_hash(path)
     relative = path.relative_to(repo).as_posix()
@@ -1137,13 +1091,15 @@ def _render_patch_file_context(
         if os.getenv("CHATCODE_DEBUG_CONTEXT", "").strip():
             dirty = "yes" if path in changed_files else "no"
             diagnostic = f"Source: working-tree; dirty={dirty}; sha256={digest}\n"
-        return (
+        full_section = (
             f"===== FULL FILE: {relative} =====\n"
             f"SHA-256: {digest}\n"
             f"{diagnostic}"
             f"Source line range: 1-{line_count}\n\n"
             f"{content}\n"
         )
+        if max_chars is None or len(full_section) <= max_chars:
+            return full_section
 
     lines = content.splitlines(keepends=True)
     excerpts = []
@@ -1157,12 +1113,41 @@ def _render_patch_file_context(
             f"----- EXCERPT {relative} source lines {start}-{end} -----\n"
             + "".join(lines[start - 1:end])
         )
-    return (
+    section = (
         f"===== SYMBOL CONTEXT: {relative} =====\n"
         f"SHA-256 (complete source file): {digest}\n"
         + "\n".join(excerpts)
         + "\n"
     )
+    if max_chars is None or len(section) <= max_chars:
+        return section
+
+    # Every primary selection gets a fresh, exact (though possibly shorter)
+    # excerpt before supporting dependencies consume the budget. Never splice
+    # arbitrary characters: preserve complete current working-tree lines.
+    header = (
+        f"===== EXCERPT: {relative} =====\n"
+        f"SHA-256 (complete source file): {digest}\n"
+    )
+    available = max_chars - len(header) - 1
+    if available <= 0:
+        return ""
+    excerpt_lines: list[str] = []
+    used = 0
+    for start, end in _symbol_aware_ranges(content, task, test_file=test_file):
+        marker = f"----- source lines {start}-{end} -----\n"
+        if used + len(marker) > available:
+            break
+        excerpt_lines.append(marker)
+        used += len(marker)
+        for line in lines[start - 1:end]:
+            if used + len(line) > available:
+                break
+            excerpt_lines.append(line)
+            used += len(line)
+        if used >= available:
+            break
+    return header + "".join(excerpt_lines) + "\n" if excerpt_lines else ""
 
 
 def _dependency_paths(repo: Path, files: list[Path]) -> set[Path]:
@@ -1203,12 +1188,12 @@ def build_patch_source_context(
     changed_files = get_changed_files(repo)
     explicit_files = set(_resolve_task_file_references(repo, task))
     dependencies = _dependency_paths(repo, files)
-    ordered = list(dict.fromkeys([
+    primary = list(dict.fromkeys([
         *[path for path in files if path in explicit_files],
         *[path for path in files if path in changed_files],
         *files,
-        *sorted(dependencies),
     ]))
+    supporting = [path for path in sorted(dependencies) if path not in primary]
 
     budget = _context_budget_chars()
     dependency_reserve = int(budget * PATCH_DEPENDENCY_RESERVE_RATIO)
@@ -1216,25 +1201,34 @@ def build_patch_source_context(
     sections: list[str] = []
     used = 0
 
-    for path in ordered:
+    # Selected files are possible patch targets. Allocate their share first so
+    # a broad dependency, README, or an early oversized selection cannot make
+    # a later selected test silently vanish from the authoritative source.
+    for position, path in enumerate(primary):
         try:
+            remaining = len(primary) - position
+            allowance = max(1, (primary_budget - used) // remaining)
             section = _render_patch_file_context(
                 repo,
                 path,
                 task,
                 changed_files,
                 explicit_files,
+                max_chars=allowance,
             )
         except OSError:
             continue
+        if not section or used + len(section) > primary_budget:
+            continue
+        sections.append(section)
+        used += len(section)
 
-        supporting_dependency = (
-            path in dependencies
-            and path not in explicit_files
-            and path not in changed_files
-        )
-        limit = budget if supporting_dependency else primary_budget
-        if used + len(section) > limit:
+    for path in supporting:
+        try:
+            section = _render_patch_file_context(repo, path, task, changed_files, explicit_files)
+        except OSError:
+            continue
+        if used + len(section) > budget:
             continue
         sections.append(section)
         used += len(section)
@@ -1303,6 +1297,21 @@ def _build_stable_patch_source_context(
     )
 
 
+def _format_selected_files(files: list[Path], repo: Path, source_context: str) -> str:
+    """Make exceptional non-materialization explicit and non-patchable."""
+    materialized = set(re.findall(
+        r"^=====(?: FULL FILE| SYMBOL CONTEXT| EXCERPT):? ([^=\n]+?) =====$",
+        source_context,
+        re.MULTILINE,
+    ))
+    lines = []
+    for path in files:
+        relative = path.relative_to(repo).as_posix()
+        suffix = "" if relative in materialized else " [source unavailable; do not patch]"
+        lines.append(f"- {relative}{suffix}")
+    return "\n".join(lines) or "None"
+
+
 def build_patch_context(
     repo: Path,
     task: str,
@@ -1326,11 +1335,6 @@ def build_patch_context(
         task,
         files,
     )
-    selected = [
-        path.relative_to(repo).as_posix()
-        for path in files
-    ]
-
     parts = [
         "# ChatCode Patch Context",
         "",
@@ -1352,7 +1356,7 @@ def build_patch_context(
         status or "Working tree clean",
         "",
         "## Selected relevant files",
-        "\n".join(f"- {path}" for path in selected) or "None",
+        _format_selected_files(files, repo, source_context),
         "",
         "## Exact current working-tree contents",
         source_context,
@@ -1546,10 +1550,7 @@ def build_context(
         tree,
         "",
         "## Selected relevant files",
-        "\n".join(
-            f"- {path.relative_to(repo).as_posix()}"
-            for path in files
-        ) or "None",
+        _format_selected_files(files, repo, source_context),
         "",
         "## Relevant source files",
         source_context,
