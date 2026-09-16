@@ -18,6 +18,7 @@ from .git_utils import (
     GitError,
     get_branch,
     get_repo_root,
+    get_status,
 )
 from .history import (
     HistoryError,
@@ -36,10 +37,12 @@ from .patch import (
     PatchError,
     PatchUndoError,
     apply_patch,
+    build_check_repair_context,
     get_repair_context_stale_reason,
     get_repair_context_targets,
     refresh_test_failure_repair_context,
     show_repair_send_instructions,
+    show_check_repair_send_instructions,
     undo_last_patch,
 )
 from .test_runner import (
@@ -529,6 +532,99 @@ def command_test() -> int:
     return result.returncode
 
 
+def _select_check_failures(failures: frozenset[str]) -> frozenset[str]:
+    ordered = sorted(failures)
+    if len(ordered) == 1:
+        return frozenset(ordered)
+    print("Select failure [number(s), or A for all]:")
+    for number, failure in enumerate(ordered, start=1):
+        print(f"[{number}] {failure}")
+    answer = input("> ").strip().lower()
+    if answer == "a":
+        return frozenset(ordered)
+    try:
+        return frozenset(ordered[int(item.strip()) - 1] for item in answer.split(",") if item.strip())
+    except (IndexError, ValueError):
+        print("No valid failure selected.")
+        return frozenset()
+
+
+def command_check() -> int:
+    """Report current working-tree health without creating a task by default."""
+    repo = get_repo_root()
+    print("Running repository health check...")
+    try:
+        result = run_project_tests(repo)
+    except TestError as exc:
+        print("\nRepository health: ERROR")
+        print("Test command could not complete:")
+        print(exc)
+        return 2
+
+    try:
+        dirty = get_status(repo)
+    except GitError:
+        dirty = ""
+    if dirty:
+        lines = dirty.splitlines()
+        print(f"Working tree: {len(lines)} changed file(s)")
+
+    if result.returncode == 0:
+        print("\nRepository health: PASS")
+        print("[OK] Tests passed")
+        print("[OK] No failing test cases detected")
+        return 0
+
+    failures = result.failed_tests
+    if not failures:
+        print("\nRepository health: ERROR")
+        print("Test command completed unsuccessfully without stable test IDs.")
+        print(f"Test output: {result.output_file}")
+        if sys.stdin.isatty():
+            while True:
+                choice = input("[T] Show test output  [X] Exit\n> ").strip().lower()
+                if choice in {"", "x"}:
+                    break
+                if choice == "t":
+                    try:
+                        print(result.output_file.read_text(encoding="utf-8", errors="replace"))
+                    except OSError as exc:
+                        print(f"Could not read test output: {exc}")
+                    continue
+                print("Choose T or X.")
+        return 2
+
+    print("\nRepository health: FAIL")
+    print(f"{len(failures)} failing test(s):")
+    for number, failure in enumerate(sorted(failures), start=1):
+        print(f"{number}. {failure}")
+    if not sys.stdin.isatty():
+        return 1
+    while True:
+        choice = input("[F] Create fix context  [T] Show test output  [X] Exit\n> ").strip().lower()
+        if choice in {"", "x"}:
+            return 1
+        if choice == "t":
+            try:
+                print(result.output_file.read_text(encoding="utf-8", errors="replace"))
+            except OSError as exc:
+                print(f"Could not read test output: {exc}")
+            continue
+        if choice == "f":
+            selected = _select_check_failures(failures)
+            if selected:
+                try:
+                    context = build_check_repair_context(repo, result, selected)
+                    show_check_repair_send_instructions(context)
+                    # The check remains failed (exit 1), but a successful
+                    # context handoff completes this interaction.
+                    return 1
+                except (OSError, PatchError) as exc:
+                    print(f"Could not create check repair context: {exc}")
+            continue
+        print("Choose F, T, or X.")
+
+
 def command_repair() -> int:
     repo = get_repo_root()
     repair_context = get_repair_context_file(repo)
@@ -726,6 +822,11 @@ def create_parser() -> argparse.ArgumentParser:
     )
 
     subparsers.add_parser(
+        "check",
+        help="Run a standalone repository health check.",
+    )
+
+    subparsers.add_parser(
         "repair",
         help="Show a freshness-validated context for the latest failed patch or test flow.",
     )
@@ -814,6 +915,11 @@ def main() -> None:
                     sys.exit(
                         returncode
                     )
+
+            case "check":
+                returncode = command_check()
+                if returncode != 0:
+                    sys.exit(returncode)
 
             case "repair":
                 returncode = command_repair()

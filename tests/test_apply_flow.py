@@ -15,6 +15,7 @@ from chatcode.patch import (
     _show_test_validation,
     _status,
     build_test_failure_repair_context,
+    build_existing_failure_context,
     get_repair_context_stale_reason,
     show_repair_send_instructions,
     _build_patch_summary,
@@ -30,6 +31,7 @@ from chatcode.unified_diff import canonicalize_unified_diff
 from chatcode.workspace import (
     get_default_patch_file,
     get_repair_context_file,
+    get_existing_failure_context_file,
 )
 
 
@@ -453,6 +455,134 @@ class ApplyFlowTests(unittest.TestCase):
         self.assertEqual(validation.status, "regressions")
         self.assertEqual(validation.new_failures, frozenset({"tests.test_new"}))
         self.assertEqual(validation.existing_failures, frozenset({"tests.test_old"}))
+
+    def test_unchanged_baseline_failure_passes_with_visible_pre_existing_status(self) -> None:
+        failure = "tests.test_old"
+        baseline = TestResult(**{**self.result(1).__dict__, "failed_tests": frozenset({failure})})
+        after = TestResult(**{**self.result(1).__dict__, "failed_tests": frozenset({failure})})
+
+        validation = _classify_test_validation(baseline, self.result(), after)
+
+        self.assertEqual(validation.status, "existing")
+        self.assertFalse(validation.new_failures)
+        self.assertEqual(validation.existing_failures, frozenset({failure}))
+        with patch("builtins.print") as output:
+            _show_test_validation(validation)
+        rendered = "\n".join(str(call.args[0]) for call in output.call_args_list if call.args)
+        self.assertIn("PASS WITH PRE-EXISTING FAILURES", rendered)
+        self.assertIn("REGRESSIONS: 0", rendered)
+        self.assertIn("PRE-EXISTING: 1", rendered)
+
+    def test_unchanged_baseline_failure_does_not_create_repair_context(self) -> None:
+        failure = "tests.test_old"
+        failed = TestResult(**{
+            **self.result(1).__dict__, "failed_tests": frozenset({failure}),
+        })
+        with patch("chatcode.patch._qwen_patch_summary", return_value=None), patch(
+            "chatcode.test_runner.run_project_tests", side_effect=[failed, failed],
+        ), patch("chatcode.patch.build_test_failure_repair_context") as repair:
+            _run_apply_flow(self.repo, self.incoming, yes=True)
+
+        repair.assert_not_called()
+
+    def test_pre_existing_failure_menu_offers_fix_context_action(self) -> None:
+        failure = "tests.test_old"
+        failed = TestResult(**{
+            **self.result(1).__dict__, "failed_tests": frozenset({failure}),
+        })
+        stdin, stdout = self.interactive()
+        with patch("chatcode.patch._qwen_patch_summary", return_value=None), patch(
+            "chatcode.test_runner.run_project_tests", side_effect=[failed, failed],
+        ), stdin, stdout, patch("builtins.input", side_effect=["n", "y", "f", "k"]), patch(
+            "builtins.print"
+        ) as output:
+            _run_apply_flow(self.repo, self.incoming)
+
+        rendered = "\n".join(str(call.args[0]) for call in output.call_args_list if call.args)
+        self.assertIn("[F] Create fix context for existing failure", rendered)
+        self.assertIn("Existing failure context created:", rendered)
+        self.assertTrue(get_existing_failure_context_file(self.repo).is_file())
+
+    def test_existing_failure_context_is_a_separate_focused_new_task(self) -> None:
+        applied = apply_patch(self.repo, self.incoming)
+        test_file = self.repo / "tests" / "test_broken.py"
+        implementation = self.repo / "pkg" / "service.py"
+        test_file.parent.mkdir(exist_ok=True)
+        implementation.parent.mkdir()
+        test_file.write_text("from pkg.service import broken\n\ndef test_failure():\n    assert broken()\n", encoding="utf-8")
+        implementation.write_text("def broken():\n    return False\n", encoding="utf-8")
+        report = self.root / "existing-failure.md"
+        failure = "test_broken.BrokenTests.test_failure"
+        report.write_text(
+            f"Status: FAILED\nFAIL: test_failure ({failure})\nTraceback\nAssertionError\n",
+            encoding="utf-8",
+        )
+        failed = TestResult(**{
+            **self.result(1).__dict__, "output_file": report,
+            "failed_tests": frozenset({failure}),
+        })
+        validation = TestValidation(
+            baseline=failed, targeted=self.result(), full=failed, status="existing",
+            existing_failures=frozenset({failure}),
+        )
+
+        context = build_existing_failure_context(
+            self.repo, applied, validation, frozenset({failure})
+        )
+        content = context.read_text(encoding="utf-8")
+
+        self.assertEqual(context, get_existing_failure_context_file(self.repo))
+        self.assertIn("# ChatCode Existing Failure Context", content)
+        self.assertIn(failure, content)
+        self.assertIn("failed before the previous patch", content)
+        self.assertIn("introduced zero new regressions", content)
+        self.assertIn("def broken", content)
+        self.assertIn("from pkg.service import broken", content)
+        self.assertNotIn("PATCH_REPAIR_CONTEXT", str(context))
+
+    def test_existing_failure_context_contains_only_selected_failures(self) -> None:
+        applied = apply_patch(self.repo, self.incoming)
+        first, second = "tests.test_first", "tests.test_second"
+        failed = TestResult(**{
+            **self.result(1).__dict__, "failed_tests": frozenset({first, second}),
+        })
+        validation = TestValidation(
+            baseline=failed, targeted=self.result(), full=failed, status="existing",
+            existing_failures=frozenset({first, second}),
+        )
+
+        context = build_existing_failure_context(self.repo, applied, validation, frozenset({first}))
+        content = context.read_text(encoding="utf-8")
+
+        self.assertIn(first, content)
+        self.assertNotIn(second, content)
+
+    def test_fixed_baseline_failure_is_recorded_without_a_regression(self) -> None:
+        baseline = TestResult(**{
+            **self.result(1).__dict__,
+            "failed_tests": frozenset({"tests.test_old", "tests.test_fixed"}),
+        })
+        after = TestResult(**{
+            **self.result(1).__dict__,
+            "failed_tests": frozenset({"tests.test_old"}),
+        })
+
+        validation = _classify_test_validation(baseline, self.result(), after)
+
+        self.assertEqual(validation.status, "existing")
+        self.assertEqual(validation.fixed_failures, frozenset({"tests.test_fixed"}))
+        self.assertFalse(validation.new_failures)
+
+    def test_targeted_failure_is_authoritative_even_when_it_existed_at_baseline(self) -> None:
+        failure = "tests.test_required"
+        baseline = TestResult(**{**self.result(1).__dict__, "failed_tests": frozenset({failure})})
+        targeted = TestResult(**{**self.result(1).__dict__, "failed_tests": frozenset({failure})})
+        after = TestResult(**{**self.result(1).__dict__, "failed_tests": frozenset({failure})})
+
+        validation = _classify_test_validation(baseline, targeted, after)
+
+        self.assertEqual(validation.status, "targeted_failed")
+        self.assertFalse(validation.new_failures)
 
     def test_unparseable_failed_output_is_classified_as_unclear(self) -> None:
         validation = _classify_test_validation(

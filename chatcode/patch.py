@@ -16,7 +16,7 @@ from .context_state import (
     get_context_task,
     get_stale_context_reason,
 )
-from .git_utils import GitError, run_git
+from .git_utils import GitError, get_status, run_git
 from .history import (
     HistoryError,
     begin_history_entry,
@@ -30,6 +30,8 @@ from .history import (
 from .workspace import (
     atomic_write_text,
     get_default_patch_file,
+    get_check_repair_context_file,
+    get_existing_failure_context_file,
     get_repair_context_file,
     get_repo_workspace,
     get_test_results_dir,
@@ -100,6 +102,7 @@ class TestValidation:
     status: str
     new_failures: frozenset[str] = frozenset()
     existing_failures: frozenset[str] = frozenset()
+    fixed_failures: frozenset[str] = frozenset()
     repair_targets: frozenset[str] = frozenset()
     remaining_repair_failures: frozenset[str] = frozenset()
 
@@ -142,40 +145,51 @@ def _classify_test_validation(
     repair_targets: frozenset[str] = frozenset(),
 ) -> TestValidation:
     """Classify post-patch failures without claiming more than the output shows."""
-    post_results = [
-        result for result in (targeted, full)
-        if result is not None
-    ]
-    if not post_results:
+    if targeted is None and full is None:
         return TestValidation(
             baseline, targeted, full, "unavailable",
             repair_targets=repair_targets,
         )
-    failed_results = [
-        result for result in post_results
-        if result.returncode != 0
-    ]
-    if not failed_results:
+    # Targeted tests are the explicit success criterion for this patch.  They
+    # remain authoritative even when their failing test was already red in the
+    # baseline; the baseline only determines full-suite regressions.
+    if targeted is not None and targeted.returncode != 0:
+        targeted_failures = getattr(targeted, "failed_tests", frozenset())
+        before = getattr(baseline, "failed_tests", frozenset())
+        full_failures = getattr(full, "failed_tests", frozenset()) if full else frozenset()
+        remaining_targets = targeted_failures & repair_targets
         return TestValidation(
-            baseline,
-            targeted,
-            full,
+            baseline, targeted, full,
+            "repair_failed" if remaining_targets else "targeted_failed",
+            new_failures=full_failures - before,
+            existing_failures=full_failures & before,
+            fixed_failures=before - full_failures if full is not None else frozenset(),
+            repair_targets=repair_targets,
+            remaining_repair_failures=remaining_targets,
+        )
+
+    if full is not None and full.returncode == 0:
+        before = getattr(baseline, "failed_tests", frozenset())
+        return TestValidation(
+            baseline, targeted, full,
             "repair_passed" if repair_targets else "passed",
+            fixed_failures=before,
             repair_targets=repair_targets,
         )
     if baseline is None:
         return TestValidation(baseline, targeted, full, "unclear")
 
     before = getattr(baseline, "failed_tests", frozenset())
-    after = frozenset().union(
-        *(getattr(result, "failed_tests", frozenset()) for result in failed_results)
-    )
+    # Regressions are deliberately the full-suite delta, B - A.  A targeted
+    # failure is handled above as a separate, patch-specific criterion.
+    after = getattr(full, "failed_tests", frozenset()) if full is not None else frozenset()
     remaining_targets = after & repair_targets
     if remaining_targets:
         return TestValidation(
             baseline, targeted, full, "repair_failed",
             new_failures=after - before,
             existing_failures=after & before,
+            fixed_failures=before - after,
             repair_targets=repair_targets,
             remaining_repair_failures=remaining_targets,
         )
@@ -183,17 +197,19 @@ def _classify_test_validation(
         # We know the baseline failed, but not *which* test failed.  No
         # post-patch identifier can safely be called new in that situation.
         return TestValidation(baseline, targeted, full, "unclear")
-    if not before and not after:
+    if full is None or not before and not after:
         return TestValidation(baseline, targeted, full, "unclear")
     new = after - before
     existing = after & before
     if new:
         return TestValidation(
-            baseline, targeted, full, "regressions", new, existing
+            baseline, targeted, full, "regressions", new, existing,
+            fixed_failures=before - after,
         )
     if existing:
         return TestValidation(
-            baseline, targeted, full, "existing", frozenset(), existing
+            baseline, targeted, full, "existing", frozenset(), existing,
+            fixed_failures=before - after,
         )
     return TestValidation(baseline, targeted, full, "unclear")
 
@@ -201,9 +217,11 @@ def _classify_test_validation(
 def _show_test_validation(validation: TestValidation) -> None:
     functional_status = {
         "passed": ("PASSED", "green"),
+        "existing": ("PASS WITH PRE-EXISTING FAILURES", "yellow"),
         "repair_passed": ("REPAIR SUCCESSFUL", "green"),
         "regressions": ("FAILED", "red"),
         "repair_failed": ("REPAIR UNSUCCESSFUL", "red"),
+        "targeted_failed": ("FAILED", "red"),
     }.get(validation.status, ("REVIEW REQUIRED", "yellow"))
     print("\nFunctional validation: " + _status(*functional_status))
     for label, result in (
@@ -229,6 +247,18 @@ def _show_test_validation(validation: TestValidation) -> None:
                     "yellow",
                 ))
                 continue
+            if label == "Full suite" and validation.status == "existing":
+                count = len(validation.existing_failures)
+                plural = "failure remains" if count == 1 else "failures remain"
+                print(_status(
+                    f"[WARN] {label}: same {count} pre-existing {plural} ({result.command})",
+                    "yellow",
+                ))
+                continue
+            if label == "Baseline" and validation.status == "existing":
+                count = len(validation.existing_failures)
+                print(_status(f"[FAIL] {label}: {count} existing failure(s) ({result.command})", "red"))
+                continue
             status = "passed" if result.returncode == 0 else "failed"
             color = "green" if result.returncode == 0 else "red"
             symbol = "[OK]" if result.returncode == 0 else "[FAIL]"
@@ -251,8 +281,15 @@ def _show_test_validation(validation: TestValidation) -> None:
         print(_status("Failed: " + ", ".join(sorted(validation.new_failures)), "red"))
         print("Recommended action: run `chatcode repair` to create repair context, then send it to ChatGPT.")
     elif validation.status == "existing":
-        print(_status("[WARN] Baseline failures: " + ", ".join(sorted(validation.existing_failures)), "yellow"))
-        print("Recommended action: run `chatcode repair`, send the context to ChatGPT, or investigate the existing failures separately.")
+        print(_status(
+            f"[WARN] {len(validation.existing_failures)} pre-existing failure(s) remain: "
+            + ", ".join(sorted(validation.existing_failures)),
+            "yellow",
+        ))
+        print("[OK] Assessment: no new regressions detected; existing failures predate this patch.")
+    elif validation.status == "targeted_failed":
+        print(_status("[FAIL] Relevant tests failed; targeted validation remains required for this patch.", "red"))
+        print("Recommended action: repair the targeted failures before keeping this patch.")
     else:
         print(_status("[WARN] Assessment: failures are unclear and require review.", "yellow"))
         print("Recommended action: run `chatcode repair` and send the context to ChatGPT for review.")
@@ -262,12 +299,16 @@ def _show_test_validation(validation: TestValidation) -> None:
     regression_count = len(validation.new_failures)
     targeted_color = "green" if targeted == "PASS" else "red" if targeted == "FAIL" else "yellow"
     full_color = "green" if full == "PASS" else "red" if full == "FAIL" else "yellow"
-    regression_color = "green" if regression_count == 0 and validation.status in {"passed", "repair_passed"} else "red" if regression_count else "yellow"
+    regression_color = "green" if regression_count == 0 and validation.status in {"passed", "repair_passed", "existing"} else "red" if regression_count else "yellow"
     print(" | ".join([
         _status("APPLY: PASS", "green"),
         _status(f"TARGETED: {targeted}", targeted_color),
         _status(f"FULL SUITE: {full}", full_color),
         _status(f"REGRESSIONS: {regression_count}", regression_color),
+        *(
+            [_status(f"PRE-EXISTING: {len(validation.existing_failures)}", "yellow")]
+            if validation.existing_failures else []
+        ),
         *(
             [_status("REPAIR: PASS | TARGET FAILURES REMAIN: 0", "green")]
             if validation.status == "repair_passed" else []
@@ -966,9 +1007,21 @@ def build_test_failure_repair_context(
         except OSError:
             raw_reports[label] = "[Saved test output is unavailable.]"
 
-    failure_ids = sorted(
-        validation.new_failures | validation.existing_failures
+    # A repair prompt must focus on failures this patch is responsible for.
+    # Unchanged baseline failures are diagnostic information, never automatic
+    # repair targets.
+    repair_failure_ids = (
+        validation.new_failures
+        | validation.remaining_repair_failures
+        | (
+            getattr(validation.targeted, "failed_tests", frozenset())
+            if validation.status == "targeted_failed" else frozenset()
+        )
+        # This function may also be called explicitly to investigate an
+        # existing failure.  It is never reached automatically for that state.
+        | (validation.existing_failures if validation.status == "existing" else frozenset())
     )
+    failure_ids = sorted(repair_failure_ids)
     anchors: dict[str, int] = {}
     relevant_paths: list[str] = []
 
@@ -1073,10 +1126,19 @@ def build_test_failure_repair_context(
                 validation.new_failures - validation.remaining_repair_failures
             )),
         ]
+    elif validation.status == "targeted_failed":
+        classifications = [
+            *(f"- failed targeted test: {name}" for name in sorted(
+                getattr(validation.targeted, "failed_tests", frozenset())
+            )),
+            *(f"- regression: {name}" for name in sorted(validation.new_failures)),
+        ]
     else:
         classifications = [
             *(f"- regression: {name}" for name in sorted(validation.new_failures)),
-            *(f"- pre-existing: {name}" for name in sorted(validation.existing_failures)),
+            *(f"- pre-existing (explicit investigation): {name}" for name in sorted(
+                validation.existing_failures
+            )),
         ]
     classifications = classifications or [
         "- unclear: test runner did not expose stable failure identifiers"
@@ -1626,6 +1688,257 @@ def _verify_undo(
         ) from exc
 
 
+CHECK_REPAIR_COMPANION_PROMPT = (
+    "Use the attached CHECK_REPAIR_CONTEXT.md as the current repository context "
+    "and source of truth. Fix the listed failing test(s) without weakening tests "
+    "or reverting unrelated working-tree changes. Trace the failure through the "
+    "supplied current implementation and repair the underlying behavior. Return "
+    "exactly one complete unified diff with at least three unchanged context lines "
+    "around each hunk and no explanation outside the diff."
+)
+
+
+def build_check_repair_context(repo: Path, test_result, selected_failures: frozenset[str]) -> Path:
+    """Materialize a focused new task from a standalone health check."""
+    selected = frozenset(selected_failures) & getattr(test_result, "failed_tests", frozenset())
+    if not selected:
+        raise PatchError("Choose at least one failing test from this health check.")
+    try:
+        output = test_result.output_file.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        output = "[Saved test output is unavailable.]"
+    traceback_paths: list[Path] = []
+    repo_root = repo.resolve()
+    for raw_path in re.findall(r'^\s*File "([^"]+)", line \d+', output, re.MULTILINE):
+        try:
+            path = Path(raw_path).resolve()
+            path.relative_to(repo_root)
+        except (OSError, ValueError):
+            continue
+        traceback_paths.append(path)
+    from .context_builder import build_context_from_test_roots
+    source_context, selected_paths = build_context_from_test_roots(
+        repo, selected, traceback_paths
+    )
+    try:
+        dirty = get_status(repo) or "[Working tree clean.]"
+    except GitError:
+        dirty = "[Working-tree status unavailable.]"
+    try:
+        diff_paths = [path.relative_to(repo).as_posix() for path in selected_paths]
+        current_diff = run_git("diff", "--no-renames", "--", *diff_paths, cwd=repo) if diff_paths else ""
+    except GitError:
+        current_diff = ""
+    diagnostics = []
+    for failure_id in sorted(selected):
+        diagnostics.extend([f"### {failure_id}", "```text", _failure_output_excerpt(output, failure_id), "```", ""])
+    content = "\n".join([
+        "# ChatCode Check Repair Context", "",
+        "Generated from `chatcode check` against the current working tree.",
+        f"Repository: `{repo.resolve()}`", "",
+        "## Repair targets", *(f"- {failure}" for failure in sorted(selected)), "",
+        "## Relevant failure output", *diagnostics,
+        "## Dirty working-tree state", "```text", dirty, "```", "",
+        "## Directly relevant current diff", "```diff", current_diff or "[No unstaged diff for selected source files.]", "```", "",
+        "## Exact current source and bounded dependencies",
+        source_context,
+        "## Repair success criterion",
+        "The listed failing tests are the repair targets. The repair is successful when those tests pass without introducing new regressions.",
+        "Do not weaken or remove tests. Do not revert unrelated working-tree changes.", "",
+    ])
+    destination = get_check_repair_context_file(repo)
+    atomic_write_text(destination, content, newline="\n")
+    return destination
+
+
+def show_check_repair_send_instructions(context: Path) -> None:
+    print(f"Check repair context created: {context}")
+    print("Attach that file and send this message with it:")
+    print(CHECK_REPAIR_COMPANION_PROMPT)
+
+
+EXISTING_FAILURE_COMPANION_PROMPT = (
+    "Use the attached EXISTING_FAILURE_CONTEXT.md as the current repository "
+    "context and source of truth. Fix the selected pre-existing test failure "
+    "without reverting unrelated working-tree changes or the previously "
+    "successful patch. Return exactly one complete unified diff with at least "
+    "three unchanged context lines around each hunk and no explanation outside "
+    "the diff."
+)
+
+
+def _failure_output_excerpt(output: str, failure_id: str) -> str:
+    """Keep the selected failure's diagnostic, not unrelated suite noise."""
+    lines = output.splitlines()
+    index = next((i for i, line in enumerate(lines) if failure_id in line), None)
+    if index is None:
+        return output[-12_000:] or "[Selected failure details unavailable.]"
+    end = next(
+        (i for i in range(index + 1, len(lines))
+         if lines[i].startswith(("FAIL: ", "ERROR: "))),
+        min(len(lines), index + 180),
+    )
+    return "\n".join(lines[max(0, index - 2):end]).strip()
+
+
+def build_existing_failure_context(
+    repo: Path,
+    result: ApplyResult,
+    validation: TestValidation,
+    selected_failures: frozenset[str],
+) -> Path:
+    """Create a new-task context for failures proven to predate this patch."""
+    selected_failures = frozenset(selected_failures) & validation.existing_failures
+    if not selected_failures:
+        raise PatchError("Choose at least one currently reported pre-existing failure.")
+
+    def report_text(test_result) -> str:
+        if test_result is None:
+            return "[Not run.]"
+        try:
+            return test_result.output_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return "[Saved test output is unavailable.]"
+
+    baseline_output = report_text(validation.baseline)
+    post_output = report_text(validation.full)
+    relevant_paths: list[str] = []
+
+    def add_path(raw_path: str) -> None:
+        normalized = PurePosixPath(raw_path.replace("\\", "/")).as_posix()
+        path = PurePosixPath(normalized)
+        if (path.is_absolute() or ".." in path.parts or ".git" in path.parts
+                or normalized in relevant_paths):
+            return
+        if repo.joinpath(*path.parts).is_file():
+            relevant_paths.append(normalized)
+
+    test_paths: list[str] = []
+    for failure_id in sorted(selected_failures):
+        module = failure_id.split(".", 1)[0]
+        candidate = f"tests/{module.replace('.', '/')}" + ("" if module.endswith(".py") else ".py")
+        if (repo / candidate).is_file():
+            test_paths.append(candidate)
+            add_path(candidate)
+
+    # A small deterministic fallback keeps a useful implementation file in
+    # the context even when the project graph has not been built yet.
+    for test_path in test_paths:
+        try:
+            test_source = (repo / test_path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        modules = re.findall(r"^\s*from\s+([\w.]+)\s+import\s+", test_source, re.MULTILINE)
+        modules += re.findall(r"^\s*import\s+([\w.]+)", test_source, re.MULTILINE)
+        for module in modules[:12]:
+            add_path(module.replace(".", "/") + ".py")
+            add_path(module.replace(".", "/") + "/__init__.py")
+
+    # The graph supplies bounded direct implementation dependencies from the
+    # high-confidence failing-test seed. Content is always read from disk now.
+    try:
+        from .indexing.project_graph import load_map
+        indexed_files = load_map(repo).get("files", {})
+        for test_path in test_paths:
+            for dependency in indexed_files.get(test_path, {}).get("dependencies", [])[:8]:
+                if isinstance(dependency, str):
+                    add_path(dependency)
+    except (OSError, AttributeError, TypeError):
+        pass
+    for path in sorted(result.paths):
+        add_path(path)
+
+    sections: list[str] = []
+    budget = 140_000
+    for path in relevant_paths:
+        section = _working_tree_section(repo, path, full_limit=35_000)
+        size = len("\n".join(section))
+        if sections and size > budget:
+            continue
+        sections.extend(section)
+        budget -= size
+
+    try:
+        patch_text = get_history_patch_file(result.history_entry).read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        patch_text = "[Recently applied patch is unavailable.]"
+    try:
+        dirty_state = get_status(repo) or "[Working tree clean.]"
+    except GitError:
+        dirty_state = "[Working-tree status unavailable.]"
+
+    failure_sections: list[str] = []
+    for failure_id in sorted(selected_failures):
+        failure_sections.extend([
+            f"### {failure_id}",
+            "This test failed before the previous patch and still fails now.",
+            "#### Baseline failure output",
+            "```text", _failure_output_excerpt(baseline_output, failure_id), "```",
+            "#### Current post-patch failure output",
+            "```text", _failure_output_excerpt(post_output, failure_id), "```", "",
+        ])
+
+    content = "\n".join([
+        "# ChatCode Existing Failure Context",
+        "",
+        "## New-task provenance",
+        "Created from a pre-existing failure discovered during post-apply validation.",
+        f"Repository: `{repo.resolve()}`",
+        "The previous patch passed its targeted tests and introduced zero new regressions.",
+        "This is a separate bug-fix task, not a repair of the previous patch.",
+        "",
+        "## Original task for the previous patch",
+        get_context_task(repo),
+        "",
+        "## Selected pre-existing failure(s)",
+        *failure_sections,
+        "## Recently applied patch summary",
+        _fallback_patch_summary(patch_text, result.paths),
+        "",
+        "## Dirty working-tree state",
+        "```text", dirty_state, "```",
+        "",
+        "## Exact current source and bounded dependencies",
+        *(sections or ["[No selected test source could be materialized.]", ""]),
+        "## Required response",
+        "Fix only the selected pre-existing failure(s). Preserve unrelated working behavior and do not revert the previous successful patch merely to restore an old state.",
+        "Return one complete unified diff against the current files, with no explanation outside the diff.",
+        "",
+    ])
+    output_file = get_existing_failure_context_file(repo)
+    atomic_write_text(output_file, content, newline="\n")
+    return output_file
+
+
+def show_existing_failure_send_instructions(context: Path) -> None:
+    print(f"Existing failure context created: {context}")
+    print("Attach that file and send this message with it:")
+    print(EXISTING_FAILURE_COMPANION_PROMPT)
+
+
+def _choose_existing_failures(failures: frozenset[str]) -> frozenset[str]:
+    ordered = sorted(failures)
+    if len(ordered) == 1:
+        print(f"Selected pre-existing failure: {ordered[0]}")
+        return frozenset(ordered)
+    print("Select pre-existing failure(s) for a new fix task:")
+    for index, failure in enumerate(ordered, start=1):
+        print(f"[{index}] {failure}")
+    print("Enter comma-separated numbers, or A for all (one is recommended).")
+    answer = input("> ").strip().lower()
+    if answer == "a":
+        return frozenset(ordered)
+    try:
+        selected = {ordered[int(part.strip()) - 1] for part in answer.split(",") if part.strip()}
+    except (IndexError, ValueError):
+        selected = set()
+    if not selected:
+        print("No valid failure selected.")
+    return frozenset(selected)
+
+
 def _post_apply_choice(
     repo: Path,
     result: ApplyResult,
@@ -1641,11 +1954,15 @@ def _post_apply_choice(
         test_result is not None
         and test_result.returncode != 0
     )
+    pre_existing_only = validation is not None and validation.status == "existing"
 
     while True:
         if failed:
             undo_label = "[U] Undo (recommended)" if recommend_undo else "[U] Undo"
-            print(f"[K] Keep changes  {undo_label}  [R] Review diff  [T] Show test output")
+            if pre_existing_only:
+                print(f"[K] Keep changes  [F] Create fix context for existing failure  {undo_label}  [R] Review diff  [T] Show test output")
+            else:
+                print(f"[K] Keep changes  {undo_label}  [R] Review diff  [T] Show test output")
             choice = input("> ").strip().lower()
             if not choice and recommend_undo:
                 choice = "u"
@@ -1678,6 +1995,17 @@ def _post_apply_choice(
                 print(f"Could not read test output: {exc}")
             continue
 
+        if choice == "f" and pre_existing_only and validation is not None:
+            selected = _choose_existing_failures(validation.existing_failures)
+            if not selected:
+                continue
+            try:
+                context = build_existing_failure_context(repo, result, validation, selected)
+                show_existing_failure_send_instructions(context)
+            except OSError as exc:
+                print(f"Could not create existing failure context: {exc}")
+            continue
+
         if choice == "u":
             undone = undo_last_patch(repo)
             _verify_undo(
@@ -1705,7 +2033,8 @@ def _post_apply_choice(
             print(f"No test report is available: {test_error}")
             continue
 
-        print("Choose K, U, R" + (", or T." if failed else "."))
+        extra = ", T, or F." if failed and pre_existing_only else ", or T." if failed else "."
+        print("Choose K, U, R" + extra)
 
 
 def _run_apply_flow(
@@ -1846,7 +2175,7 @@ def _run_apply_flow(
         repair_targets,
     )
     _show_test_validation(validation)
-    validation_passed = validation.status in {"passed", "repair_passed"}
+    validation_passed = validation.status in {"passed", "repair_passed", "existing"}
     if not validation_passed:
         try:
             repair_context = build_test_failure_repair_context(

@@ -116,6 +116,20 @@ def get_repair_context_file(
     )
 
 
+def get_existing_failure_context_file(
+    repo: Path,
+) -> Path:
+    """A new-task context for debt discovered during patch validation."""
+    return get_repo_workspace(repo) / "EXISTING_FAILURE_CONTEXT.md"
+
+
+def get_check_repair_context_file(
+    repo: Path,
+) -> Path:
+    """A standalone health-check repair task, never tied to a patch."""
+    return get_repo_workspace(repo) / "CHECK_REPAIR_CONTEXT.md"
+
+
 def get_test_results_dir(
     repo: Path,
 ) -> Path:

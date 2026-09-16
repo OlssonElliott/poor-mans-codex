@@ -1607,6 +1607,68 @@ def build_patch_source_context(
     return rendered
 
 
+def build_context_from_test_roots(
+    repo: Path,
+    test_ids: frozenset[str],
+    traceback_paths: list[Path] | None = None,
+) -> tuple[str, list[Path]]:
+    """Build verified current source from exact failing-test roots.
+
+    This deliberately skips natural-language/semantic discovery.  Test IDs
+    seed the same deterministic call-site closure and hardened materializer
+    used by normal patch contexts.
+    """
+    roots: list[Path] = []
+    required: dict[Path, list[str]] = {}
+    for test_id in sorted(test_ids):
+        if "::" in test_id:
+            raw_path, *parts = test_id.split("::")
+            candidate = repo / raw_path
+            symbol = parts[-1] if parts else ""
+        else:
+            parts = test_id.rsplit(".", 2)
+            module = parts[0] if len(parts) == 3 else test_id.split(".", 1)[0]
+            candidate = repo / (module.replace(".", "/") + ".py")
+            if not candidate.is_file():
+                candidate = repo / "tests" / (module.replace(".", "/") + ".py")
+            symbol = parts[-1] if len(parts) == 3 else ""
+        if candidate.is_file() and candidate not in roots:
+            roots.append(candidate)
+        if candidate.is_file() and symbol:
+            required.setdefault(candidate, []).append(symbol)
+
+    # Keep index-derived ownership current while retaining the known test as
+    # the only retrieval root.
+    try:
+        update_project_map(repo, paths=_index_scope_paths(repo))
+    except Exception:
+        pass
+    # The closure's task matcher works on identifier tokens. Split test IDs
+    # (including snake_case names) so an exact test method is never skipped.
+    closure_task = " ".join(
+        token
+        for test_id in sorted(test_ids)
+        for token in re.findall(r"[A-Za-z0-9]+", test_id)
+    )
+    closure = test_callsite_closure(repo, closure_task, roots)
+    files = list(dict.fromkeys([*roots, *closure.files]))
+    for path, symbols in closure.required_symbols.items():
+        required.setdefault(path, []).extend(symbols)
+    for path in traceback_paths or []:
+        try:
+            resolved = path.resolve()
+            resolved.relative_to(repo.resolve())
+        except (OSError, ValueError):
+            continue
+        if resolved.is_file() and resolved not in files:
+            files.append(resolved)
+    required = {path: list(dict.fromkeys(symbols)) for path, symbols in required.items()}
+    source, _hashes = _build_stable_patch_source_context(
+        repo, closure_task, files, required
+    )
+    return source, files
+
+
 def _current_file_hashes(
     files: list[Path],
 ) -> dict[Path, str | None]:
