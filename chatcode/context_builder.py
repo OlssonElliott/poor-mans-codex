@@ -968,15 +968,9 @@ def collect_relevant_files(
     seed_files = list(dict.fromkeys([
         *explicit_targets, *surface_result.files, *semantic_targets, *graph_files,
     ]))
-    transport_seed_files = list(dict.fromkeys([
-        *seed_files,
-        *(
-            path for path in changed_files
-            if path.is_file() and is_source_file(path)
-            and not _is_context_internal_artifact(path, repo)
-        ),
-    ]))
-    transport_result = resolve_transport_roots(repo, transport_seed_files)
+    # Dirty state is preservation metadata, not relevance evidence. A changed
+    # file participates here only when another retrieval signal selected it.
+    transport_result = resolve_transport_roots(repo, seed_files)
     seed_files = list(dict.fromkeys([*seed_files, *transport_result.files]))
     hybrid = expand_candidates(repo, task, seed_files, limit=MAX_FILES)
     for path, reasons in explicit_target_reasons.items():
@@ -997,21 +991,38 @@ def collect_relevant_files(
         hybrid.reasons[path] = list(dict.fromkeys([
             *reasons, *hybrid.reasons.get(path, []),
         ]))
+    callsite_closure = test_callsite_closure(repo, task, [*hybrid.files, *graph_files])
+    implementation_roots: dict[Path, list[str]] = {}
+    for result in (
+        locals().get("explicit_target_result"),
+        surface_result,
+        locals().get("semantic_target_result"),
+        transport_result,
+        callsite_closure,
+    ):
+        if result is None:
+            continue
+        for path, symbols in result.required_symbols.items():
+            implementation_roots.setdefault(path, [])
+            implementation_roots[path] = list(dict.fromkeys([
+                *implementation_roots[path],
+                *symbols,
+            ]))
     closure_focus = {
         symbol
-        for result in (
-            locals().get("explicit_target_result"), surface_result,
-            locals().get("semantic_target_result"),
-        )
-        if result is not None
-        for symbols in result.required_symbols.values()
+        for symbols in implementation_roots.values()
         for symbol in symbols
     }
     closure = (
-        implementation_closure(repo, task, [*hybrid.files, *graph_files], closure_focus)
-        if closure_focus else RetrievalResult([])
+        implementation_closure(
+            repo,
+            task,
+            [*hybrid.files, *graph_files],
+            closure_focus,
+            root_symbols=implementation_roots,
+        )
+        if implementation_roots else RetrievalResult([])
     )
-    callsite_closure = test_callsite_closure(repo, task, [*hybrid.files, *graph_files])
     for path in callsite_closure.files:
         if path not in hybrid.files:
             hybrid.files.append(path)
@@ -1043,7 +1054,17 @@ def collect_relevant_files(
     changed_definition_roots = _changed_python_definition_roots(
         repo, changed_source_files
     )
-    selected: list[Path] = [path for path in changed_source_files if path not in ambiguous_files]
+    # Dirty state is normally preservation metadata, not relevance evidence.
+    # Keep the legacy overflow safeguard: when the dirty working tree itself
+    # exceeds the normal selection cap, retaining every dirty source file
+    # avoids silently dropping user changes. Smaller unrelated dirty sets still
+    # require an independent task or retrieval signal.
+    preserve_dirty_overflow = len(changed_source_files) > MAX_FILES
+    selected: list[Path] = [
+        path
+        for path in changed_source_files
+        if preserve_dirty_overflow and path not in ambiguous_files
+    ]
     for path in explicit_files:
         if path not in selected:
             selected.append(path)

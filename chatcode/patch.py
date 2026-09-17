@@ -1947,9 +1947,11 @@ def _result_from_followup_attempt(attempt: dict) -> ApplyResult | None:
     )
 
 
-def _attempted_python_symbols(result: ApplyResult) -> set[str]:
-    """Recover definitions changed by the successfully applied patch."""
-    attempted: set[str] = set()
+def _attempted_python_symbols_by_path(
+    result: ApplyResult,
+) -> dict[str, set[str]]:
+    """Recover changed Python definitions while preserving their file owner."""
+    attempted: dict[str, set[str]] = {}
     for relative in result.paths:
         if not relative.casefold().endswith(".py"):
             continue
@@ -1969,11 +1971,22 @@ def _attempted_python_symbols(result: ApplyResult) -> set[str]:
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
             })
         before, after = snapshots
-        attempted.update(
+        changed = {
             name for name in before.keys() | after.keys()
             if before.get(name) != after.get(name)
-        )
+        }
+        if changed:
+            attempted[relative] = changed
     return attempted
+
+
+def _attempted_python_symbols(result: ApplyResult) -> set[str]:
+    """Compatibility helper for follow-up alternative discovery."""
+    return {
+        symbol
+        for symbols in _attempted_python_symbols_by_path(result).values()
+        for symbol in symbols
+    }
 
 
 def build_followup_context(
@@ -2025,6 +2038,7 @@ def build_followup_context(
         _build_stable_patch_source_context,
         _ensure_explicit_task_files,
         collect_relevant_files,
+        is_source_file,
     )
     from .retrieval.hybrid_retriever import resolve_alternative_callback_roots
     retrieved = collect_relevant_files(repo, retrieval_task, include_target_symbols=True)
@@ -2034,22 +2048,52 @@ def build_followup_context(
         symbol for attempted in attempted_results
         for symbol in _attempted_python_symbols(attempted)
     }
+    attempted_paths: list[Path] = []
+    attempted_target_symbols: dict[Path, list[str]] = {}
+    repo_root = repo.resolve()
+    for attempted in attempted_results:
+        symbols_by_path = _attempted_python_symbols_by_path(attempted)
+        for raw_path in sorted(attempted.paths):
+            relative = PurePosixPath(raw_path.replace("\\", "/"))
+            if relative.is_absolute() or ".." in relative.parts or ".git" in relative.parts:
+                continue
+            candidate = repo.joinpath(*relative.parts)
+            try:
+                candidate.resolve().relative_to(repo_root)
+            except (OSError, ValueError):
+                continue
+            if (
+                candidate.is_file()
+                and is_source_file(candidate)
+                and candidate not in attempted_paths
+            ):
+                attempted_paths.append(candidate)
+            symbols = symbols_by_path.get(raw_path, set())
+            if candidate.is_file() and symbols:
+                attempted_target_symbols.setdefault(candidate, [])
+                attempted_target_symbols[candidate] = list(dict.fromkeys([
+                    *attempted_target_symbols[candidate],
+                    *sorted(symbols),
+                ]))
     alternatives = resolve_alternative_callback_roots(
         repo, retrieval_task, attempted_symbols
     )
     # Follow-up-only priority: keep the attempted dirty path in normal
     # retrieval, but put structurally supported alternatives first so the
     # failed hypothesis cannot consume all patchable-source allowance.
-    files = list(dict.fromkeys([*alternatives.files, *files]))
-    target_symbols = {
-        **alternatives.required_symbols,
-        **{
-            path: list(dict.fromkeys([
-                *alternatives.required_symbols.get(path, []), *symbols,
+    files = list(dict.fromkeys([*alternatives.files, *attempted_paths, *files]))
+    merged_targets: dict[Path, list[str]] = {}
+    for source in (
+        alternatives.required_symbols,
+        target_symbols,
+        attempted_target_symbols,
+    ):
+        for path, symbols in source.items():
+            merged_targets.setdefault(path, [])
+            merged_targets[path] = list(dict.fromkeys([
+                *merged_targets[path], *symbols,
             ]))
-            for path, symbols in target_symbols.items()
-        },
-    }
+    target_symbols = merged_targets
     files = _ensure_explicit_task_files(repo, retrieval_task, files)
     source_context, source_hashes = _build_stable_patch_source_context(
         repo, retrieval_task, files, target_symbols
@@ -2605,7 +2649,7 @@ def _run_apply_flow(
     )
     assert isinstance(result, ApplyResult)
 
-    print(_status("\n[OK] PATCH APPLIED", "green"))
+    print("\n[OK] PATCH APPLIED")
     print("Running relevant tests, then the full suite...")
 
     test_result = None

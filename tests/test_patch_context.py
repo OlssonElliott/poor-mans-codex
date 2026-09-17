@@ -91,6 +91,36 @@ class PatchContextTests(unittest.TestCase):
         )
         legacy_scan.assert_not_called()
 
+    def test_unrelated_dirty_source_is_not_automatically_relevant(self) -> None:
+        relevant = self.write(
+            "src/relevant.py",
+            "def wanted_feature():\n    return 'current'\n",
+        )
+        unrelated = self.write(
+            "src/unrelated.py",
+            "def background_work():\n    return 'base'\n",
+        )
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-qm", "fixture")
+        unrelated.write_text(
+            "def background_work():\n    return 'DIRTY unrelated'\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        update = Mock(effective_mode="static")
+        with patch(
+            "chatcode.context_builder.update_project_map", return_value=update
+        ), patch(
+            "chatcode.context_builder.retrieve_files", return_value=[relevant]
+        ):
+            selected = collect_relevant_files(
+                self.repo,
+                "change wanted feature",
+            )
+
+        self.assertIn(relevant, selected)
+        self.assertNotIn(unrelated, selected)
+
     def test_completeness_symbol_resolution_file_reaches_final_context(self) -> None:
         command = self.write("commands/transfer.py", "def transfer():\n    pass\n")
         service = self.write("services/inventory_transfer.py", "class InventoryTransferService:\n    pass\n")
