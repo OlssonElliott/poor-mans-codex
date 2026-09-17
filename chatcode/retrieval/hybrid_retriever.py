@@ -29,6 +29,7 @@ MAX_TASK_SURFACES = 4
 # example renderer, view, presenter, and autocomplete). Keep this bounded,
 # while allowing each independently promoted root to reach materialization.
 MAX_SURFACE_ROOTS = 4
+MAX_TRANSPORT_ROOTS = 2
 GENERIC_PATH_PARTS = {"utils", "util", "common", "config", "settings", "constants", "helpers"}
 
 
@@ -413,6 +414,95 @@ def implementation_closure(
     ordered = sorted(scores, key=lambda name: (-scores[name], name.lower()))[:MAX_CLOSURE_FILES]
     paths = [repo / name for name in ordered]
     return RetrievalResult(paths, {repo / name: reasons[name] for name in ordered}, paths.copy(), {repo / name: required[name] for name in ordered})
+
+
+def resolve_transport_roots(repo: Path, seeds: list[Path]) -> RetrievalResult:
+    """Resolve a local HTTP-handler owner when selected code names a method.
+
+    The method that needs implementing may deliberately be absent.  In that
+    case a class owning several sibling HTTP handlers is stronger evidence
+    than an exact-symbol lookup, provided its indexed module is structurally
+    connected to one of the already selected application surfaces.
+    """
+    index = load_map(repo).get("files", {})
+    seed_names = {
+        path.relative_to(repo).as_posix()
+        for path in seeds
+        if path.is_file()
+    }
+    requested: set[str] = set()
+    method_pattern = re.compile(
+        r"\bmethod\s*[:=]\s*[^\r\n]{0,80}?['\"]"
+        r"(GET|POST|PUT|PATCH|DELETE|OPTIONS)['\"]",
+        re.IGNORECASE,
+    )
+    for path in seeds:
+        if not path.is_file():
+            continue
+        try:
+            requested.update(
+                value.upper() for value in method_pattern.findall(
+                    path.read_text(encoding="utf-8", errors="replace")
+                )
+            )
+        except OSError:
+            continue
+    if not requested:
+        return RetrievalResult([])
+
+    candidates: list[tuple[int, str, str, list[str]]] = []
+    for relative, entry in index.items():
+        path = repo / relative
+        if relative in seed_names or path.suffix.casefold() != ".py" or not path.is_file():
+            continue
+        dependencies = {str(value) for value in entry.get("dependencies", [])}
+        # This relation anchors the transport owner to a selected application
+        # surface and prevents unrelated web servers from entering the result.
+        if not dependencies & seed_names:
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, SyntaxError):
+            continue
+        indexed_names = {
+            str(symbol.get("name", ""))
+            for symbol in entry.get("symbols", [])
+            if isinstance(symbol, dict)
+        }
+        for node in tree.body:
+            if not isinstance(node, ast.ClassDef) or node.name not in indexed_names:
+                continue
+            handlers = sorted({
+                child.name
+                for child in node.body
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and re.fullmatch(r"do_(GET|POST|PUT|PATCH|DELETE|OPTIONS)", child.name)
+            })
+            methods = {name.removeprefix("do_") for name in handlers}
+            if len(methods) < 3:
+                continue
+            score = len(methods) * 20 + 120
+            score += 50 if "OPTIONS" in methods else 0
+            score += 80 if requested - methods else 40
+            candidates.append((score, relative, node.name, handlers))
+
+    chosen = sorted(
+        candidates, key=lambda value: (-value[0], value[1].casefold(), value[2].casefold())
+    )[:MAX_TRANSPORT_ROOTS]
+    paths = [repo / relative for _score, relative, _owner, _handlers in chosen]
+    reasons = {
+        repo / relative: [
+            "HTTP transport owner for selected request method(s) "
+            + ", ".join(sorted(requested)),
+            "sibling handlers: " + ", ".join(handlers),
+        ]
+        for _score, relative, _owner, handlers in chosen
+    }
+    required = {
+        repo / relative: [owner]
+        for _score, relative, owner, _handlers in chosen
+    }
+    return RetrievalResult(paths, reasons, paths.copy(), required)
 
 
 def test_callsite_closure(repo: Path, task: str, seeds: list[Path]) -> RetrievalResult:
