@@ -19,21 +19,75 @@ from chatcode.config import get_setting
 from chatcode.indexing.project_graph import load_map
 
 
-MAX_CANDIDATES = 24
-MAX_COMPLETENESS_RESOLVED = 3
+MAX_CANDIDATES = 36
+MAX_COMPLETENESS_RESOLVED = 6
 MAX_EXPLICIT_TARGETS = 8
-MAX_SEMANTIC_HINTS = 12
+MAX_SEMANTIC_HINTS = 20
 MAX_CLOSURE_FILES = 8
 MAX_ROOTED_CLOSURE_DEPTH = 3
 MAX_ROOTED_CLOSURE_FILES = 12
 MAX_ROOTED_CLOSURE_SYMBOLS = 24
-MAX_TASK_SURFACES = 4
+MAX_TASK_SURFACES = 12
 # A surface can have a small set of equally strong concrete definitions (for
 # example renderer, view, presenter, and autocomplete). Keep this bounded,
 # while allowing each independently promoted root to reach materialization.
 MAX_SURFACE_ROOTS = 4
 MAX_TRANSPORT_ROOTS = 2
+MAX_SURFACE_SUPPORT_SYMBOLS = 4
 GENERIC_PATH_PARTS = {"utils", "util", "common", "config", "settings", "constants", "helpers"}
+
+REQUIREMENT_ROLE_TERMS = {
+    "persistence": frozenset({
+        "database", "db", "persist", "persistence", "schema", "storage", "store",
+        "save", "saved", "load", "loaded", "table", "repository",
+        "databas", "lagra", "lagring", "spara", "sparas", "ladda", "tabell",
+    }),
+    "transport": frozenset({
+        "api", "endpoint", "route", "request", "response", "http", "handler",
+        "controller", "server",
+    }),
+    "ui": frozenset({
+        "ui", "frontend", "dashboard", "dialog", "modal", "editor", "button",
+        "form", "component", "render", "display", "view", "panel",
+        "gränssnitt", "knapp", "visa",
+    }),
+    "tests": frozenset({
+        "test", "tests", "testing", "spec", "regression",
+        "tester", "testa", "regressionstest",
+    }),
+    "domain": frozenset({
+        "model", "entity", "service", "state", "flow", "rule", "behavior",
+        "behaviour", "type", "instance", "template",
+        "modell", "entitet", "tjänst", "flöde", "regel", "instans", "mall",
+    }),
+}
+
+REQUIREMENT_ROLE_SYMBOL_TERMS = {
+    "persistence": frozenset({
+        "init", "initialize", "schema", "migrate", "migration", "create", "insert",
+        "save", "store", "persist", "load", "read", "get", "list", "update",
+        "delete", "remove",
+    }),
+    "transport": frozenset({
+        "api", "route", "handler", "request", "response", "get", "post", "put",
+        "patch", "delete", "options", "serialize", "deserialize",
+    }),
+    "ui": frozenset({
+        "dialog", "modal", "editor", "form", "component", "render", "view",
+        "panel", "button", "submit", "handle", "open", "close",
+    }),
+    "tests": frozenset({"test", "spec", "fixture", "assert"}),
+    "domain": frozenset({
+        "model", "entity", "service", "state", "flow", "rule", "create", "update",
+        "delete", "place", "move", "transfer",
+    }),
+}
+
+GENERIC_REQUIREMENT_TERMS = frozenset({
+    "add", "allow", "change", "create", "edit", "make", "new", "replace",
+    "support", "update", "use", "when", "with", "without", "should", "same",
+    "lägg", "ändra", "skapa", "stöd", "använd", "ska", "samma",
+})
 
 
 @dataclass
@@ -51,15 +105,114 @@ class CompletenessResult:
     reasons: dict[Path, str] = field(default_factory=dict)
 
 
+def _surface_tokens(text: str) -> set[str]:
+    tokens = {
+        token.casefold()
+        for token in re.findall(
+            r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]+",
+            text.replace("_", " "),
+        )
+        if len(token) >= 3
+    }
+    expanded = set(tokens)
+    for token in tokens:
+        if token.endswith("ies") and len(token) > 5:
+            expanded.add(token[:-3] + "y")
+        if token.endswith("ing") and len(token) > 5:
+            expanded.add(token[:-3])
+        if token.endswith("ed") and len(token) > 4:
+            expanded.add(token[:-2])
+        if token.endswith("s") and len(token) > 4:
+            expanded.add(token[:-1])
+    return expanded
+
+
+def _surface_roles(tokens: set[str]) -> set[str]:
+    return {
+        role
+        for role, trigger_terms in REQUIREMENT_ROLE_TERMS.items()
+        if tokens & trigger_terms
+    }
+
+
+def _task_is_complex(task: str, surfaces: list[str] | None = None) -> bool:
+    surfaces = surfaces if surfaces is not None else _task_surfaces(task)
+    roles = {
+        role
+        for surface in surfaces
+        for role in _surface_roles(_surface_tokens(surface))
+    }
+    return len(surfaces) >= 4 or len(task) >= 480 or len(roles) >= 3
+
+
+def _related_role_symbols(
+    entry: dict,
+    task_tokens: set[str],
+    roles: set[str],
+    primary: str,
+) -> list[str]:
+    if not roles:
+        return []
+    domain_tokens = task_tokens - GENERIC_REQUIREMENT_TERMS
+    role_symbol_terms = {
+        term
+        for role in roles
+        for term in REQUIREMENT_ROLE_SYMBOL_TERMS.get(role, ())
+    }
+    important = {
+        str(value).casefold()
+        for value in entry.get("important_symbols", [])
+        if isinstance(value, str)
+    }
+    ranked: list[tuple[int, str, str]] = []
+    for symbol in entry.get("symbols", []):
+        if not isinstance(symbol, dict) or not symbol.get("name"):
+            continue
+        name = str(symbol["name"])
+        definition = str(symbol.get("definition_name") or name)
+        if definition == primary:
+            continue
+        split_name = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", name)
+        symbol_tokens = _surface_tokens(split_name)
+        score = 100 * len(domain_tokens & symbol_tokens)
+        score += 45 * len(role_symbol_terms & symbol_tokens)
+        if name.casefold() in important:
+            score += 20
+        if (
+            "persistence" in roles
+            and symbol_tokens
+            & {"init", "initialize", "schema", "migrate", "migration", "setup"}
+        ):
+            score += 40
+        if score >= 45:
+            ranked.append((score, name, definition))
+    ranked.sort(key=lambda item: (-item[0], item[1].casefold()))
+    return list(
+        dict.fromkeys(item[2] for item in ranked)
+    )[:MAX_SURFACE_SUPPORT_SYMBOLS]
+
+
 def _task_surfaces(task: str) -> list[str]:
-    """Split only explicit functional clauses, never arbitrary nouns."""
-    clauses = re.split(
-        r"\s*(?:;|\n+|[.!?]\s+(?=(?:when|make|show|render|display|use|update|save|delete|drop|take|/))|"
-        r"\band\s+(?=(?:make|show|render|display|use|update|save|delete|drop|take|/)))\s*",
+    """Split broad maintenance tasks into bounded explicit requirements."""
+    normalized = re.sub(
+        r"(?m)^\s*(?:[-*•]|\d+[.)])\s+",
+        "",
         task,
+    )
+    action_words = (
+        r"add|allow|create|delete|display|edit|load|make|persist|remove|render|"
+        r"replace|save|show|support|update|use|when|lägg|skapa|ta|visa|ändra|"
+        r"spara|ladda|stöd"
+    )
+    clauses = re.split(
+        rf"\s*(?:;|\n+|[.!?]+\s+|,\s+(?=(?:{action_words})\b)|"
+        rf"\b(?:and|och)\s+(?=(?:{action_words})\b))\s*",
+        normalized,
         flags=re.IGNORECASE,
     )
-    return list(dict.fromkeys(clause.strip() for clause in clauses if clause.strip()))[:MAX_TASK_SURFACES]
+    return list(
+        dict.fromkeys(clause.strip() for clause in clauses if clause.strip())
+    )[:MAX_TASK_SURFACES]
 
 
 def _python_definition_literal_terms(path: Path) -> dict[str, dict[str, int]]:
@@ -96,8 +249,9 @@ def _python_definition_literal_terms(path: Path) -> dict[str, dict[str, int]]:
 
 
 def resolve_task_surface_roots(repo: Path, task: str) -> RetrievalResult:
-    """Find a few real indexed roots for every explicit task surface."""
+    """Find concrete indexed roots for each explicit requirement in the task."""
     surfaces = _task_surfaces(task)
+    complex_task = _task_is_complex(task, surfaces)
     # A single surface remains too broad for name-only promotion. Concrete
     # runtime text owned by a relevant definition is narrow enough to use.
     runtime_evidence_only = len(surfaces) < 2
@@ -109,10 +263,12 @@ def resolve_task_surface_roots(repo: Path, task: str) -> RetrievalResult:
     literal_terms_by_file: dict[str, dict[str, dict[str, int]]] = {}
     presentation_terms = {"display", "displayed", "show", "render", "rendering", "view", "embed", "ui"}
     for surface in surfaces:
-        tokens = {
-            token.casefold()
-            for token in re.findall(r"[A-Za-z0-9]+", surface.replace("_", " "))
-            if len(token) >= 3
+        tokens = _surface_tokens(surface)
+        roles = _surface_roles(tokens) if complex_task else set()
+        role_symbol_terms = {
+            term
+            for role in roles
+            for term in REQUIREMENT_ROLE_SYMBOL_TERMS.get(role, ())
         }
         candidates: list[tuple[int, str, str]] = []
         for relative, entry in index.items():
@@ -128,7 +284,17 @@ def resolve_task_surface_roots(repo: Path, task: str) -> RetrievalResult:
                 for value in entry.get("important_symbols", [])
                 if isinstance(value, str)
             }
-            file_tokens = set(re.findall(r"[a-z0-9]+", relative.casefold().replace("_", " ")))
+            file_tokens = _surface_tokens(relative)
+            semantic_tokens = _surface_tokens(
+                " ".join([
+                    str(entry.get("summary", "")),
+                    *[
+                        str(tag)
+                        for tag in entry.get("tags", [])
+                        if isinstance(tag, str)
+                    ],
+                ])
+            )
             literal_terms_by_file.setdefault(
                 relative, _python_definition_literal_terms(repo / relative)
                 if relative.casefold().endswith(".py") else {},
@@ -138,16 +304,19 @@ def resolve_task_surface_roots(repo: Path, task: str) -> RetrievalResult:
                     continue
                 name = str(symbol["name"])
                 symbol_text = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", name)
-                symbol_tokens = set(re.findall(r"[a-z0-9]+", symbol_text.casefold().replace("_", " ")))
-                overlap = tokens & (symbol_tokens | file_tokens)
-                if not overlap:
+                symbol_tokens = _surface_tokens(symbol_text)
+                overlap = tokens & (symbol_tokens | file_tokens | semantic_tokens)
+                role_symbol_overlap = role_symbol_terms & symbol_tokens
+                if not overlap and not role_symbol_overlap:
                     continue
-                score = 70 * len(tokens & symbol_tokens) + 25 * len(tokens & file_tokens)
+                score = (
+                    70 * len(tokens & symbol_tokens)
+                    + 25 * len(tokens & file_tokens)
+                    + 15 * len(tokens & semantic_tokens)
+                )
                 definition_name = str(symbol.get("definition_name") or name)
                 # Runtime examples in task/feedback are direct evidence for
                 # the definition that owns their literal/template fragments.
-                # Keep this tied to an otherwise relevant symbol so common
-                # prose in an unrelated error message cannot create a root.
                 owned_literal_terms = literal_terms_by_file[relative].get(
                     definition_name, {}
                 )
@@ -157,27 +326,27 @@ def resolve_task_surface_roots(repo: Path, task: str) -> RetrievalResult:
                 score += 240 * sum(owned_literal_terms[word] for word in literal_overlap)
                 if name.casefold() in tokens:
                     score += 120
-                # Normalize the already-supported presentation vocabulary so
-                # inflected task wording ("displayed") can resolve concrete
-                # show/render/view/embed definitions for the same noun surface.
                 if tokens & presentation_terms and symbol_tokens & presentation_terms:
                     score += 180
-                # The index already records a bounded set of central symbols.
-                # Use that existing definition metadata only to break close
-                # matches; it does not add files or candidates to the search.
+                if complex_task:
+                    score += 45 * len(role_symbol_overlap)
+                    file_role_terms = {
+                        term
+                        for role in roles
+                        for term in REQUIREMENT_ROLE_TERMS.get(role, ())
+                    }
+                    score += 12 * len(file_role_terms & (file_tokens | semantic_tokens))
                 if name.casefold() in important:
                     score += 80
-                # A surface must have meaningful evidence, not a lone generic
-                # filename coincidence.
                 if score >= 70:
                     candidates.append((score, relative, definition_name))
-        selected = sorted(candidates, key=lambda item: (-item[0], item[1].lower(), item[2].lower()))[:MAX_SURFACE_ROOTS]
+        selected = sorted(
+            candidates,
+            key=lambda item: (-item[0], item[1].lower(), item[2].lower()),
+        )[:MAX_SURFACE_ROOTS]
         if not selected:
             diagnostics.append(f"surface unresolved: {surface}")
             continue
-        # This means concrete definition roots were resolved. Rendering is
-        # verified later by the shared required-source materializer; references
-        # or imports alone never produce this state.
         diagnostics.append(f"surface definition roots resolved: {surface}")
         for _score, relative, symbol in selected:
             path = repo / relative
@@ -188,6 +357,21 @@ def resolve_task_surface_roots(repo: Path, task: str) -> RetrievalResult:
                 reasons[path].append(label)
             if symbol not in required[path]:
                 required[path].append(symbol)
+            if not complex_task:
+                continue
+            for support_symbol in _related_role_symbols(
+                index.get(relative, {}),
+                tokens,
+                roles,
+                symbol,
+            ):
+                if support_symbol not in required[path] and len(required[path]) < 8:
+                    required[path].append(support_symbol)
+                    support_label = (
+                        f"requirement support for {surface}: {support_symbol}"
+                    )
+                    if support_label not in reasons[path]:
+                        reasons[path].append(support_label)
     return RetrievalResult(paths, dict(reasons), paths.copy(), dict(required), diagnostics)
 
 
@@ -391,18 +575,24 @@ class QwenTaskHintAnalyzer:
                 if score:
                     candidates.append((score, relative, {"id": f"{relative}::{name}", "name": name, "kind": kind, "path": relative}))
         candidates.sort(key=lambda item: (-item[0], item[1].lower(), item[2]["name"].lower()))
-        # A compact high-quality list is more useful than a flat alphabetical
-        # dump; all entries remain real indexed definitions.
-        entries = [entry for _, _, entry in candidates[:180]]
+        # Broad tasks need more vocabulary coverage, but still use one bounded
+        # model call and only real indexed IDs.
+        surfaces = _task_surfaces(task)
+        complex_task = _task_is_complex(task, surfaces)
+        entry_limit = 240 if complex_task else 180
+        hint_limit = MAX_SEMANTIC_HINTS if complex_task else 12
+        entries = [entry for _, _, entry in candidates[:entry_limit]]
         vocabulary = list(dict.fromkeys(entry["name"] for entry in entries))
         self.last_candidate_ids = {entry["id"]: entry["name"] for entry in entries}
         self.last_vocabulary = vocabulary
         prompt = (
             "Map this maintenance task to likely existing repository symbol names by meaning, not literal word overlap. "
             "Natural-language actions may use different verbs than code; choose the semantically closest vocabulary names. "
-            "Return ONLY JSON {\"candidate_ids\":[\"id\"]}. Use only IDs from Candidates; at most 12. "
+            f"Return ONLY JSON {{\"candidate_ids\":[\"id\"]}}. Use only IDs from Candidates; at most {hint_limit}. "
+            "Cover each explicit requirement when the task spans multiple layers. "
             "Prefer behavior-changing functions, methods, handlers, and commands over passive domain types when appropriate. "
-            f"Task: {task}\nCandidates: {json.dumps(entries, ensure_ascii=False)}"
+            f"Task: {task}\nRequirements: {json.dumps(surfaces, ensure_ascii=False)}"
+            f"\nCandidates: {json.dumps(entries, ensure_ascii=False)}"
         )
         try:
             run = subprocess.run(["ollama", "run", self.model, "--format", "json"], input=prompt,
@@ -1102,7 +1292,12 @@ def expand_candidates(repo: Path, task: str, seeds: list[Path], limit: int = 12)
     ordered = sorted(scores, key=lambda value: (-scores[value], value.lower()))
     selected_names = ordered[:max(limit, len(seed_names))]
     paths = [repo / name for name in selected_names]
-    return RetrievalResult(paths, {repo / name: reasons[name] for name in selected_names}, [repo / name for name in ordered[:MAX_CANDIDATES]])
+    candidate_limit = MAX_CANDIDATES if _task_is_complex(task) else 24
+    return RetrievalResult(
+        paths,
+        {repo / name: reasons[name] for name in selected_names},
+        [repo / name for name in ordered[:candidate_limit]],
+    )
 
 
 def _is_test(relative: str) -> bool:
@@ -1122,26 +1317,50 @@ class QwenCompletenessChecker:
     def check(self, repo: Path, task: str, result: RetrievalResult) -> CompletenessResult:
         if not self.is_available():
             return CompletenessResult()
+        surfaces = _task_surfaces(task)
+        complex_task = _task_is_complex(task, surfaces)
+        symbol_limit = 14 if complex_task else 8
+        dependency_limit = 10 if complex_task else 6
+        resolved_limit = MAX_COMPLETENESS_RESOLVED if complex_task else 3
         selected = {path.relative_to(repo).as_posix() for path in result.files}
         candidate_rows = []
         index = load_map(repo).get("files", {})
         selected_rows = []
         for relative in sorted(selected):
             entry = index.get(relative, {})
-            selected_rows.append({"path": relative, "symbols": [str(item.get("qualified_name") or item.get("name")) for item in entry.get("symbols", [])[:8] if isinstance(item, dict)], "dependencies": entry.get("dependencies", [])[:6]})
+            selected_rows.append({
+                "path": relative,
+                "symbols": [
+                    str(item.get("qualified_name") or item.get("name"))
+                    for item in entry.get("symbols", [])[:symbol_limit]
+                    if isinstance(item, dict)
+                ],
+                "dependencies": entry.get("dependencies", [])[:dependency_limit],
+            })
         for path in result.candidates:
             relative = path.relative_to(repo).as_posix()
             if relative in selected:
                 continue
             entry = index.get(relative, {})
-            symbols = [str(item.get("qualified_name") or item.get("name")) for item in entry.get("symbols", [])[:8] if isinstance(item, dict)]
-            candidate_rows.append({"path": relative, "symbols": symbols, "dependencies": entry.get("dependencies", [])[:6]})
+            symbols = [
+                str(item.get("qualified_name") or item.get("name"))
+                for item in entry.get("symbols", [])[:symbol_limit]
+                if isinstance(item, dict)
+            ]
+            candidate_rows.append({
+                "path": relative,
+                "symbols": symbols,
+                "dependencies": entry.get("dependencies", [])[:dependency_limit],
+            })
         prompt = (
             "You check whether code-retrieval context is complete. Return ONLY JSON: "
             '{"missing_files":["candidate/path"],"missing_symbols":["ClassOrFunction"],'
             '"missing_concepts":["short implementation concept"]}. missing_files may ONLY be paths in Candidates. '
+            "Check every explicit requirement below, including persistence, domain, transport, UI, and tests when present. "
             "For a required file absent from Candidates, name its project symbol or a short concept; do not invent paths.\n"
-            f"Task: {task}\nSelected: {json.dumps(selected_rows, ensure_ascii=False)}\nCandidates: {json.dumps(candidate_rows, ensure_ascii=False)}"
+            f"Task: {task}\nRequirements: {json.dumps(surfaces, ensure_ascii=False)}"
+            f"\nSelected: {json.dumps(selected_rows, ensure_ascii=False)}"
+            f"\nCandidates: {json.dumps(candidate_rows, ensure_ascii=False)}"
         )
         try:
             run = subprocess.run(["ollama", "run", self.model, "--format", "json"], input=prompt,
@@ -1159,13 +1378,25 @@ class QwenCompletenessChecker:
             if path not in output.files:
                 output.files.append(path)
                 output.reasons[path] = "Qwen completeness known-path addition"
-        symbols = _bounded_strings(payload.get("missing_symbols", []) if isinstance(payload, dict) else [], 8)
-        concepts = _bounded_strings(payload.get("missing_concepts", []) if isinstance(payload, dict) else [], 4)
-        # The initial pool is intentionally broad but bounded (task rg hits plus
-        # one-hop graph evidence). These requests cover the rare case where it
-        # contains no route to a required implementation, without trusting an
-        # invented filename or asking Qwen a third question.
-        for path, reason in _resolve_missing_requests(repo, index, selected | {p.relative_to(repo).as_posix() for p in output.files}, symbols, concepts):
+        symbols = _bounded_strings(
+            payload.get("missing_symbols", []) if isinstance(payload, dict) else [],
+            12 if complex_task else 8,
+        )
+        concepts = _bounded_strings(
+            payload.get("missing_concepts", []) if isinstance(payload, dict) else [],
+            8 if complex_task else 4,
+        )
+        # This remains one bounded repair pass. Complex tasks may resolve a few
+        # more concrete files, but never trigger an open-ended model loop.
+        for path, reason in _resolve_missing_requests(
+            repo,
+            index,
+            selected | {p.relative_to(repo).as_posix() for p in output.files},
+            symbols,
+            concepts,
+        ):
+            if len(output.files) >= resolved_limit:
+                break
             if path not in output.files:
                 output.files.append(path)
                 output.reasons[path] = reason

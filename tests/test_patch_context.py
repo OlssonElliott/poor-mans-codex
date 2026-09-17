@@ -1602,6 +1602,42 @@ class PatchContextTests(unittest.TestCase):
         self.assertNotIn("```text\n\n```", repair)
         self.assertEqual(source.read_text(encoding="utf-8"), "\n".join(lines) + "\n")
 
+    def test_typescript_required_symbol_materializes_exact_arrow_function(self) -> None:
+        padding = "".join(
+            f"const unrelated_{index} = {index};\n"
+            for index in range(2200)
+        )
+        source = self.write(
+            "dashboard/editor.tsx",
+            padding
+            + "export const AddContainerDialog: React.FC = () => {\n"
+            + "  const label = '{container}';\n"
+            + "  return <div>{label}</div>;\n"
+            + "};\n"
+            + padding,
+        )
+        save_map(self.repo, {"version": 3, "files": {
+            "dashboard/editor.tsx": {
+                "dependencies": [],
+                "symbols": [{"name": "AddContainerDialog"}],
+            },
+        }})
+
+        context = build_patch_source_context(
+            self.repo,
+            "Update the AddContainerDialog container UI",
+            files=[source],
+            target_symbols={source: ["AddContainerDialog"]},
+        )
+
+        self.assertIn(
+            "SYMBOL CONTEXT: dashboard/editor.tsx::AddContainerDialog",
+            context,
+        )
+        self.assertIn("const label = '{container}';", context)
+        self.assertIn("return <div>{label}</div>;", context)
+        self.assertNotIn("const unrelated_1100 = 1100;", context)
+
 
 if __name__ == "__main__":
     unittest.main()

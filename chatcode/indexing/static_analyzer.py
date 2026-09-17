@@ -93,8 +93,12 @@ class _PythonVisitor(ast.NodeVisitor):
 
 GENERIC_SYMBOL = re.compile(
     r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?"
-    r"(?:(class|interface|function)\s+([A-Za-z_$][\w$]*)|"
-    r"(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\([^)]*\)\s*=>)",
+    r"(?:(?P<kind>class|interface|function|enum)\s+"
+    r"(?P<named>[A-Za-z_$][\w$]*)|"
+    r"type\s+(?P<type_name>[A-Za-z_$][\w$]*)\s*=|"
+    r"(?:const|let|var)\s+(?P<binding>[A-Za-z_$][\w$]*)"
+    r"(?:\s*:\s*[^=\n]+)?\s*=\s*(?:async\s*)?"
+    r"(?:<[^>\n]+>\s*)?\([^)]*\)(?:\s*:\s*[^=\n]+)?\s*=>)",
     re.MULTILINE,
 )
 GENERIC_IMPORT = re.compile(
@@ -105,8 +109,8 @@ GENERIC_IMPORT = re.compile(
 def _analyze_generic(text: str) -> dict[str, Any]:
     symbols: list[dict[str, str]] = []
     for match in GENERIC_SYMBOL.finditer(text):
-        kind = match.group(1) or "function"
-        name = match.group(2) or match.group(3)
+        kind = match.group("kind") or ("type" if match.group("type_name") else "function")
+        name = match.group("named") or match.group("type_name") or match.group("binding")
         symbols.append({"name": name, "qualified_name": name, "kind": kind})
         if len(symbols) >= MAX_SYMBOLS:
             break

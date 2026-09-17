@@ -153,6 +153,28 @@ class ProjectMapTests(unittest.TestCase):
         self.assertEqual(same_name["kind"], "command")
         self.assertEqual(same_name["definition_name"], "drop")
 
+    def test_typescript_index_keeps_typed_arrow_component(self) -> None:
+        self.write(
+            "dashboard/editor.tsx",
+            "type Props = { title: string };\n"
+            "export const AddContainerDialog: React.FC<Props> = "
+            "(props): JSX.Element => {\n"
+            "    return <div>{props.title}</div>;\n"
+            "};\n",
+        )
+
+        update_project_map(
+            self.repo,
+            run_semantic=False,
+            index_mode="static",
+            force_rebuild=True,
+        )
+        symbols = load_map(self.repo)["files"]["dashboard/editor.tsx"]["symbols"]
+        by_name = {symbol["name"]: symbol for symbol in symbols}
+
+        self.assertEqual(by_name["Props"]["kind"], "type")
+        self.assertEqual(by_name["AddContainerDialog"]["kind"], "function")
+
     def test_full_rebuild_excludes_repo_local_chatcode_workspace(self) -> None:
         self.write("app.py", "def app(): pass\n")
         self.write("workspace/other/history/old.py", "def stale(): pass\n")

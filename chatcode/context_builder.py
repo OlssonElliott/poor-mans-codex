@@ -40,6 +40,7 @@ from .retrieval.hybrid_retriever import (
     resolve_semantic_hints,
     test_callsite_closure,
 )
+from .retrieval.source_coverage import plan_source_coverage
 from .workspace import (
     atomic_write_text,
     get_repo_workspace,
@@ -1572,10 +1573,159 @@ def _render_patch_file_context(
     return header + "".join(excerpt_lines) + "\n" if excerpt_lines else ""
 
 
+GENERIC_SYMBOL_SUFFIXES = {".js", ".jsx", ".ts", ".tsx"}
+
+
+def _balanced_source_end(
+    content: str,
+    start: int,
+    opener: str,
+    closer: str,
+) -> int | None:
+    """Return the index just after a balanced JS/TS delimiter."""
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    line_comment = False
+    block_comment = False
+    index = start
+    while index < len(content):
+        char = content[index]
+        next_char = content[index + 1] if index + 1 < len(content) else ""
+
+        if line_comment:
+            if char == "\n":
+                line_comment = False
+            index += 1
+            continue
+        if block_comment:
+            if char == "*" and next_char == "/":
+                block_comment = False
+                index += 2
+                continue
+            index += 1
+            continue
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            index += 1
+            continue
+
+        if char == "/" and next_char == "/":
+            line_comment = True
+            index += 2
+            continue
+        if char == "/" and next_char == "*":
+            block_comment = True
+            index += 2
+            continue
+        if char in {'"', "'", "`"}:
+            quote = char
+            index += 1
+            continue
+        if char == opener:
+            depth += 1
+        elif char == closer:
+            depth -= 1
+            if depth == 0:
+                return index + 1
+        index += 1
+    return None
+
+
+def _generic_symbol_span(
+    content: str,
+    symbol: str,
+) -> tuple[int, int] | None:
+    """Locate one named JS/TS declaration without requiring a parser runtime."""
+    escaped_symbol = re.escape(symbol)
+    declaration = re.compile(
+        rf"(?m)^[ \t]*(?:export\s+)?(?:default\s+)?"
+        rf"(?:(?P<kind>async\s+function|function|class|interface|enum)\s+{escaped_symbol}\b"
+        rf"|type\s+{escaped_symbol}\s*="
+        rf"|(?P<binding>const|let|var)\s+{escaped_symbol}(?:\s*:\s*[^=\n]+)?\s*=)"
+    )
+    match = declaration.search(content)
+    if match is None:
+        return None
+
+    search_from = match.end()
+    end_index: int | None = None
+    if match.group("binding"):
+        arrow = content.find("=>", search_from)
+        semicolon = content.find(";", search_from)
+        if arrow >= 0 and (semicolon < 0 or arrow < semicolon):
+            cursor = arrow + 2
+            while cursor < len(content) and content[cursor].isspace():
+                cursor += 1
+            if cursor < len(content) and content[cursor] in "{(":
+                opener = content[cursor]
+                closer = "}" if opener == "{" else ")"
+                end_index = _balanced_source_end(content, cursor, opener, closer)
+        if end_index is None:
+            brace = content.find("{", search_from)
+            if brace >= 0 and (semicolon < 0 or brace < semicolon):
+                end_index = _balanced_source_end(content, brace, "{", "}")
+    elif match.group("kind"):
+        brace = content.find("{", search_from)
+        if brace >= 0:
+            end_index = _balanced_source_end(content, brace, "{", "}")
+    else:
+        equals = content.find("=", match.start(), search_from + 1)
+        cursor = equals + 1 if equals >= 0 else search_from
+        while cursor < len(content) and content[cursor].isspace():
+            cursor += 1
+        if cursor < len(content) and content[cursor] in "{(":
+            opener = content[cursor]
+            closer = "}" if opener == "{" else ")"
+            end_index = _balanced_source_end(content, cursor, opener, closer)
+
+    if end_index is None:
+        semicolon = content.find(";", search_from)
+        newline = content.find("\n", search_from)
+        candidates = [
+            value
+            for value in (
+                semicolon + 1 if semicolon >= 0 else -1,
+                newline,
+            )
+            if value >= 0
+        ]
+        end_index = min(candidates) if candidates else len(content)
+
+    cursor = end_index
+    while cursor < len(content) and content[cursor] in " \t":
+        cursor += 1
+    if cursor < len(content) and content[cursor] == ";":
+        end_index = cursor + 1
+
+    start_line = content.count("\n", 0, match.start()) + 1
+    end_line = content.count("\n", 0, max(match.start(), end_index - 1)) + 1
+    return start_line, end_line
+
+
 def _fresh_symbol_ranges(content: str, path: Path, symbols: list[str]) -> list[tuple[int, int]]:
-    """Locate requested Python definitions in fresh source, never cached text."""
-    if path.suffix.lower() != ".py" or not symbols:
+    """Locate requested definitions in fresh Python or JS/TS source."""
+    if not symbols:
         return []
+    suffix = path.suffix.lower()
+    if suffix in GENERIC_SYMBOL_SUFFIXES:
+        spans = {
+            symbol: _generic_symbol_span(content, symbol)
+            for symbol in symbols
+        }
+        return [
+            span
+            for symbol in symbols
+            if (span := spans.get(symbol)) is not None
+        ]
+    if suffix != ".py":
+        return []
+
     wanted = set(symbols)
     try:
         tree = ast.parse(content)
@@ -1615,10 +1765,25 @@ def _fresh_symbol_node(
     """Return one complete current definition, calls, and exact source range."""
     try:
         content = path.read_text(encoding="utf-8", errors="replace")
-        tree = ast.parse(content)
-    except (OSError, SyntaxError):
+    except OSError:
         return None
     lines = content.splitlines(keepends=True)
+    if path.suffix.lower() in GENERIC_SYMBOL_SUFFIXES:
+        span = _generic_symbol_span(content, symbol)
+        if span is None:
+            return None
+        start, end = span
+        return (
+            "".join(lines[start - 1:end]),
+            [],
+            start,
+            end,
+        )
+
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return None
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
@@ -1774,17 +1939,42 @@ def _render_required_symbols(
 
     grouped_items = list(grouped.items())
     required_path_set = set(required_paths)
+    coverage_demands: dict[Path, int] = {}
+    for path, symbols in grouped_items:
+        coverage_count = sum(
+            priority == "source coverage"
+            for _symbol, priority in symbols
+        )
+        if coverage_count:
+            # Demand is intentionally structural rather than byte-perfect. It
+            # gives files with several required regions a larger share without
+            # reparsing large source files just to estimate their size.
+            coverage_demands[path] = 1_600 + coverage_count * 2_800
+
     for position, (path, symbols) in enumerate(grouped_items):
         relative = path.relative_to(repo).as_posix()
-        remaining_paths = (
-            sum(
-                candidate in required_path_set
+        coverage_path = path in coverage_demands
+        if coverage_path:
+            remaining_demand = sum(
+                coverage_demands.get(candidate, 0)
                 for candidate, _symbols in grouped_items[position:]
             )
-            if path in required_path_set
-            else len(grouped_items) - position
-        )
-        allowance = max(1, (budget - used) // remaining_paths)
+            allowance = max(
+                1,
+                max(0, budget - used)
+                * coverage_demands[path]
+                // max(1, remaining_demand),
+            )
+        else:
+            remaining_paths = (
+                sum(
+                    candidate in required_path_set
+                    for candidate, _symbols in grouped_items[position:]
+                )
+                if path in required_path_set
+                else len(grouped_items) - position
+            )
+            allowance = max(1, (budget - used) // remaining_paths)
         if path in changed_files and path.suffix.casefold() == ".py":
             dirty_symbols = set(
                 _changed_python_definition_roots(repo, [path]).get(path, [])
@@ -1818,7 +2008,11 @@ def _render_required_symbols(
             if node is not None
         )
         needs_fallback = path_fallback_required or bool(fallback_symbols) or exact_size > allowance
-        exact_allowance = allowance // 2 if needs_fallback else allowance
+        if coverage_path and needs_fallback:
+            fallback_reserve = min(2_200, max(600, allowance // 10))
+            exact_allowance = max(1, allowance - fallback_reserve)
+        else:
+            exact_allowance = allowance // 2 if needs_fallback else allowance
         local_used = 0
 
         for symbol, priority, node in resolved:
@@ -1840,6 +2034,7 @@ def _render_required_symbols(
         fallback_allowance = allowance - local_used
         if (path_fallback_required or fallback_symbols) and fallback_allowance > 0:
             try:
+                unique_fallback_symbols = list(dict.fromkeys(fallback_symbols))
                 fallback_section = _render_patch_file_context(
                     repo,
                     path,
@@ -1847,7 +2042,8 @@ def _render_required_symbols(
                     changed_files,
                     explicit_files,
                     max_chars=fallback_allowance,
-                    focus_symbols=list(dict.fromkeys(fallback_symbols)),
+                    required_symbols=unique_fallback_symbols or None,
+                    focus_symbols=unique_fallback_symbols,
                 )
             except OSError:
                 fallback_section = ""
@@ -1947,8 +2143,48 @@ def build_patch_source_context(
 
     changed_files = get_changed_files(repo)
     explicit_files = set(_resolve_task_file_references(repo, task))
-    target_metadata = target_symbols or resolve_explicit_targets(repo, task).required_symbols
-    materialization_targets = _materialization_targets(repo, target_metadata)
+    base_target_metadata = (
+        target_symbols or resolve_explicit_targets(repo, task).required_symbols
+    )
+    target_metadata = {
+        path: list(dict.fromkeys(symbols))
+        for path, symbols in base_target_metadata.items()
+    }
+    coverage_plan = plan_source_coverage(
+        repo,
+        task,
+        files,
+        target_metadata,
+    )
+    coverage_keys: set[tuple[Path, str]] = set()
+    for path, symbols in coverage_plan.symbols.items():
+        target_metadata.setdefault(path, [])
+        for symbol in symbols:
+            coverage_keys.add((path, symbol))
+            if symbol not in target_metadata[path]:
+                target_metadata[path].append(symbol)
+
+    base_materialization_targets = _materialization_targets(
+        repo,
+        base_target_metadata,
+    )
+    base_keys = {
+        (path, symbol)
+        for path, symbol, _priority in base_materialization_targets
+    }
+    coverage_targets: list[tuple[Path, str, str]] = []
+    other_targets: list[tuple[Path, str, str]] = []
+    for path, symbol, priority in base_materialization_targets:
+        if (path, symbol) in coverage_keys:
+            coverage_targets.append((path, symbol, "source coverage"))
+        else:
+            other_targets.append((path, symbol, priority))
+    for path, symbols in coverage_plan.symbols.items():
+        for symbol in symbols:
+            if (path, symbol) not in base_keys:
+                coverage_targets.append((path, symbol, "source coverage"))
+    materialization_targets = [*coverage_targets, *other_targets]
+
     dependencies = _dependency_paths(repo, files)
     primary = list(dict.fromkeys([
         *[path for path in files if path in explicit_files],
@@ -1958,24 +2194,112 @@ def build_patch_source_context(
     supporting = [path for path in sorted(dependencies) if path not in primary]
 
     budget = _context_budget_chars()
-    required_context, materialization_states = _render_required_symbols(
+    required_paths = list(dict.fromkeys([
+        *[
+            path for path in primary
+            if path in changed_files
+            and "tests" not in {part.casefold() for part in path.relative_to(repo).parts}
+            and "test" not in path.stem.casefold()
+            and "spec" not in path.stem.casefold()
+        ],
+        *(critical_paths if critical_paths is not None else base_target_metadata),
+    ]))
+
+    coverage_context = ""
+    coverage_states: dict[tuple[Path, str], tuple[str, str]] = {}
+    if coverage_targets:
+        coverage_context, coverage_states = _render_required_symbols(
+            repo,
+            task,
+            coverage_targets,
+            coverage_plan.paths,
+            budget,
+            changed_files,
+            explicit_files,
+        )
+
+        # Validate coverage against the exact fresh definition text. A fallback
+        # excerpt that does not contain the complete node is not enough for a
+        # patch target. Spend one bounded local repair pass on those gaps before
+        # lower-priority selected files receive any context budget.
+        missing_coverage: list[tuple[Path, str, str]] = []
+        for path, symbol, priority in coverage_targets:
+            node = _fresh_symbol_node(path, symbol)
+            if node is None or node[0] not in coverage_context:
+                missing_coverage.append((path, symbol, priority))
+
+        coverage_rendered_chars = sum(
+            len(section)
+            for section in coverage_context.splitlines(keepends=True)
+            if "REQUIRED SOURCE UNAVAILABLE:" not in section
+        )
+        repair_budget = max(0, budget - coverage_rendered_chars)
+        if missing_coverage and repair_budget > 0:
+            repair_context, repair_states = _render_required_symbols(
+                repo,
+                task,
+                missing_coverage,
+                list(dict.fromkeys(path for path, _symbol, _priority in missing_coverage)),
+                repair_budget,
+                changed_files,
+                explicit_files,
+            )
+            if repair_context:
+                repaired_keys: set[tuple[Path, str]] = set()
+                for path, symbol, _priority in missing_coverage:
+                    node = _fresh_symbol_node(path, symbol)
+                    if node is not None and node[0] in repair_context:
+                        repaired_keys.add((path, symbol))
+                if repaired_keys:
+                    marker_prefixes = {
+                        f"===== REQUIRED SOURCE UNAVAILABLE: "
+                        f"{path.relative_to(repo).as_posix()}::{symbol} "
+                        for path, symbol in repaired_keys
+                    }
+                    coverage_context = "".join(
+                        line
+                        for line in coverage_context.splitlines(keepends=True)
+                        if not any(line.startswith(prefix) for prefix in marker_prefixes)
+                    )
+                coverage_context = "\n".join(
+                    part for part in (coverage_context, repair_context) if part
+                )
+                coverage_states.update(repair_states)
+
+        for path, symbol, _priority in coverage_targets:
+            node = _fresh_symbol_node(path, symbol)
+            if node is None or node[0] not in coverage_context:
+                coverage_states[(path, symbol)] = (
+                    "unavailable",
+                    "source coverage validation",
+                )
+
+    coverage_rendered_chars = sum(
+        len(section)
+        for section in coverage_context.splitlines(keepends=True)
+        if "REQUIRED SOURCE UNAVAILABLE:" not in section
+    )
+    remaining_required_budget = max(0, budget - coverage_rendered_chars)
+    coverage_path_set = set(coverage_plan.paths)
+    other_required_paths = [
+        path
+        for path in required_paths
+        if path not in coverage_path_set or path in changed_files
+    ]
+    other_context, other_states = _render_required_symbols(
         repo,
         task,
-        materialization_targets,
-        list(dict.fromkeys([
-            *[
-                path for path in primary
-                if path in changed_files
-                and "tests" not in {part.casefold() for part in path.relative_to(repo).parts}
-                and "test" not in path.stem.casefold()
-                and "spec" not in path.stem.casefold()
-            ],
-            *(critical_paths if critical_paths is not None else target_metadata),
-        ])),
-        budget,
+        other_targets,
+        other_required_paths,
+        remaining_required_budget,
         changed_files,
         explicit_files,
     )
+    required_context = "\n".join(
+        part for part in (coverage_context, other_context) if part
+    )
+    materialization_states = {**coverage_states, **other_states}
+
     required_rendered_chars = sum(
         len(section) for section in required_context.splitlines(keepends=True)
         if "REQUIRED SOURCE UNAVAILABLE:" not in section
@@ -2015,10 +2339,16 @@ def build_patch_source_context(
         if path in target_metadata:
             continue
         try:
-            section = _render_patch_file_context(repo, path, task, changed_files, explicit_files)
+            section = _render_patch_file_context(
+                repo,
+                path,
+                task,
+                changed_files,
+                explicit_files,
+            )
         except OSError:
             continue
-        if used + len(section) > budget:
+        if not section or used + len(section) > remaining_budget:
             continue
         sections.append(section)
         used += len(section)
@@ -2027,6 +2357,17 @@ def build_patch_source_context(
     rendered = _enforce_materialization_invariant(
         repo, rendered, materialization_targets, materialization_states
     )
+    if get_boolean_setting("CHATCODE_RETRIEVAL_DEBUG") and coverage_plan.symbols:
+        print("Source coverage planner:", file=os.sys.stderr)
+        for diagnostic in coverage_plan.diagnostics:
+            print(f"- {diagnostic}", file=os.sys.stderr)
+        for path in coverage_plan.paths:
+            symbols = coverage_plan.symbols.get(path, [])
+            if symbols:
+                print(
+                    f"- {path.relative_to(repo)}: {', '.join(symbols)}",
+                    file=os.sys.stderr,
+                )
     if get_boolean_setting("CHATCODE_RETRIEVAL_DEBUG") and materialization_states:
         print("Final materialization:", file=os.sys.stderr)
         priorities = {(path, symbol): priority for path, symbol, priority in materialization_targets}

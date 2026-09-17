@@ -212,6 +212,73 @@ class HybridRetrieverTests(unittest.TestCase):
         result = expand_candidates(self.repo, "fix payments", [command], limit=2)
         self.assertEqual(result.files, [command, generic])
 
+    def test_complex_task_keeps_later_requirements_and_support_symbols(self) -> None:
+        model = self.write("world/models.py", "def create_container_template(): pass\n")
+        database = self.write(
+            "storage/database.py",
+            "def initialize(): pass\n"
+            "def create_container_instance(): pass\n"
+            "def load_container_contents(): pass\n",
+        )
+        api = self.write("api/container_api.py", "def update_container(): pass\n")
+        ui = self.write(
+            "dashboard/container-editor.tsx",
+            "export function ContainerEditor() { return null }\n",
+        )
+        locks = self.write("world/locks.py", "def lockpick_container(): pass\n")
+        service = self.write("world/service.py", "def place_container(): pass\n")
+        self.map({
+            "world/models.py": {
+                "dependencies": [],
+                "symbols": [{"name": "create_container_template"}],
+            },
+            "storage/database.py": {
+                "dependencies": [],
+                "symbols": [
+                    {"name": "initialize"},
+                    {"name": "create_container_instance"},
+                    {"name": "load_container_contents"},
+                ],
+            },
+            "api/container_api.py": {
+                "dependencies": [],
+                "symbols": [{"name": "update_container"}],
+            },
+            "dashboard/container-editor.tsx": {
+                "dependencies": [],
+                "symbols": [{"name": "ContainerEditor"}],
+            },
+            "world/locks.py": {
+                "dependencies": [],
+                "symbols": [{"name": "lockpick_container"}],
+            },
+            "world/service.py": {
+                "dependencies": [],
+                "symbols": [{"name": "place_container"}],
+            },
+        })
+        task = (
+            "Create reusable container templates. "
+            "Save container instances in the database. "
+            "Expose container editing through the API. "
+            "Render a container editor in the dashboard. "
+            "Support lockpicking for containers. "
+            "Update world service placement."
+        )
+
+        result = resolve_task_surface_roots(self.repo, task)
+
+        for expected in (model, database, api, ui, locks, service):
+            self.assertIn(expected, result.files)
+        self.assertIn("initialize", result.required_symbols[database])
+        self.assertIn("create_container_instance", result.required_symbols[database])
+        self.assertTrue(
+            any(
+                "Support lockpicking for containers" in diagnostic
+                for diagnostic in result.diagnostics
+            )
+        )
+
     def test_completeness_accepts_only_known_unique_candidates(self) -> None:
         command = self.write("commands/run.py")
         repository = self.write("repositories/items.py")
