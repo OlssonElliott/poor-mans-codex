@@ -828,6 +828,133 @@ class PatchContextTests(unittest.TestCase):
         self.assertIn("## Unstaged changes", context)
         self.assertIn("+        dirty_marker = 'CURRENT dirty take source'", context)
 
+    def test_required_tsx_without_python_ast_uses_dirty_full_file_fallback(self) -> None:
+        editor = self.write(
+            "dashboard/app/editor.tsx",
+            "export function DungeonEditor() {\n"
+            "  const [stackable, setStackable] = useState(false);\n"
+            "  return <ItemForm stackable={stackable} />;\n"
+            "}\n",
+        )
+        self.commit_all()
+        editor.write_text(
+            editor.read_text(encoding="utf-8").replace(
+                "useState(false)", "useState(true) // DIRTY current TSX"
+            ),
+            encoding="utf-8",
+            newline="\n",
+        )
+        required = {editor: ["DungeonEditor"]}
+        with patch(
+            "chatcode.context_builder.collect_relevant_files",
+            return_value=([editor], required),
+        ):
+            context = build_context(
+                self.repo, "allow the dungeon editor item form to update stackable"
+            ).read_text(encoding="utf-8")
+
+        self.assertIn("===== FULL FILE: dashboard/app/editor.tsx =====", context)
+        self.assertIn("DIRTY current TSX", context)
+        self.assertIn("Source line range: 1-4", context)
+        self.assertNotIn("REQUIRED SOURCE UNAVAILABLE: dashboard/app/editor.tsx", context)
+        self.assertNotIn(
+            "dashboard/app/editor.tsx [source unavailable; do not patch]", context
+        )
+
+    def test_required_python_missing_symbol_uses_readable_source_fallback(self) -> None:
+        service = self.write(
+            "service.py",
+            "def update_item(payload):\n"
+            "    return {'stackable': payload['stackable']}\n",
+        )
+        required = {service: ["stale_missing_symbol"]}
+        with patch(
+            "chatcode.context_builder.collect_relevant_files",
+            return_value=([service], required),
+        ):
+            context = build_context(
+                self.repo, "update item stackable payload"
+            ).read_text(encoding="utf-8")
+
+        self.assertIn("===== FULL FILE: service.py =====", context)
+        self.assertIn("def update_item(payload):", context)
+        self.assertNotIn("REQUIRED SOURCE UNAVAILABLE: service.py", context)
+
+    def test_required_cross_language_sources_survive_constrained_budget(self) -> None:
+        padding = "".join(f"// unrelated support line {index}\n" for index in range(900))
+        imports = "".join(
+            f"import {{ Widget{index} }} from './widget-{index}';\n"
+            for index in range(60)
+        )
+        editor = self.write(
+            "dashboard/app/editor.tsx",
+            imports
+            + padding
+            + "export function DungeonEditor() {\n"
+            "  const [stackable, setStackable] = useState(false);\n"
+            "  return <ItemForm stackable={stackable} />;\n"
+            "}\n"
+            + padding,
+        )
+        backend = self.write(
+            "rpg_bot/dashboard_api.py",
+            "def update_item(payload):\n"
+            "    return {'stackable': bool(payload['stackable'])}\n",
+        )
+        persistence = self.write(
+            "src/InventoryStore.java",
+            padding
+            + "class InventoryStore {\n"
+            "  void normalizeStackableRows(boolean stackable) {\n"
+            "    updateRows(stackable);\n"
+            "  }\n"
+            "}\n"
+            + padding,
+        )
+        support = self.write("docs/support.md", "irrelevant support " * 10_000)
+        required = {
+            editor: ["DungeonEditor"],
+            backend: ["update_item"],
+            persistence: ["normalizeStackableRows"],
+        }
+        with patch(
+            "chatcode.context_builder.collect_relevant_files",
+            return_value=([editor, backend, persistence, support], required),
+        ), patch.dict(
+            "os.environ", {"CHATCODE_CONTEXT_BUDGET_CHARS": "9000"}, clear=False
+        ):
+            context = build_context(
+                self.repo,
+                "edit item stackable and normalize stackable inventory rows",
+            ).read_text(encoding="utf-8")
+
+        for relative, marker in (
+            ("dashboard/app/editor.tsx", "function DungeonEditor"),
+            ("rpg_bot/dashboard_api.py", "def update_item"),
+            ("src/InventoryStore.java", "normalizeStackableRows"),
+        ):
+            self.assertIn(marker, context)
+            self.assertNotIn(f"REQUIRED SOURCE UNAVAILABLE: {relative}", context)
+            self.assertNotIn(
+                f"{relative} [source unavailable; do not patch]", context
+            )
+        self.assertNotIn("irrelevant support", context)
+
+        for relative in ("dashboard/app/editor.tsx", "src/InventoryStore.java"):
+            match = re.search(
+                rf"(?:===== SYMBOL CONTEXT: {re.escape(relative)} =====.*?"
+                rf"----- EXCERPT {re.escape(relative)} source lines|"
+                rf"===== EXCERPT: {re.escape(relative)} =====.*?"
+                rf"----- source lines) (\d+)-(\d+) -----\n",
+                context,
+                re.DOTALL,
+            )
+            self.assertIsNotNone(match, f"missing exact fallback range for {relative}")
+            start, end = map(int, match.groups())
+            source = (self.repo / relative).read_text(encoding="utf-8")
+            exact = "".join(source.splitlines(keepends=True)[start - 1:end])
+            self.assertTrue(context.startswith(exact, match.end()))
+
     def test_clean_working_tree_uses_exact_current_file_and_hash(self) -> None:
         source = self.write("src/widget.py", "def widget():\n    return 1\n")
         self.commit_all()
@@ -843,6 +970,71 @@ class PatchContextTests(unittest.TestCase):
         self.assertIn(self.repo.resolve().as_posix(), context)
         self.assertNotIn("[File truncated by ChatCode]", context)
         self.assertNotIn("## Unstaged changes", context)
+
+    def test_put_failure_materializes_connected_transport_handler_owner(self) -> None:
+        frontend = self.write(
+            "dashboard/app/item-editor.tsx",
+            "export function ItemEditor() {\n"
+            "  return fetch('/api/items/1', { method: 'PUT' });\n"
+            "}\n",
+        )
+        api = self.write(
+            "app/item_api.py",
+            "class ItemAPI:\n"
+            "    def update_item_template(self):\n"
+            "        return True\n",
+        )
+        server = self.write(
+            "infra/request_transport.py",
+            "class LocalRequestHandler:\n"
+            "    def do_GET(self): self._handle()\n"
+            "    def do_POST(self): self._handle()\n"
+            "    def do_PATCH(self): self._handle()\n"
+            "    def do_DELETE(self): self._handle()\n"
+            "    def do_OPTIONS(self):\n"
+            "        self.send_header('Access-Control-Allow-Methods', "
+            "'GET, POST, PATCH, DELETE, OPTIONS')\n",
+        )
+        save_map(self.repo, {"version": 3, "files": {
+            "dashboard/app/item-editor.tsx": {"dependencies": [], "symbols": [
+                {"name": "ItemEditor"},
+            ]},
+            "app/item_api.py": {"dependencies": [], "symbols": [
+                {"name": "ItemAPI"}, {"name": "update_item_template"},
+            ]},
+            "infra/request_transport.py": {"dependencies": ["app/item_api.py"], "symbols": [
+                {"name": "LocalRequestHandler"}, {"name": "do_GET"},
+                {"name": "do_POST"}, {"name": "do_PATCH"},
+                {"name": "do_DELETE"}, {"name": "do_OPTIONS"},
+            ]},
+        }})
+        update = Mock(effective_mode="static")
+        with patch(
+            "chatcode.context_builder.update_project_map", return_value=update
+        ), patch(
+            "chatcode.context_builder.retrieve_files", return_value=[frontend, api]
+        ):
+            artifact = build_patch_context(
+                self.repo, "editing an item gives Failed to fetch"
+            )
+        context = artifact.read_text(encoding="utf-8")
+
+        self.assertEqual(artifact.name, "UPLOAD_TO_CHATGPT.md")
+        self.assertIn("dashboard/app/item-editor.tsx", context)
+        self.assertIn("def update_item_template", context)
+        self.assertRegex(
+            context,
+            r"===== (?:FULL FILE|SYMBOL CONTEXT): infra/request_transport\.py",
+        )
+        self.assertIn("class LocalRequestHandler", context)
+        self.assertIn("def do_OPTIONS", context)
+        self.assertIn("Access-Control-Allow-Methods", context)
+        self.assertNotIn(
+            "REQUIRED SOURCE UNAVAILABLE: infra/request_transport.py", context
+        )
+        self.assertNotIn(
+            "infra/request_transport.py [source unavailable; do not patch]", context
+        )
 
     def test_staged_file_uses_working_tree_contents(self) -> None:
         source = self.write("src/staged.py", "value = 'A'\n")

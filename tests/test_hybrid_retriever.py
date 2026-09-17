@@ -15,6 +15,7 @@ from chatcode.retrieval.hybrid_retriever import (
     test_callsite_closure,
     resolve_explicit_targets,
     resolve_task_surface_roots,
+    resolve_transport_roots,
     resolve_semantic_hints,
 )
 
@@ -53,6 +54,43 @@ class HybridRetrieverTests(unittest.TestCase):
         result = expand_candidates(self.repo, "fix inventory command", [command])
         self.assertIn(service, result.files)
         self.assertIn(test, result.files)
+
+    def test_missing_http_method_resolves_indexed_sibling_handler_owner(self) -> None:
+        frontend = self.write(
+            "web/editor.tsx", "fetch('/api/items/1', { method: 'PUT' })\n"
+        )
+        api = self.write("app/item_api.py", "def update_item_template(): pass\n")
+        server = self.write(
+            "infra/local_transport.py",
+            "class LocalRequestHandler:\n"
+            "    def do_GET(self): pass\n"
+            "    def do_POST(self): pass\n"
+            "    def do_PATCH(self): pass\n"
+            "    def do_DELETE(self): pass\n"
+            "    def do_OPTIONS(self): pass\n",
+        )
+        unrelated = self.write(
+            "other/server.py",
+            "class OtherHandler:\n"
+            "    def do_GET(self): pass\n"
+            "    def do_POST(self): pass\n"
+            "    def do_PATCH(self): pass\n",
+        )
+        self.map({
+            "web/editor.tsx": {"dependencies": [], "symbols": []},
+            "app/item_api.py": {"dependencies": [], "symbols": [{"name": "update_item_template"}]},
+            "infra/local_transport.py": {"dependencies": ["app/item_api.py"], "symbols": [
+                {"name": "LocalRequestHandler"}, {"name": "do_GET"}, {"name": "do_POST"},
+                {"name": "do_PATCH"}, {"name": "do_DELETE"}, {"name": "do_OPTIONS"},
+            ]},
+            "other/server.py": {"dependencies": [], "symbols": [{"name": "OtherHandler"}]},
+        })
+
+        result = resolve_transport_roots(self.repo, [frontend, api])
+
+        self.assertEqual(result.files, [server])
+        self.assertEqual(result.required_symbols[server], ["LocalRequestHandler"])
+        self.assertNotIn(unrelated, result.files)
 
     def test_disconnected_explicit_task_surfaces_receive_separate_roots(self) -> None:
         command = self.write("commands/world.py")

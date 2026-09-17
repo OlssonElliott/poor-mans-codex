@@ -34,6 +34,7 @@ from .retrieval.hybrid_retriever import (
     RetrievalResult,
     expand_candidates,
     implementation_closure,
+    resolve_transport_roots,
     resolve_explicit_targets,
     resolve_task_surface_roots,
     resolve_semantic_hints,
@@ -967,6 +968,16 @@ def collect_relevant_files(
     seed_files = list(dict.fromkeys([
         *explicit_targets, *surface_result.files, *semantic_targets, *graph_files,
     ]))
+    transport_seed_files = list(dict.fromkeys([
+        *seed_files,
+        *(
+            path for path in changed_files
+            if path.is_file() and is_source_file(path)
+            and not _is_context_internal_artifact(path, repo)
+        ),
+    ]))
+    transport_result = resolve_transport_roots(repo, transport_seed_files)
+    seed_files = list(dict.fromkeys([*seed_files, *transport_result.files]))
     hybrid = expand_candidates(repo, task, seed_files, limit=MAX_FILES)
     for path, reasons in explicit_target_reasons.items():
         hybrid.reasons[path] = list(dict.fromkeys([
@@ -981,6 +992,10 @@ def collect_relevant_files(
         hybrid.reasons[path] = list(dict.fromkeys([
             *reasons,
             *hybrid.reasons.get(path, []),
+        ]))
+    for path, reasons in transport_result.reasons.items():
+        hybrid.reasons[path] = list(dict.fromkeys([
+            *reasons, *hybrid.reasons.get(path, []),
         ]))
     closure_focus = {
         symbol
@@ -1044,6 +1059,9 @@ def collect_relevant_files(
     for path in semantic_targets:
         if path not in selected and path not in ambiguous_files:
             selected.append(path)
+    for path in transport_result.files:
+        if path not in selected and path not in ambiguous_files:
+            selected.append(path)
     for path in closure.files:
         if path not in selected and path not in ambiguous_files:
             selected.append(path)
@@ -1061,6 +1079,7 @@ def collect_relevant_files(
             surface_result,
             locals().get("explicit_target_result"),
             locals().get("semantic_target_result"),
+            transport_result,
             closure,
             callsite_closure,
         ) if value is not None
@@ -1232,29 +1251,85 @@ def _context_budget_chars() -> int:
     )
 
 
+def _dirty_current_line_ranges(repo: Path, path: Path) -> list[tuple[int, int]]:
+    """Return new-side dirty hunk coordinates without treating diff as source."""
+    try:
+        relative = path.relative_to(repo).as_posix()
+        diff = run_git(
+            "diff", "HEAD", "--unified=0", "--no-renames", "--", relative,
+            cwd=repo,
+        )
+    except (GitError, ValueError):
+        return []
+    ranges: list[tuple[int, int]] = []
+    for match in re.finditer(
+        r"^@@ -\d+(?:,\d+)? \+(?P<start>\d+)(?:,(?P<count>\d+))? @@",
+        diff,
+        re.MULTILINE,
+    ):
+        start = max(1, int(match.group("start")))
+        count = int(match.group("count") or "1")
+        ranges.append((start, start if count == 0 else start + count - 1))
+    return ranges
+
+
 def _symbol_aware_ranges(
     content: str,
     task: str,
     *,
     test_file: bool = False,
+    focus_symbols: list[str] | None = None,
+    preferred_ranges: list[tuple[int, int]] | None = None,
 ) -> list[tuple[int, int]]:
     lines = content.splitlines()
     count = len(lines)
-    task_words = get_task_words(task)
+    task_words = get_task_words(task) - {
+        "able", "and", "are", "like", "not", "properly", "should", "the",
+        "themselves", "there", "they", "way", "you",
+    }
     matches: set[int] = set()
+    match_scores: dict[int, int] = {}
     definition = re.compile(
         r"^\s*(?:async\s+)?(?:def|class|function|interface|type|enum|struct|trait)\s+"
         r"([A-Za-z_][A-Za-z0-9_]*)"
     )
     symbols: set[str] = set()
 
+    term_frequency = {
+        word: sum(1 for line in lines if word in line.lower())
+        for word in task_words
+    }
     for index, line in enumerate(lines, start=1):
         lowered = line.lower()
-        if any(word in lowered for word in task_words):
+        symbol_hits = sum(
+            1
+            for symbol in (focus_symbols or [])
+            if re.search(rf"\b{re.escape(symbol)}\b", line, re.IGNORECASE)
+        )
+        word_hits = [word for word in task_words if word in lowered]
+        if symbol_hits or word_hits:
             matches.add(index)
+            match_scores[index] = symbol_hits * 100 + sum(
+                min(
+                    5000,
+                    max(
+                        1,
+                        (len(word) ** 3 * 100)
+                        // max(1, int(term_frequency[word] ** 0.5)),
+                    ),
+                )
+                * max(1, lowered.count(word))
+                for word in word_hits
+            )
+            if any(len(word) >= 6 for word in word_hits) and any(
+                start <= index <= end for start, end in (preferred_ranges or [])
+            ):
+                match_scores[index] += 10_000
             found = definition.match(line)
             if found:
                 symbols.add(found.group(1))
+                if found.group(1).casefold() in task_words:
+                    match_scores[index] += 20_000
 
     if test_file and task_words:
         for index, line in enumerate(lines, start=1):
@@ -1263,6 +1338,7 @@ def _symbol_aware_ranges(
                 word in lowered for word in task_words
             ):
                 matches.add(index)
+                match_scores.setdefault(index, 1)
 
     if symbols:
         for index, line in enumerate(lines, start=1):
@@ -1287,13 +1363,67 @@ def _symbol_aware_ranges(
             [*ranges, (1, fallback_end)] if count else ranges
         )
 
-    for line_number in sorted(matches):
+    strongest_matches = set(
+        sorted(
+            matches,
+            key=lambda line_number: (-match_scores.get(line_number, 1), line_number),
+        )[:64]
+    )
+    for line_number in sorted(strongest_matches):
         ranges.append((
             max(1, line_number - PATCH_EXCERPT_RADIUS),
             min(count, line_number + PATCH_EXCERPT_RADIUS),
         ))
 
-    return _merge_line_ranges(ranges)
+    merged = _merge_line_ranges(ranges)
+    focused_ranges: list[tuple[int, int, int]] = []
+    for start, end in merged:
+        anchors = [
+            line_number
+            for line_number in strongest_matches
+            if start <= line_number <= end
+        ]
+        if not anchors:
+            focused_ranges.append((start, end, 0))
+            continue
+        anchor = min(
+            anchors,
+            key=lambda line_number: (-match_scores.get(line_number, 1), line_number),
+        )
+        structural_start = max(start, anchor - PATCH_EXCERPT_RADIUS)
+        found_structure = False
+        for line_number in range(anchor, structural_start - 1, -1):
+            if definition.match(lines[line_number - 1]):
+                structural_start = line_number
+                found_structure = True
+                break
+        if not found_structure:
+            structural_start = max(start, anchor - 10)
+        focused_ranges.append((
+            structural_start,
+            min(end, anchor + PATCH_EXCERPT_RADIUS),
+            match_scores.get(anchor, 1),
+        ))
+        secondary_candidates = [
+            line_number
+            for line_number in anchors
+            if abs(line_number - anchor) >= 30
+        ]
+        secondary = max(secondary_candidates, default=None)
+        if secondary is not None:
+            focused_ranges.append((
+                max(start, secondary - 10),
+                min(end, secondary + PATCH_EXCERPT_RADIUS),
+                match_scores.get(anchor, 1),
+            ))
+    # Under a constrained required-file allowance, patch-relevant regions
+    # must be emitted before supplemental imports or file headers.
+    return [
+        (start, end)
+        for start, end, _score in sorted(
+            focused_ranges, key=lambda item: (-item[2], item[0])
+        )
+    ]
 
 
 def _render_patch_file_context(
@@ -1304,6 +1434,7 @@ def _render_patch_file_context(
     explicit_files: set[Path],
     max_chars: int | None = None,
     required_symbols: list[str] | None = None,
+    focus_symbols: list[str] | None = None,
 ) -> str:
     content, digest = _read_current_text_and_hash(path)
     relative = path.relative_to(repo).as_posix()
@@ -1333,8 +1464,17 @@ def _render_patch_file_context(
     lines = content.splitlines(keepends=True)
     excerpts = []
     test_file = "test" in path.stem.casefold() or "spec" in path.stem.casefold()
+    preferred_ranges = (
+        _dirty_current_line_ranges(repo, path) if path in changed_files else []
+    )
     target_ranges = _fresh_symbol_ranges(content, path, required_symbols or [])
-    ranges = target_ranges or _symbol_aware_ranges(content, task, test_file=test_file)
+    ranges = target_ranges or _symbol_aware_ranges(
+        content,
+        task,
+        test_file=test_file,
+        focus_symbols=focus_symbols or required_symbols,
+        preferred_ranges=preferred_ranges,
+    )
     for start, end in ranges:
         excerpts.append(
             f"----- EXCERPT {relative} source lines {start}-{end} -----\n"
@@ -1378,26 +1518,35 @@ def _render_patch_file_context(
         return ""
     excerpt_lines: list[str] = []
     used = 0
-    for start, end in _symbol_aware_ranges(content, task, test_file=test_file):
+    fallback_ranges = _symbol_aware_ranges(
+        content,
+        task,
+        test_file=test_file,
+        focus_symbols=focus_symbols or required_symbols,
+        preferred_ranges=preferred_ranges,
+    )[:4]
+    for position, (start, end) in enumerate(fallback_ranges):
+        remaining_ranges = len(fallback_ranges) - position
+        range_allowance = max(1, (available - used) // remaining_ranges)
         marker = f"----- source lines "
-        if used + len(marker) > available:
+        if len(marker) > range_allowance:
             break
         captured: list[str] = []
         actual_end = start - 1
         for line_number, line in enumerate(lines[start - 1:end], start=start):
             # Reserve the final, truthful range marker before accepting a line.
             possible_marker = f"----- source lines {start}-{line_number} -----\n"
-            if used + len(possible_marker) + sum(map(len, captured)) + len(line) > available:
+            if len(possible_marker) + sum(map(len, captured)) + len(line) > range_allowance:
                 break
             captured.append(line)
             actual_end = line_number
         if actual_end < start:
-            break
+            continue
         final_marker = f"----- source lines {start}-{actual_end} -----\n"
         excerpt_lines.append(final_marker)
         excerpt_lines.extend(captured)
         used += len(final_marker) + sum(map(len, captured))
-        if used >= available or actual_end < end:
+        if used >= available:
             break
     return header + "".join(excerpt_lines) + "\n" if excerpt_lines else ""
 
@@ -1585,37 +1734,124 @@ def _materialization_targets(
 
 def _render_required_symbols(
     repo: Path,
+    task: str,
     targets: list[tuple[Path, str, str]],
+    required_paths: list[Path],
     budget: int,
+    changed_files: set[Path],
+    explicit_files: set[Path],
 ) -> tuple[str, dict[tuple[Path, str], tuple[str, str]]]:
+    """Render required paths first, with current-source fallback per file."""
     sections: list[str] = []
     states: dict[tuple[Path, str], tuple[str, str]] = {}
     used = 0
+    grouped: dict[Path, list[tuple[str, str]]] = {}
+    for path in required_paths:
+        grouped.setdefault(path, [])
     for path, symbol, priority in targets:
+        grouped.setdefault(path, []).append((symbol, priority))
+
+    grouped_items = list(grouped.items())
+    required_path_set = set(required_paths)
+    for position, (path, symbols) in enumerate(grouped_items):
         relative = path.relative_to(repo).as_posix()
-        node = _fresh_symbol_node(path, symbol)
-        if node is None:
-            reason = "definition not found in current working tree"
+        remaining_paths = (
+            sum(
+                candidate in required_path_set
+                for candidate, _symbols in grouped_items[position:]
+            )
+            if path in required_path_set
+            else len(grouped_items) - position
+        )
+        allowance = max(1, (budget - used) // remaining_paths)
+        if path in changed_files and path.suffix.casefold() == ".py":
+            dirty_symbols = set(
+                _changed_python_definition_roots(repo, [path]).get(path, [])
+            )
+            task_identifiers = get_task_words(task)
+            symbols = sorted(
+                enumerate(symbols),
+                key=lambda item: (
+                    item[1][0] not in dirty_symbols,
+                    -sum(
+                        len(word)
+                        for word in task_identifiers
+                        if word in item[1][0].casefold()
+                    ),
+                    item[0],
+                ),
+            )
+            symbols = [item for _index, item in symbols]
+        resolved = [
+            (symbol, priority, _fresh_symbol_node(path, symbol))
+            for symbol, priority in symbols
+        ]
+        fallback_symbols = [symbol for symbol, _priority, node in resolved if node is None]
+        path_fallback_required = not symbols or path in required_paths
+        exact_size = sum(
+            len(
+                f"===== SYMBOL CONTEXT: {relative}::{symbol} [{priority}] "
+                f"source lines {node[2]}-{node[3]} =====\n{node[0]}\n"
+            )
+            for symbol, priority, node in resolved
+            if node is not None
+        )
+        needs_fallback = path_fallback_required or bool(fallback_symbols) or exact_size > allowance
+        exact_allowance = allowance // 2 if needs_fallback else allowance
+        local_used = 0
+
+        for symbol, priority, node in resolved:
+            if node is None:
+                continue
+            section = (
+                f"===== SYMBOL CONTEXT: {relative}::{symbol} [{priority}] "
+                f"source lines {node[2]}-{node[3]} =====\n"
+                f"{node[0]}\n"
+            )
+            if local_used + len(section) <= exact_allowance:
+                sections.append(section)
+                local_used += len(section)
+                states[(path, symbol)] = ("rendered", priority)
+            else:
+                fallback_symbols.append(symbol)
+
+        fallback_section = ""
+        fallback_allowance = allowance - local_used
+        if (path_fallback_required or fallback_symbols) and fallback_allowance > 0:
+            try:
+                fallback_section = _render_patch_file_context(
+                    repo,
+                    path,
+                    task,
+                    changed_files,
+                    explicit_files,
+                    max_chars=fallback_allowance,
+                    focus_symbols=list(dict.fromkeys(fallback_symbols)),
+                )
+            except OSError:
+                fallback_section = ""
+        if fallback_section:
+            sections.append(fallback_section)
+            local_used += len(fallback_section)
+            fallback_type = (
+                "FULL FILE" if fallback_section.startswith("===== FULL FILE:")
+                else "EXCERPT"
+            )
+            for symbol in fallback_symbols:
+                states[(path, symbol)] = ("fallback", fallback_type)
+
+        used += local_used
+        for symbol, _priority in symbols:
+            if (path, symbol) in states:
+                continue
+            reason = (
+                "source could not be read or bounded safely"
+                if not path.is_file() else "budget"
+            )
             states[(path, symbol)] = ("unavailable", reason)
             sections.append(
                 f"===== REQUIRED SOURCE UNAVAILABLE: {relative}::{symbol} "
                 f"[reason: {reason}; do not patch] =====\n"
-            )
-            continue
-        section = (
-            f"===== SYMBOL CONTEXT: {relative}::{symbol} [{priority}] "
-            f"source lines {node[2]}-{node[3]} =====\n"
-            f"{node[0]}\n"
-        )
-        if used + len(section) <= budget:
-            sections.append(section)
-            used += len(section)
-            states[(path, symbol)] = ("rendered", priority)
-        else:
-            states[(path, symbol)] = ("unavailable", "budget")
-            sections.append(
-                f"===== REQUIRED SOURCE UNAVAILABLE: {relative}::{symbol} "
-                "[reason: budget; do not patch] =====\n"
             )
     return "\n".join(sections), states
 
@@ -1624,10 +1860,14 @@ def _enforce_materialization_invariant(
     repo: Path,
     rendered: str,
     targets: list[tuple[Path, str, str]],
+    states: dict[tuple[Path, str], tuple[str, str]],
 ) -> str:
     """Ensure every required symbol is complete or explicitly non-patchable."""
     repairs: list[str] = []
     for path, symbol, _priority in targets:
+        state = states.get((path, symbol), ("unavailable", "missing state"))[0]
+        if state == "fallback":
+            continue
         relative = path.relative_to(repo).as_posix()
         unavailable = f"===== REQUIRED SOURCE UNAVAILABLE: {relative}::{symbol} "
         if unavailable in rendered:
@@ -1679,6 +1919,7 @@ def build_patch_source_context(
     task: str,
     files: list[Path] | None = None,
     target_symbols: dict[Path, list[str]] | None = None,
+    critical_paths: list[Path] | None = None,
 ) -> str:
     if files is None:
         files = collect_relevant_files(repo, task)
@@ -1697,7 +1938,22 @@ def build_patch_source_context(
 
     budget = _context_budget_chars()
     required_context, materialization_states = _render_required_symbols(
-        repo, materialization_targets, budget
+        repo,
+        task,
+        materialization_targets,
+        list(dict.fromkeys([
+            *[
+                path for path in primary
+                if path in changed_files
+                and "tests" not in {part.casefold() for part in path.relative_to(repo).parts}
+                and "test" not in path.stem.casefold()
+                and "spec" not in path.stem.casefold()
+            ],
+            *(critical_paths if critical_paths is not None else target_metadata),
+        ])),
+        budget,
+        changed_files,
+        explicit_files,
     )
     required_rendered_chars = sum(
         len(section) for section in required_context.splitlines(keepends=True)
@@ -1747,7 +2003,9 @@ def build_patch_source_context(
         used += len(section)
 
     rendered = "\n".join(sections) or "No relevant source files found."
-    rendered = _enforce_materialization_invariant(repo, rendered, materialization_targets)
+    rendered = _enforce_materialization_invariant(
+        repo, rendered, materialization_targets, materialization_states
+    )
     if get_boolean_setting("CHATCODE_RETRIEVAL_DEBUG") and materialization_states:
         print("Final materialization:", file=os.sys.stderr)
         priorities = {(path, symbol): priority for path, symbol, priority in materialization_targets}
@@ -1896,6 +2154,7 @@ def _build_stable_patch_source_context(
             task,
             files=files,
             target_symbols=expanded_metadata,
+            critical_paths=list((target_symbols or {}).keys()),
         )
         # Re-resolve dependencies in case graph metadata was refreshed while
         # rendering, then verify every path that could have been emitted.
@@ -1919,16 +2178,23 @@ def _build_stable_patch_source_context(
 
 def _format_selected_files(files: list[Path], repo: Path, source_context: str) -> str:
     """Make exceptional non-materialization explicit and non-patchable."""
-    materialized = set(re.findall(
-        r"^=====(?: FULL FILE| SYMBOL CONTEXT| EXCERPT):? ([^=\n]+?) =====$",
-        source_context,
-        re.MULTILINE,
-    ))
-    materialized.update(re.findall(
-        r"^===== REQUIRED SOURCE: ([^:\n]+?)::[^\n]+ =====$",
-        source_context,
-        re.MULTILINE,
-    ))
+    materialized: set[str] = set()
+    for line in source_context.splitlines():
+        for prefix in (
+            "===== FULL FILE: ",
+            "===== SYMBOL CONTEXT: ",
+            "===== EXCERPT: ",
+            "===== SELECTED SOURCE: ",
+        ):
+            if not line.startswith(prefix) or not line.endswith(" ====="):
+                continue
+            label = line[len(prefix):-len(" =====")]
+            if prefix == "===== SYMBOL CONTEXT: " and "::" in label:
+                label = label.split("::", 1)[0]
+            if " source lines " in label:
+                label = label.split(" source lines ", 1)[0]
+            materialized.add(label)
+            break
     lines = []
     for path in files:
         relative = path.relative_to(repo).as_posix()
