@@ -14,6 +14,7 @@ from chatcode.retrieval.hybrid_retriever import (
     implementation_closure,
     test_callsite_closure,
     resolve_explicit_targets,
+    resolve_alternative_callback_roots,
     resolve_task_surface_roots,
     resolve_transport_roots,
     resolve_semantic_hints,
@@ -113,6 +114,63 @@ class HybridRetrieverTests(unittest.TestCase):
         self.assertIn("drop", result.required_symbols[command])
         self.assertIn("inventory_embed", result.required_symbols[inventory])
         self.assertIn("InventoryView", result.required_symbols[inventory])
+
+    def test_runtime_literal_promotes_owning_symbol_over_similar_siblings(self) -> None:
+        commands = self.write(
+            "commands/world.py",
+            "class WorldCommands:\n"
+            "    async def inventory_item_autocomplete(self):\n"
+            "        return f'Inventory item x{2}'\n\n"
+            "    async def loose_item_autocomplete(self):\n"
+            "        return f'Great Axe ({1} here)'\n\n"
+            "    async def room_item_display(self): pass\n"
+            "    async def item_list_display(self): pass\n"
+            "    async def item_choice_display(self): pass\n",
+        )
+        self.map({
+            "commands/world.py": {"dependencies": [], "symbols": [
+                {"name": "inventory_item_autocomplete"},
+                {"name": "loose_item_autocomplete"},
+                {"name": "room_item_display"},
+                {"name": "item_list_display"},
+                {"name": "item_choice_display"},
+            ]},
+        })
+
+        result = resolve_task_surface_roots(
+            self.repo,
+            "The item suggestion currently says Great Axe (1 here). "
+            "Stackable items should display as Health Potion x2.",
+        )
+
+        self.assertIn("loose_item_autocomplete", result.required_symbols[commands])
+
+    def test_unresolved_followup_uses_callback_binding_to_find_alternative(self) -> None:
+        commands = self.write(
+            "commands/items.py",
+            "def attempted_suggestion(): return 'still unavailable'\n"
+            "def alternative_suggestion(): return f'Visible ({1} nearby)'\n"
+            "def incidental_suggestion(): return 'nearby error'\n\n"
+            "@ui.autocomplete(item=attempted_suggestion)\n"
+            "def store_item(): pass\n\n"
+            "@ui.autocomplete(item=alternative_suggestion)\n"
+            "def collect_item(): pass\n\n"
+            "@ui.autocomplete(item=incidental_suggestion)\n"
+            "def inspect_item(): pass\n",
+        )
+        self.map({"commands/items.py": {"dependencies": [], "symbols": [
+            {"name": "attempted_suggestion"}, {"name": "alternative_suggestion"},
+            {"name": "incidental_suggestion"},
+        ]}})
+
+        result = resolve_alternative_callback_roots(
+            self.repo,
+            "The visible item still says Visible (1 nearby).",
+            {"attempted_suggestion"},
+            limit=1,
+        )
+
+        self.assertEqual(result.required_symbols[commands], ["alternative_suggestion"])
 
     def test_explicit_command_follows_only_the_resolved_entry_point_body(self) -> None:
         command = self.write(

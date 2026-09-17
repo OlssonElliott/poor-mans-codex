@@ -180,6 +180,15 @@ def get_context_task(
     return task if isinstance(task, str) and task else "[Original task unavailable]"
 
 
+def get_context_kind(repo: Path) -> str | None:
+    try:
+        state = json.loads(_state_file(repo).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    kind = state.get("context_kind")
+    return kind if isinstance(kind, str) else None
+
+
 def get_stale_context_reason(
     repo: Path,
     patch_paths: set[str],

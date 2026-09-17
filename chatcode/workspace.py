@@ -123,11 +123,25 @@ def get_existing_failure_context_file(
     return get_repo_workspace(repo) / "EXISTING_FAILURE_CONTEXT.md"
 
 
+def get_followup_context_file(repo: Path) -> Path:
+    """A fresh task when validation passed but the user reports failure."""
+    return get_repo_workspace(repo) / "FOLLOWUP_CONTEXT.md"
+
+
+def get_followup_state_file(repo: Path) -> Path:
+    """Structured lifecycle state for the repository's unresolved follow-up."""
+    return get_repo_workspace(repo) / "followup-state.json"
+
+
 def get_check_repair_context_file(
     repo: Path,
 ) -> Path:
     """A standalone health-check repair task, never tied to a patch."""
     return get_repo_workspace(repo) / "CHECK_REPAIR_CONTEXT.md"
+
+
+def get_verified_baseline_cache_file(repo: Path) -> Path:
+    return get_repo_workspace(repo) / "verified-baseline.json"
 
 
 def get_test_results_dir(

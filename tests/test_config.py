@@ -14,6 +14,10 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(args.command, "status")
         self.assertTrue(args.reindex)
 
+    def test_followup_command_parses(self) -> None:
+        args = create_parser().parse_args(["followup"])
+        self.assertEqual(args.command, "followup")
+
     def test_process_environment_overrides_dotenv(self) -> None:
         with patch.dict(os.environ, {"CHATCODE_QWEN_MODEL": "session-model"}):
             self.assertEqual(get_setting("CHATCODE_QWEN_MODEL"), "session-model")

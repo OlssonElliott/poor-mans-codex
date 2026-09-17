@@ -41,8 +41,13 @@ from .patch import (
     get_repair_context_stale_reason,
     get_repair_context_targets,
     refresh_test_failure_repair_context,
+    regenerate_followup_context,
+    show_followup_send_instructions,
     show_repair_send_instructions,
     show_check_repair_send_instructions,
+    show_chatgpt_upload_artifact,
+    _capture_repository_snapshot,
+    save_verified_baseline,
     undo_last_patch,
 )
 from .test_runner import (
@@ -256,7 +261,7 @@ def command_context(
     )
 
     print("Context created:")
-    print(output)
+    show_chatgpt_upload_artifact(output)
     print()
     print("Workspace directory:")
     print(output.parent)
@@ -553,6 +558,11 @@ def command_check() -> int:
     """Report current working-tree health without creating a task by default."""
     repo = get_repo_root()
     print("Running repository health check...")
+    snapshot = None
+    try:
+        snapshot = _capture_repository_snapshot(repo)
+    except GitError:
+        pass
     try:
         result = run_project_tests(repo)
     except TestError as exc:
@@ -560,6 +570,12 @@ def command_check() -> int:
         print("Test command could not complete:")
         print(exc)
         return 2
+    if snapshot is not None:
+        try:
+            if _capture_repository_snapshot(repo) == snapshot:
+                save_verified_baseline(repo, snapshot, result)
+        except GitError:
+            pass
 
     try:
         dirty = get_status(repo)
@@ -656,6 +672,21 @@ def command_repair() -> int:
         repair_targets=sorted(get_repair_context_targets(repo)),
     )
     show_repair_send_instructions(repair_context)
+    return 0
+
+
+def command_followup() -> int:
+    repo = get_repo_root()
+    try:
+        context = regenerate_followup_context(repo)
+    except (OSError, PatchError) as exc:
+        print(f"Could not regenerate follow-up context: {exc}", file=sys.stderr)
+        return 1
+    if context is None:
+        print("No unresolved follow-up is available for this repository.")
+        return 1
+    show_followup_send_instructions(context)
+    open_folder(context.parent)
     return 0
 
 
@@ -832,6 +863,11 @@ def create_parser() -> argparse.ArgumentParser:
     )
 
     subparsers.add_parser(
+        "followup",
+        help="Regenerate the latest unresolved follow-up using current repository source.",
+    )
+
+    subparsers.add_parser(
         "history",
         help=(
             "Show ChatCode patch history."
@@ -883,6 +919,9 @@ def main() -> None:
                     args.task,
                     patch_oriented=True,
                 )
+
+            case "followup":
+                raise SystemExit(command_followup())
 
             case "apply":
                 returncode = command_apply(

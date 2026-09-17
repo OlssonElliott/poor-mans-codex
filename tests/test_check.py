@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from chatcode.cli import command_check
+from chatcode.cli import command_check, command_context
 from chatcode.test_runner import TestError, TestResult
 from chatcode.workspace import get_check_repair_context_file
 
@@ -37,6 +37,23 @@ class CheckCommandTests(unittest.TestCase):
         rendered = "\n".join(str(call.args[0]) for call in output.call_args_list if call.args)
         self.assertIn("Repository health: PASS", rendered)
         self.assertFalse(get_check_repair_context_file(self.repo).exists())
+
+    def test_normal_context_uses_shared_upload_instruction_and_keeps_filename(self) -> None:
+        context = self.repo / "workspace" / "UPLOAD_TO_CHATGPT.md"
+        incoming = self.repo / "incoming.diff"
+        with patch("chatcode.cli.get_repo_root", return_value=self.repo), patch(
+            "chatcode.cli.build_context", return_value=context
+        ), patch("chatcode.cli.get_default_patch_file", return_value=incoming), patch(
+            "chatcode.cli.open_folder"
+        ) as open_folder, patch("builtins.print") as output:
+            command_context("fix the issue")
+
+        rendered = "\n".join(str(call.args[0]) for call in output.call_args_list if call.args)
+        self.assertIn("[UPLOAD THIS FILE]", rendered)
+        self.assertIn(str(context), rendered)
+        self.assertNotIn("[UPLOAD TO CHATGPT]", rendered)
+        self.assertEqual(context.name, "UPLOAD_TO_CHATGPT.md")
+        open_folder.assert_called_once_with(context.parent)
 
     def test_failed_check_reports_stable_id_and_returns_one(self) -> None:
         failure = "test_broken.BrokenTests.test_broken"
@@ -74,6 +91,8 @@ class CheckCommandTests(unittest.TestCase):
         self.assertEqual(prompt.call_count, 1)
         self.assertIn("[F] Create fix context", prompt.call_args.args[0])
         self.assertEqual(rendered.count("Check repair context created:"), 1)
+        self.assertIn("[UPLOAD THIS FILE]", rendered)
+        self.assertIn(str(context), rendered)
 
     def test_check_context_delegates_source_capture_to_shared_test_root_pipeline(self) -> None:
         from chatcode.patch import build_check_repair_context

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -8,16 +9,21 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 
 from .context_state import (
+    _collect_file_hashes,
     get_active_repair_targets,
     get_context_task,
+    get_context_kind,
     get_stale_context_reason,
     save_context_state,
 )
-from .git_utils import GitError, get_status, run_git
+from .git_utils import GitError, get_branch, get_status, run_git
 from .history import (
     HistoryError,
     begin_history_entry,
@@ -33,15 +39,22 @@ from .workspace import (
     get_default_patch_file,
     get_check_repair_context_file,
     get_existing_failure_context_file,
+    get_followup_context_file,
+    get_followup_state_file,
     get_repair_context_file,
     get_repo_workspace,
     get_test_results_dir,
+    get_verified_baseline_cache_file,
 )
+
+VERIFIED_BASELINE_CACHE_VERSION = 1
+VERIFIED_BASELINE_MAX_AGE_SECONDS = 30 * 60
 from .unified_diff import (
     UnifiedDiffError,
     canonicalize_unified_diff,
     parse_unified_diff,
 )
+from .test_runner import TestResult
 
 
 class PatchError(RuntimeError):
@@ -108,7 +121,90 @@ class TestValidation:
     remaining_repair_failures: frozenset[str] = frozenset()
 
 
-_ANSI = {"green": "\x1b[32m", "red": "\x1b[31m", "yellow": "\x1b[33m"}
+@dataclass(frozen=True)
+class RepositorySnapshot:
+    """The full working state that a speculative baseline represents."""
+    branch: str
+    file_hashes: tuple[tuple[str, str], ...]
+    status: str
+    staged_diff_sha256: str
+
+
+def _capture_repository_snapshot(repo: Path) -> RepositorySnapshot:
+    staged = run_git("diff", "--cached", "--binary", "--no-ext-diff", cwd=repo)
+    return RepositorySnapshot(
+        branch=get_branch(repo),
+        file_hashes=tuple(sorted(_collect_file_hashes(repo).items())),
+        status=get_status(repo),
+        staged_diff_sha256=hashlib.sha256(staged.encode("utf-8")).hexdigest(),
+    )
+
+
+def _test_config_identity(repo: Path) -> str | None:
+    try:
+        from .test_runner import detect_test_command
+        return detect_test_command(repo).display
+    except Exception:
+        return None
+
+
+def _snapshot_payload(snapshot: RepositorySnapshot) -> dict:
+    return {
+        "branch": snapshot.branch, "file_hashes": [list(item) for item in snapshot.file_hashes],
+        "status": snapshot.status, "staged_diff_sha256": snapshot.staged_diff_sha256,
+    }
+
+
+def _load_verified_baseline(repo: Path, snapshot: RepositorySnapshot):
+    try:
+        payload = json.loads(get_verified_baseline_cache_file(repo).read_text(encoding="utf-8"))
+        if payload.get("version") != VERIFIED_BASELINE_CACHE_VERSION:
+            return None
+        if time.time() - float(payload["created_at"]) > VERIFIED_BASELINE_MAX_AGE_SECONDS:
+            return None
+        if payload.get("repository") != str(repo.resolve()):
+            return None
+        if payload.get("snapshot") != _snapshot_payload(snapshot):
+            return None
+        if payload.get("test_config") != _test_config_identity(repo):
+            return None
+        report = Path(payload["report"])
+        if not report.is_file():
+            return None
+        result = payload["result"]
+        return TestResult(
+            str(result["command"]), int(result["returncode"]), float(result["duration_seconds"]),
+            report, frozenset(result["failed_tests"]),
+        )
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def save_verified_baseline(repo: Path, snapshot: RepositorySnapshot, result) -> None:
+    """Persist only a completed full-suite result for this exact state."""
+    if _test_config_identity(repo) is None:
+        return
+    report = get_repo_workspace(repo) / "verified-baseline.md"
+    try:
+        shutil.copyfile(result.output_file, report)
+    except OSError:
+        return
+    payload = {
+        "version": VERIFIED_BASELINE_CACHE_VERSION,
+        "created_at": time.time(), "repository": str(repo.resolve()),
+        "snapshot": _snapshot_payload(snapshot), "test_config": _test_config_identity(repo),
+        "report": str(report),
+        "result": {"command": result.command, "returncode": result.returncode,
+                   "duration_seconds": result.duration_seconds,
+                   "failed_tests": sorted(result.failed_tests)},
+    }
+    atomic_write_text(get_verified_baseline_cache_file(repo), json.dumps(payload, indent=2) + "\n")
+
+
+_ANSI = {
+    "green": "\x1b[32m", "red": "\x1b[31m", "yellow": "\x1b[33m",
+    "cyan": "\x1b[36m",
+}
 
 REPAIR_COMPANION_PROMPT = (
     "Use the attached PATCH_REPAIR_CONTEXT.md as repository context and the "
@@ -133,8 +229,15 @@ def _status(text: str, color: str | None = None) -> str:
     return text
 
 
+def show_chatgpt_upload_artifact(context: Path) -> None:
+    """Make a generated ChatGPT attachment unambiguous in terminal output."""
+    print(_status("[UPLOAD THIS FILE]", "cyan"))
+    print(_status(str(context), "cyan"))
+
+
 def show_repair_send_instructions(repair_context: Path) -> None:
     print(f"Repair context ready to send to ChatGPT: {repair_context}")
+    show_chatgpt_upload_artifact(repair_context)
     print("Attach that file and send this message with it:")
     print(REPAIR_COMPANION_PROMPT)
 
@@ -1681,6 +1784,12 @@ def _clear_phase_test_reports(repo: Path) -> None:
             pass
 
 
+def _run_background_baseline(repo: Path):
+    """Run the existing project-wide test command without terminal output."""
+    from .test_runner import run_project_tests
+    return run_project_tests(repo)
+
+
 def _verify_undo(
     repo: Path,
     undone_entry: Path,
@@ -1767,6 +1876,7 @@ def build_check_repair_context(repo: Path, test_result, selected_failures: froze
 
 def show_check_repair_send_instructions(context: Path) -> None:
     print(f"Check repair context created: {context}")
+    show_chatgpt_upload_artifact(context)
     print("Attach that file and send this message with it:")
     print(CHECK_REPAIR_COMPANION_PROMPT)
 
@@ -1779,6 +1889,282 @@ EXISTING_FAILURE_COMPANION_PROMPT = (
     "three unchanged context lines around each hunk and no explanation outside "
     "the diff."
 )
+
+FOLLOWUP_COMPANION_PROMPT = (
+    "Use the attached FOLLOWUP_CONTEXT.md as the current repository context "
+    "and source of truth. The previous patch applied successfully and automated "
+    "validation passed, but the user reports that the original problem remains "
+    "unresolved. Use the included user feedback to continue the fix without "
+    "reverting unrelated working-tree changes or the previous patch. Return "
+    "exactly one complete unified diff with at least three unchanged context "
+    "lines around each hunk and no explanation outside the diff."
+)
+
+MAX_FOLLOWUP_ROUNDS = 5
+
+
+def _load_followup_state(repo: Path) -> dict | None:
+    try:
+        state = json.loads(get_followup_state_file(repo).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return state if isinstance(state, dict) and state.get("version") == 1 else None
+
+
+def _save_followup_state(repo: Path, state: dict) -> None:
+    atomic_write_text(
+        get_followup_state_file(repo),
+        json.dumps(state, indent=2, ensure_ascii=False) + "\n",
+        newline="\n",
+    )
+
+
+def mark_followup_resolved(repo: Path) -> None:
+    state = _load_followup_state(repo)
+    if state is None or not state.get("unresolved"):
+        return
+    state["unresolved"] = False
+    state["updated_at"] = time.time()
+    _save_followup_state(repo, state)
+
+
+def _followup_attempt(result: ApplyResult, validation: TestValidation, patch_summary: str) -> dict:
+    return {
+        "history_entry": str(result.history_entry.resolve()),
+        "paths": sorted(result.paths),
+        "patch_summary": patch_summary,
+        "validation_status": validation.status,
+    }
+
+
+def _result_from_followup_attempt(attempt: dict) -> ApplyResult | None:
+    history_entry = attempt.get("history_entry")
+    paths = attempt.get("paths")
+    if not isinstance(history_entry, str) or not isinstance(paths, list):
+        return None
+    return ApplyResult(
+        {path for path in paths if isinstance(path, str)}, Path(history_entry)
+    )
+
+
+def _attempted_python_symbols(result: ApplyResult) -> set[str]:
+    """Recover definitions changed by the successfully applied patch."""
+    attempted: set[str] = set()
+    for relative in result.paths:
+        if not relative.casefold().endswith(".py"):
+            continue
+        parts = PurePosixPath(relative).parts
+        snapshots: list[dict[str, str]] = []
+        for state in ("before", "after"):
+            path = result.history_entry.joinpath(state, *parts)
+            try:
+                source = path.read_text(encoding="utf-8", errors="replace")
+                tree = ast.parse(source)
+            except (OSError, SyntaxError):
+                snapshots.append({})
+                continue
+            snapshots.append({
+                node.name: ast.get_source_segment(source, node) or ""
+                for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            })
+        before, after = snapshots
+        attempted.update(
+            name for name in before.keys() | after.keys()
+            if before.get(name) != after.get(name)
+        )
+    return attempted
+
+
+def build_followup_context(
+    repo: Path,
+    result: ApplyResult,
+    validation: TestValidation,
+    feedback: str,
+    patch_summary: str,
+    *,
+    original_task: str | None = None,
+    prior_attempts: list[ApplyResult] | None = None,
+    feedback_history: list[str] | None = None,
+    persist_state: bool = True,
+) -> Path:
+    """Create a fresh, post-patch task context from explicit user feedback."""
+    feedback = feedback.strip()
+    if not feedback:
+        raise PatchError("Describe what is still not working before creating a follow-up context.")
+    original_task = original_task or get_context_task(repo)
+    existing_state = _load_followup_state(repo) if persist_state else None
+    prior_feedback = list(feedback_history or [])
+    prior_results = list(prior_attempts or [])
+    if existing_state is not None and existing_state.get("unresolved"):
+        prior_feedback = [
+            item for item in existing_state.get("feedback", [])
+            if isinstance(item, str) and item
+        ]
+        prior_results = [
+            parsed for parsed in (
+                _result_from_followup_attempt(item)
+                for item in existing_state.get("attempts", [])
+                if isinstance(item, dict)
+            )
+            if parsed is not None
+        ]
+    all_feedback = [*prior_feedback, feedback]
+    all_feedback = list(dict.fromkeys(all_feedback))[-MAX_FOLLOWUP_ROUNDS:]
+    retrieval_feedback = "\n".join(
+        f"- {item}" for item in all_feedback
+    )
+    retrieval_task = "\n\n".join((
+        original_task,
+        "Previous patch applied successfully; automated validation passed.",
+        "User-provided unresolved runtime feedback:\n" + retrieval_feedback,
+    ))
+    # This is the normal current-working-tree retrieval/materialization path,
+    # deliberately rerun with feedback rather than reusing an old upload.
+    from .context_builder import (
+        _build_stable_patch_source_context,
+        _ensure_explicit_task_files,
+        collect_relevant_files,
+    )
+    from .retrieval.hybrid_retriever import resolve_alternative_callback_roots
+    retrieved = collect_relevant_files(repo, retrieval_task, include_target_symbols=True)
+    files, target_symbols = retrieved if isinstance(retrieved, tuple) else (retrieved, {})
+    attempted_results = [*prior_results, result][-MAX_FOLLOWUP_ROUNDS:]
+    attempted_symbols = {
+        symbol for attempted in attempted_results
+        for symbol in _attempted_python_symbols(attempted)
+    }
+    alternatives = resolve_alternative_callback_roots(
+        repo, retrieval_task, attempted_symbols
+    )
+    # Follow-up-only priority: keep the attempted dirty path in normal
+    # retrieval, but put structurally supported alternatives first so the
+    # failed hypothesis cannot consume all patchable-source allowance.
+    files = list(dict.fromkeys([*alternatives.files, *files]))
+    target_symbols = {
+        **alternatives.required_symbols,
+        **{
+            path: list(dict.fromkeys([
+                *alternatives.required_symbols.get(path, []), *symbols,
+            ]))
+            for path, symbols in target_symbols.items()
+        },
+    }
+    files = _ensure_explicit_task_files(repo, retrieval_task, files)
+    source_context, source_hashes = _build_stable_patch_source_context(
+        repo, retrieval_task, files, target_symbols
+    )
+    try:
+        dirty_state = get_status(repo) or "[Working tree clean.]"
+    except GitError:
+        dirty_state = "[Working-tree status unavailable.]"
+    content = "\n".join((
+        "# ChatCode Follow-up Context", "",
+        "## Original task", original_task, "",
+        "## Previous patch result",
+        "- The previous patch applied successfully.",
+        "- Automated validation passed with no new regressions.",
+        f"- Validation classification: `{validation.status}`.",
+        "", "### Previous patch summary", patch_summary, "",
+        "## User feedback", "The following is user-provided runtime feedback:",
+        "```text", feedback, "```", "",
+        "## Bounded unresolved feedback history",
+        "\n".join(f"- {item}" for item in all_feedback), "",
+        "## Follow-up status",
+        "The previous patch applied successfully and automated validation passed, "
+        "but the user reports that the real problem remains unresolved.", "",
+        "## Current repository context", "## Dirty working-tree state",
+        "```text", dirty_state, "```", "",
+        "## Exact current source and bounded dependencies", source_context, "",
+        "## Required response",
+        "Investigate the unresolved behavior using the user feedback and current "
+        "source. Preserve unrelated working-tree changes and the previous patch.",
+        "Return one complete unified diff against the current files, with no explanation outside the diff.",
+        "",
+    ))
+    output = get_followup_context_file(repo)
+    save_context_state(
+        repo,
+        task=original_task,
+        source_hashes=source_hashes,
+        context_sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        generation_id=uuid.uuid4().hex,
+        context_filename=output.name,
+        context_kind="followup",
+    )
+    atomic_write_text(output, content, newline="\n")
+    if persist_state:
+        attempts = []
+        if existing_state is not None and existing_state.get("unresolved"):
+            attempts = [
+                item for item in existing_state.get("attempts", [])
+                if isinstance(item, dict)
+            ]
+        attempts.append(_followup_attempt(result, validation, patch_summary))
+        _save_followup_state(repo, {
+            "version": 1,
+            "id": (
+                existing_state.get("id")
+                if existing_state is not None and existing_state.get("unresolved")
+                else uuid.uuid4().hex
+            ),
+            "unresolved": True,
+            "original_task": original_task,
+            "feedback": all_feedback,
+            "attempts": attempts[-MAX_FOLLOWUP_ROUNDS:],
+            "updated_at": time.time(),
+        })
+    return output
+
+
+def regenerate_followup_context(repo: Path) -> Path | None:
+    """Regenerate the active follow-up from structured evidence and current source."""
+    state = _load_followup_state(repo)
+    if state is None or not state.get("unresolved"):
+        return None
+    attempts = [item for item in state.get("attempts", []) if isinstance(item, dict)]
+    feedback = [item for item in state.get("feedback", []) if isinstance(item, str) and item]
+    if not attempts or not feedback or not isinstance(state.get("original_task"), str):
+        return None
+    latest = attempts[-1]
+    result = _result_from_followup_attempt(latest)
+    if result is None:
+        return None
+    prior_results = [
+        parsed for parsed in (_result_from_followup_attempt(item) for item in attempts[:-1])
+        if parsed is not None
+    ]
+    validation = TestValidation(
+        None, None, None, str(latest.get("validation_status") or "passed")
+    )
+    return build_followup_context(
+        repo,
+        result,
+        validation,
+        feedback[-1],
+        str(latest.get("patch_summary") or "[Previous patch summary unavailable.]"),
+        original_task=state["original_task"],
+        prior_attempts=prior_results,
+        feedback_history=feedback[:-1],
+        persist_state=False,
+    )
+
+
+def show_followup_send_instructions(context: Path) -> None:
+    print("Follow-up context created.")
+    show_chatgpt_upload_artifact(context)
+    print("Attach that file and send this message with it:")
+    print(FOLLOWUP_COMPANION_PROMPT)
+
+
+def _applied_patch_summary(result: ApplyResult) -> str:
+    try:
+        patch_text = get_history_patch_file(result.history_entry).read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        patch_text = "[Applied patch text is unavailable; changed-file summary follows.]"
+    return _fallback_patch_summary(patch_text, result.paths)
 
 
 def _failure_output_excerpt(output: str, failure_id: str) -> str:
@@ -1928,6 +2314,7 @@ def build_existing_failure_context(
 
 def show_existing_failure_send_instructions(context: Path) -> None:
     print(f"Existing failure context created: {context}")
+    show_chatgpt_upload_artifact(context)
     print("Attach that file and send this message with it:")
     print(EXISTING_FAILURE_COMPANION_PROMPT)
 
@@ -1970,6 +2357,35 @@ def _post_apply_choice(
         and test_result.returncode != 0
     )
     pre_existing_only = validation is not None and validation.status == "existing"
+    followup_eligible = validation is not None and validation.status in {"passed", "repair_passed"}
+    followup_feedback: str | None = None
+
+    if followup_eligible:
+        while True:
+            answer = input("Did the patch solve your problem? [Y/n] ").strip().lower()
+            if answer in {"", "y", "yes"}:
+                if get_context_kind(repo) == "followup":
+                    mark_followup_resolved(repo)
+                print("Changes kept.")
+                return
+            if answer in {"n", "no"}:
+                break
+            print("Choose Y or N.")
+        while not followup_feedback:
+            followup_feedback = input("What is still not working?\n> ").strip()
+            if not followup_feedback:
+                print("Please describe what is still not working.")
+        try:
+            context = build_followup_context(
+                repo, result, validation, followup_feedback, _applied_patch_summary(result),
+            )
+            show_followup_send_instructions(context)
+            from .cli import open_folder
+            open_folder(context.parent)
+            print("Changes kept.")
+            return
+        except (OSError, PatchError) as exc:
+            print(f"Could not create follow-up context: {exc}")
 
     while True:
         if failed:
@@ -1979,7 +2395,7 @@ def _post_apply_choice(
                 if recommend_keep_for_repair else "[K] Keep changes"
             )
             if pre_existing_only:
-                print(f"{keep_label}  [F] Create fix context for existing failure  {undo_label}  [R] Review diff  [T] Show test output")
+                print(f"{keep_label}  [F] Keep changes + create fix context for existing failure  {undo_label}  [R] Review diff  [T] Show test output")
             else:
                 print(f"{keep_label}  {undo_label}  [R] Review diff  [T] Show test output")
             choice = input("> ").strip().lower()
@@ -1988,7 +2404,8 @@ def _post_apply_choice(
             elif not choice and recommend_keep_for_repair:
                 choice = "k"
         else:
-            print("[K] Keep  [U] Undo  [R] Review diff")
+            retry = "  [F] Retry follow-up context" if followup_feedback else ""
+            print("[K] Keep  [U] Undo  [R] Review diff" + retry)
             choice = input("> ").strip().lower() or "k"
 
         if choice == "k":
@@ -2016,6 +2433,20 @@ def _post_apply_choice(
                 print(f"Could not read test output: {exc}")
             continue
 
+        if choice == "f" and followup_feedback and validation is not None:
+            try:
+                context = build_followup_context(
+                    repo, result, validation, followup_feedback, _applied_patch_summary(result),
+                )
+                show_followup_send_instructions(context)
+                from .cli import open_folder
+                open_folder(context.parent)
+                print("Changes kept.")
+                return
+            except (OSError, PatchError) as exc:
+                print(f"Could not create follow-up context: {exc}")
+                continue
+
         if choice == "f" and pre_existing_only and validation is not None:
             selected = _choose_existing_failures(validation.existing_failures)
             if not selected:
@@ -2023,9 +2454,16 @@ def _post_apply_choice(
             try:
                 context = build_existing_failure_context(repo, result, validation, selected)
                 show_existing_failure_send_instructions(context)
+                # Reuse the same cross-platform folder opener used for normal
+                # generated contexts. Importing here avoids a module import
+                # cycle between the CLI and patch workflow modules.
+                from .cli import open_folder
+                open_folder(context.parent)
             except OSError as exc:
                 print(f"Could not create existing failure context: {exc}")
-            continue
+                continue
+            print("Changes kept.")
+            return
 
         if choice == "u":
             undone = undo_last_patch(repo)
@@ -2045,7 +2483,7 @@ def _post_apply_choice(
             print(f"No test report is available: {test_error}")
             continue
 
-        extra = ", T, or F." if failed and pre_existing_only else ", or T." if failed else "."
+        extra = ", T, or F." if (failed and pre_existing_only) or followup_feedback else ", or T." if failed else "."
         print("Choose K, U, R" + extra)
 
 
@@ -2062,6 +2500,22 @@ def _run_apply_flow(
         dry_run=True,
     )
     assert isinstance(preview, PatchPreview)
+
+    # Start only after the candidate has passed all non-mutating applicability
+    # checks. The snapshot is rechecked immediately before mutation below.
+    baseline_snapshot = _capture_repository_snapshot(repo)
+    _clear_phase_test_reports(repo)
+    cached_baseline = _load_verified_baseline(repo, baseline_snapshot)
+    baseline_executor: ThreadPoolExecutor | None = None
+    baseline_future: Future | None = None
+    if cached_baseline is not None:
+        print("Pre-patch baseline: using verified cached result.")
+        print("[OK] Repository state unchanged since last full-suite validation." if cached_baseline.returncode == 0
+              else f"[WARN] {len(cached_baseline.failed_tests)} known pre-existing failure(s).")
+    else:
+        baseline_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="chatcode-baseline")
+        baseline_future = baseline_executor.submit(_run_background_baseline, repo)
+        print("Starting pre-patch test baseline in background...")
 
     summary = _build_patch_summary(
         repo,
@@ -2081,6 +2535,10 @@ def _run_apply_flow(
         and sys.stdout.isatty()
     )
     if not interactive and not yes:
+        if baseline_future is not None:
+            baseline_future.cancel()
+        if baseline_executor is not None:
+            baseline_executor.shutdown(wait=False, cancel_futures=True)
         raise PatchError(
             "Non-interactive apply requires --yes. "
             "No repository files were changed."
@@ -2097,24 +2555,48 @@ def _run_apply_flow(
             "Apply these changes?",
             default=False,
         ):
+            if baseline_future is not None:
+                baseline_future.cancel()
+            if baseline_executor is not None:
+                baseline_executor.shutdown(wait=False, cancel_futures=True)
             print("Apply cancelled. No repository files were changed.")
             raise PatchError(
                 "Apply cancelled by user."
             )
 
-    # A baseline is intentionally taken after confirmation but before mutating
-    # the repository, so declining a preview never starts an expensive suite.
     baseline = None
     baseline_error: Exception | None = None
-    _clear_phase_test_reports(repo)
     try:
-        from .test_runner import TestError, run_project_tests
-        print("\nRunning pre-patch test baseline...")
-        baseline = run_project_tests(repo)
+        current_snapshot = _capture_repository_snapshot(repo)
+        if cached_baseline is not None and current_snapshot == baseline_snapshot:
+            baseline = cached_baseline
+        elif current_snapshot != baseline_snapshot:
+            # Do not overlap a replacement suite with the discarded suite:
+            # project test tools often share caches and report locations.
+            print("Repository changed during review; discarding pre-patch baseline.")
+            if baseline_future is not None and baseline_executor is not None:
+                baseline_future.cancel()
+                try:
+                    baseline_future.result()
+                except Exception:
+                    pass
+                baseline_executor.shutdown(wait=True, cancel_futures=True)
+            print("Running fresh pre-patch test baseline...")
+            baseline = _run_background_baseline(repo)
+        else:
+            assert baseline_future is not None and baseline_executor is not None
+            if not baseline_future.done():
+                print("Waiting for pre-patch baseline...")
+            baseline = baseline_future.result()
+            baseline_executor.shutdown(wait=True, cancel_futures=True)
         baseline = _preserve_test_report(repo, baseline, "baseline")
         _show_test_result(baseline)
-    except TestError as exc:
+    except Exception as exc:
+        # Match the established baseline-infrastructure-error path. Test
+        # failures are TestResult values and never arrive here as exceptions.
         baseline_error = exc
+        if baseline_executor is not None:
+            baseline_executor.shutdown(wait=False, cancel_futures=True)
         print(f"Pre-patch tests could not be run: {exc}")
 
     result = _apply_patch_core(
@@ -2159,8 +2641,11 @@ def _run_apply_flow(
             ))
         else:
             try:
+                full_snapshot = _capture_repository_snapshot(repo)
                 test_result = run_project_tests(repo)
                 test_result = _preserve_test_report(repo, test_result, "full-suite")
+                if _capture_repository_snapshot(repo) == full_snapshot:
+                    save_verified_baseline(repo, full_snapshot, test_result)
                 update_history_test_result(
                     result.history_entry,
                     "PASSED" if test_result.returncode == 0 else "FAILED",

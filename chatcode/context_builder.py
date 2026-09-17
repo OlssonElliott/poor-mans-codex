@@ -1772,12 +1772,12 @@ def _render_required_symbols(
             symbols = sorted(
                 enumerate(symbols),
                 key=lambda item: (
-                    item[1][0] not in dirty_symbols,
                     -sum(
                         len(word)
                         for word in task_identifiers
                         if word in item[1][0].casefold()
                     ),
+                    item[1][0] not in dirty_symbols,
                     item[0],
                 ),
             )

@@ -723,6 +723,7 @@ class PatchContextTests(unittest.TestCase):
         self.assertIn("def inventory_item_autocomplete", context)
         self.assertIn("DIRTY current inventory autocomplete", context)
         self.assertIn("class InventoryView", context)
+
         expected_symbols = (
             ("commands/inventory.py", "inventory_embed"),
             ("commands/inventory.py", "show_inventory"),
@@ -760,6 +761,33 @@ class PatchContextTests(unittest.TestCase):
             (self.repo / "commands/world.py").read_text(encoding="utf-8").splitlines()[drop_start - 1],
             "    @app_commands.autocomplete(item=inventory_item_autocomplete)",
         )
+
+    def test_runtime_output_owner_is_materialized_with_ambiguous_sibling(self) -> None:
+        self.write(
+            "rpg_bot/commands/world.py",
+            "class WorldCommands:\n"
+            "    async def inventory_item_autocomplete(self):\n"
+            "        return f'Inventory item x{2}'\n\n"
+            "    async def loose_item_autocomplete(self):\n"
+            "        return f'Great Axe ({1} here)'\n\n"
+            "    async def room_item_display(self): pass\n"
+            "    async def item_list_display(self): pass\n"
+            "    async def item_choice_display(self): pass\n",
+        )
+        self.commit_all()
+
+        output = build_context(
+            self.repo,
+            "The item suggestion currently says Great Axe (1 here). "
+            "Stackable items should display as Health Potion x2.",
+        )
+        context = output.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "SYMBOL CONTEXT: rpg_bot/commands/world.py::loose_item_autocomplete",
+            context,
+        )
+        self.assertIn("return f'Great Axe ({1} here)'", context)
 
     def test_dirty_take_definition_and_autocomplete_are_patchable_final_source(self) -> None:
         padding = "PADDING = " + repr("x" * 49_000) + "\n\n"

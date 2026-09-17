@@ -59,17 +59,51 @@ def _task_surfaces(task: str) -> list[str]:
     return list(dict.fromkeys(clause.strip() for clause in clauses if clause.strip()))[:MAX_TASK_SURFACES]
 
 
+def _python_definition_literal_terms(path: Path) -> dict[str, dict[str, int]]:
+    """Return user-visible literal words owned by each Python definition."""
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, SyntaxError):
+        return {}
+    result: dict[str, dict[str, int]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        terms: dict[str, int] = {}
+        docstring = ast.get_docstring(node, clean=False)
+        for child in ast.walk(node):
+            if not isinstance(child, ast.Constant) or not isinstance(child.value, str):
+                continue
+            if child.value == docstring:
+                continue
+            for word in re.findall(r"[A-Za-z0-9]+", child.value):
+                if len(word) >= 3:
+                    terms.setdefault(word.casefold(), 1)
+        # Static fragments inside an f-string/template are stronger evidence
+        # of displayed output than prose used only in an exception branch.
+        for template in (child for child in ast.walk(node) if isinstance(child, ast.JoinedStr)):
+            for part in template.values:
+                if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                    for word in re.findall(r"[A-Za-z0-9]+", part.value):
+                        if len(word) >= 3:
+                            terms[word.casefold()] = 2
+        if terms:
+            result[node.name] = terms
+    return result
+
+
 def resolve_task_surface_roots(repo: Path, task: str) -> RetrievalResult:
     """Find a few real indexed roots for every explicit task surface."""
     surfaces = _task_surfaces(task)
-    # Preserve established single-surface ranking/materialization exactly.
-    if len(surfaces) < 2:
-        return RetrievalResult([])
+    # A single surface remains too broad for name-only promotion. Concrete
+    # runtime text owned by a relevant definition is narrow enough to use.
+    runtime_evidence_only = len(surfaces) < 2
     index = load_map(repo).get("files", {})
     paths: list[Path] = []
     reasons: dict[Path, list[str]] = defaultdict(list)
     required: dict[Path, list[str]] = defaultdict(list)
     diagnostics: list[str] = []
+    literal_terms_by_file: dict[str, dict[str, dict[str, int]]] = {}
     presentation_terms = {"display", "displayed", "show", "render", "rendering", "view", "embed", "ui"}
     for surface in surfaces:
         tokens = {
@@ -92,6 +126,10 @@ def resolve_task_surface_roots(repo: Path, task: str) -> RetrievalResult:
                 if isinstance(value, str)
             }
             file_tokens = set(re.findall(r"[a-z0-9]+", relative.casefold().replace("_", " ")))
+            literal_terms_by_file.setdefault(
+                relative, _python_definition_literal_terms(repo / relative)
+                if relative.casefold().endswith(".py") else {},
+            )
             for symbol in entry.get("symbols", []):
                 if not isinstance(symbol, dict) or not symbol.get("name"):
                     continue
@@ -102,6 +140,18 @@ def resolve_task_surface_roots(repo: Path, task: str) -> RetrievalResult:
                 if not overlap:
                     continue
                 score = 70 * len(tokens & symbol_tokens) + 25 * len(tokens & file_tokens)
+                definition_name = str(symbol.get("definition_name") or name)
+                # Runtime examples in task/feedback are direct evidence for
+                # the definition that owns their literal/template fragments.
+                # Keep this tied to an otherwise relevant symbol so common
+                # prose in an unrelated error message cannot create a root.
+                owned_literal_terms = literal_terms_by_file[relative].get(
+                    definition_name, {}
+                )
+                literal_overlap = tokens & owned_literal_terms.keys()
+                if runtime_evidence_only and not literal_overlap:
+                    continue
+                score += 240 * sum(owned_literal_terms[word] for word in literal_overlap)
                 if name.casefold() in tokens:
                     score += 120
                 # Normalize the already-supported presentation vocabulary so
@@ -117,7 +167,7 @@ def resolve_task_surface_roots(repo: Path, task: str) -> RetrievalResult:
                 # A surface must have meaningful evidence, not a lone generic
                 # filename coincidence.
                 if score >= 70:
-                    candidates.append((score, relative, str(symbol.get("definition_name") or name)))
+                    candidates.append((score, relative, definition_name))
         selected = sorted(candidates, key=lambda item: (-item[0], item[1].lower(), item[2].lower()))[:MAX_SURFACE_ROOTS]
         if not selected:
             diagnostics.append(f"surface unresolved: {surface}")
@@ -136,6 +186,75 @@ def resolve_task_surface_roots(repo: Path, task: str) -> RetrievalResult:
             if symbol not in required[path]:
                 required[path].append(symbol)
     return RetrievalResult(paths, dict(reasons), paths.copy(), dict(required), diagnostics)
+
+
+def resolve_alternative_callback_roots(
+    repo: Path, task: str, attempted_symbols: set[str], limit: int = 3,
+) -> RetrievalResult:
+    """Find bounded callback alternatives to an attempted implementation path."""
+    if not attempted_symbols:
+        return RetrievalResult([])
+    index = load_map(repo).get("files", {})
+    bindings: list[tuple[str, str, str, str]] = []
+    for relative in index:
+        path = repo / relative
+        if not relative.casefold().endswith(".py") or not path.is_file() or _is_test(relative):
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, SyntaxError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for decorator in node.decorator_list:
+                if not isinstance(decorator, ast.Call):
+                    continue
+                decorator_name = (
+                    decorator.func.attr if isinstance(decorator.func, ast.Attribute)
+                    else decorator.func.id if isinstance(decorator.func, ast.Name) else ""
+                )
+                if not decorator_name.casefold().endswith("autocomplete"):
+                    continue
+                for keyword in decorator.keywords:
+                    if keyword.arg and isinstance(keyword.value, ast.Name):
+                        bindings.append((relative, node.name, keyword.arg, keyword.value.id))
+
+    attempted_parameters = {
+        parameter
+        for _relative, _command, parameter, callback in bindings
+        if callback in attempted_symbols
+    }
+    if not attempted_parameters:
+        return RetrievalResult([])
+    task_tokens = {
+        token.casefold() for token in re.findall(r"[A-Za-z0-9]+", task)
+        if len(token) >= 3
+    }
+    ranked: list[tuple[int, str, str, str]] = []
+    for relative, command, parameter, callback in bindings:
+        if callback in attempted_symbols or parameter not in attempted_parameters:
+            continue
+        callback_tokens = set(re.findall(r"[a-z0-9]+", callback.casefold().replace("_", " ")))
+        command_tokens = set(re.findall(r"[a-z0-9]+", command.casefold().replace("_", " ")))
+        literal_terms = _python_definition_literal_terms(repo / relative).get(callback, {})
+        score = 300
+        score += 70 * len(task_tokens & callback_tokens)
+        score += 50 * len(task_tokens & command_tokens)
+        score += 120 * sum(literal_terms[word] for word in task_tokens & literal_terms.keys())
+        ranked.append((score, relative, callback, command))
+    selected = sorted(ranked, key=lambda item: (-item[0], item[1].lower(), item[2].lower()))[:limit]
+    paths: list[Path] = []
+    reasons: dict[Path, list[str]] = defaultdict(list)
+    required: dict[Path, list[str]] = defaultdict(list)
+    for _score, relative, callback, command in selected:
+        path = repo / relative
+        if path not in paths:
+            paths.append(path)
+        reasons[path].append(f"alternative callback for unresolved follow-up: {command} -> {callback}")
+        if callback not in required[path]:
+            required[path].append(callback)
+    return RetrievalResult(paths, dict(reasons), paths.copy(), dict(required))
 
 
 def resolve_explicit_targets(repo: Path, task: str) -> RetrievalResult:
