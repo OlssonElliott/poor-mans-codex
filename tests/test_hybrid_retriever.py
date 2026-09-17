@@ -341,6 +341,88 @@ class HybridRetrieverTests(unittest.TestCase):
         self.assertEqual(result.required_symbols[command], ["drop"])
         self.assertEqual(result.required_symbols[service], ["drop_item"])
 
+    def test_rooted_closure_follows_same_class_generic_persistence_chain(self) -> None:
+        catalog = self.write(
+            "catalog.py",
+            "class ItemCatalog:\n"
+            "    def get(self):\n"
+            "        self._reload_if_changed()\n"
+            "        return 'item'\n\n"
+            "    def _reload_if_changed(self):\n"
+            "        self.load()\n\n"
+            "    def load(self):\n"
+            "        return 'disk'\n",
+        )
+        self.map({"catalog.py": {"dependencies": [], "symbols": [
+            {"name": "ItemCatalog"}, {"name": "get"},
+            {"name": "_reload_if_changed"}, {"name": "load"},
+        ]}})
+
+        result = implementation_closure(
+            self.repo,
+            "stackable setting should survive restart",
+            [catalog],
+            root_symbols={catalog: ["get"]},
+        )
+
+        self.assertEqual(
+            result.required_symbols[catalog],
+            ["_reload_if_changed", "load"],
+        )
+
+    def test_rooted_closure_follows_generic_call_through_direct_dependency(self) -> None:
+        api = self.write(
+            "api.py",
+            "class ItemAPI:\n"
+            "    def update_item(self):\n"
+            "        self.store.save()\n",
+        )
+        store = self.write(
+            "store.py",
+            "class ItemStore:\n"
+            "    def save(self):\n"
+            "        return True\n",
+        )
+        self.map({
+            "api.py": {
+                "dependencies": ["store.py"],
+                "symbols": [{"name": "ItemAPI"}, {"name": "update_item"}],
+            },
+            "store.py": {
+                "dependencies": [],
+                "symbols": [{"name": "ItemStore"}, {"name": "save"}],
+            },
+        })
+
+        result = implementation_closure(
+            self.repo,
+            "save edited item",
+            [api],
+            root_symbols={api: ["update_item"]},
+        )
+
+        self.assertEqual(result.required_symbols[store], ["save"])
+
+    def test_rooted_closure_does_not_guess_ambiguous_generic_owner(self) -> None:
+        api = self.write("api.py", "def update_item():\n    backend.save()\n")
+        first = self.write("first_store.py", "def save():\n    return 1\n")
+        second = self.write("second_store.py", "def save():\n    return 2\n")
+        self.map({
+            "api.py": {"dependencies": [], "symbols": [{"name": "update_item"}]},
+            "first_store.py": {"dependencies": [], "symbols": [{"name": "save"}]},
+            "second_store.py": {"dependencies": [], "symbols": [{"name": "save"}]},
+        })
+
+        result = implementation_closure(
+            self.repo,
+            "save edited item",
+            [api],
+            root_symbols={api: ["update_item"]},
+        )
+
+        self.assertNotIn(first, result.files)
+        self.assertNotIn(second, result.files)
+
     def test_semantic_hint_promotes_only_the_exact_same_file_symbol(self) -> None:
         service = self.write("world_service.py", "def drop_item(): pass\ndef take_loose_item(): pass\ndef create_room(): pass\n")
         self.map({"world_service.py": {"dependencies": [], "symbols": [

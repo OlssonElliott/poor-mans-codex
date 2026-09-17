@@ -1342,6 +1342,37 @@ class ApplyFlowTests(unittest.TestCase):
         self.assertIn("SYMBOL CONTEXT: commands.py::alternative_suggestion", context)
         self.assertIn("return f'Visible item ({1} nearby)'", context)
 
+    def test_followup_keeps_previous_patch_path_as_explicit_evidence(self) -> None:
+        history = self.root / "followup-history"
+        (history / "before").mkdir(parents=True)
+        (history / "after").mkdir(parents=True)
+        (history / "before" / "app.py").write_text(
+            "value = 0\n",
+            encoding="utf-8",
+        )
+        (history / "after" / "app.py").write_text(
+            "value = 1\n",
+            encoding="utf-8",
+        )
+        self.source.write_text(
+            "value = 1\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        context = build_followup_context(
+            self.repo,
+            ApplyResult({"app.py"}, history),
+            TestValidation(None, None, self.result(), "passed"),
+            "The problem is still visible at runtime.",
+            "Changed app.py",
+            original_task="fix unrelated runtime behavior",
+            persist_state=False,
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("app.py", context)
+        self.assertIn("value = 1", context)
+
     def test_followup_command_regenerates_from_current_source_and_saved_history(self) -> None:
         history = self.root / "history"
         (history / "before").mkdir(parents=True)

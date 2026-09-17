@@ -213,6 +213,13 @@ def parse_unified_diff(text: str) -> UnifiedDiff:
                     header,
                 )
 
+            if not any(line.kind in {"+", "-"} for line in body):
+                raise UnifiedDiffError(
+                    "hunk contains no changes",
+                    source_line,
+                    "\n".join([header, *(line.kind + line.text for line in body)]),
+                )
+
             hunks.append(Hunk(
                 old_start=old_start,
                 old_count=old_count,

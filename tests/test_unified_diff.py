@@ -39,6 +39,25 @@ class UnifiedDiffTests(unittest.TestCase):
         with self.assertRaisesRegex(UnifiedDiffError, "hunk header"):
             parse_unified_diff(patch)
 
+    def test_context_only_hunk_is_rejected_before_git(self) -> None:
+        patch = (
+            "--- a/rpg_bot/commands/world.py\n"
+            "+++ b/rpg_bot/commands/world.py\n"
+            "@@ -229,6 +229,7 @@\n"
+            "     async def inventory_item_autocomplete(\n"
+            "         self, interaction: discord.Interaction, current: str\n"
+            "     ) -> list[app_commands.Choice[str]]:\n"
+            "         \"\"\"Suggest droppable items.\"\"\"\n"
+            "         try:\n"
+            "             character_id = self._active_character_id(interaction.user.id)\n"
+            "         except CharacterNotFoundError:\n"
+            "             return []\n"
+            " \n"
+            "         inventory = self.database.get_character_inventory(character_id)\n"
+        )
+        with self.assertRaisesRegex(UnifiedDiffError, "hunk contains no changes"):
+            canonicalize_unified_diff(patch)
+
     def test_no_newline_metadata_does_not_affect_counts(self) -> None:
         patch = (
             "--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n"

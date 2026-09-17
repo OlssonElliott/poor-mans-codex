@@ -24,6 +24,9 @@ MAX_COMPLETENESS_RESOLVED = 3
 MAX_EXPLICIT_TARGETS = 8
 MAX_SEMANTIC_HINTS = 12
 MAX_CLOSURE_FILES = 8
+MAX_ROOTED_CLOSURE_DEPTH = 3
+MAX_ROOTED_CLOSURE_FILES = 12
+MAX_ROOTED_CLOSURE_SYMBOLS = 24
 MAX_TASK_SURFACES = 4
 # A surface can have a small set of equally strong concrete definitions (for
 # example renderer, view, presenter, and autocomplete). Keep this bounded,
@@ -481,10 +484,248 @@ def resolve_semantic_hints(repo: Path, hints: list[str]) -> RetrievalResult:
     return RetrievalResult(paths, reasons, paths.copy(), required)
 
 
-def implementation_closure(
-    repo: Path, task: str, seeds: list[Path], focus_symbols: set[str] | None = None,
+def _indexed_definition_owners(
+    index: dict,
+) -> dict[str, list[tuple[str, str]]]:
+    """Map callable/class names to concrete indexed definition owners."""
+    owners: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for relative, entry in index.items():
+        if not isinstance(entry, dict):
+            continue
+        for symbol in entry.get("symbols", []):
+            if not isinstance(symbol, dict) or not symbol.get("name"):
+                continue
+            name = str(symbol["name"])
+            definition = str(symbol.get("definition_name") or name)
+            owner = (relative, definition)
+            for lookup in {name.casefold(), definition.casefold()}:
+                if owner not in owners[lookup]:
+                    owners[lookup].append(owner)
+    return owners
+
+
+def _fresh_python_definitions(
+    path: Path,
+) -> list[tuple[str, str | None]]:
+    """Return current top-level functions/classes and direct class methods."""
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, SyntaxError):
+        return []
+    definitions: list[tuple[str, str | None]] = []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            definitions.append((node.name, None))
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for member in node.body:
+            if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                definitions.append((member.name, node.name))
+    return definitions
+
+
+def _fresh_python_call_edges(
+    path: Path,
+    symbol: str,
+) -> tuple[str | None, list[tuple[str, str]]] | None:
+    """Return direct call names for one unambiguous current Python definition."""
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, SyntaxError):
+        return None
+    matches: list[tuple[ast.AST, str | None]] = []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == symbol:
+            matches.append((node, None))
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for member in node.body:
+            if (
+                isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and member.name == symbol
+            ):
+                matches.append((member, node.name))
+    if len(matches) != 1:
+        return None
+    node, class_name = matches[0]
+    calls: list[tuple[str, str]] = []
+    for call in sorted(
+        (item for item in ast.walk(node) if isinstance(item, ast.Call)),
+        key=lambda item: (item.lineno, item.col_offset),
+    ):
+        if isinstance(call.func, ast.Attribute):
+            receiver = call.func.value
+            root = receiver
+            while isinstance(root, ast.Attribute):
+                root = root.value
+            if isinstance(receiver, ast.Name) and receiver.id in {"self", "cls"}:
+                receiver_kind = "self"
+            elif isinstance(root, ast.Name) and root.id in {"self", "cls"}:
+                receiver_kind = "member"
+            else:
+                receiver_kind = "qualified"
+            calls.append((call.func.attr, receiver_kind))
+        elif isinstance(call.func, ast.Name):
+            calls.append((call.func.id, "bare"))
+    for decorator in getattr(node, "decorator_list", []):
+        for call in (
+            item for item in ast.walk(decorator) if isinstance(item, ast.Call)
+        ):
+            calls.extend(
+                (keyword.value.id, "bare")
+                for keyword in call.keywords
+                if isinstance(keyword.value, ast.Name)
+            )
+    return class_name, list(dict.fromkeys(calls))
+
+
+def _root_definition_name(
+    index: dict,
+    relative: str,
+    symbol: str,
+) -> str:
+    """Translate aliases such as command names to their real definition name."""
+    entry = index.get(relative, {})
+    for candidate in entry.get("symbols", []) if isinstance(entry, dict) else []:
+        if not isinstance(candidate, dict):
+            continue
+        names = {
+            str(candidate.get("name", "")).casefold(),
+            str(candidate.get("qualified_name", "")).casefold(),
+        }
+        if symbol.casefold() in names:
+            return str(candidate.get("definition_name") or candidate.get("name") or symbol)
+    return symbol
+
+
+def _rooted_implementation_closure(
+    repo: Path,
+    root_symbols: dict[Path, list[str]],
 ) -> RetrievalResult:
-    """Follow task-related project calls from selected tests/call sites, twice."""
+    """Follow concrete project-local calls from already accepted task roots.
+
+    Generic names such as get/save/load/update are allowed when their owner can
+    be resolved structurally. Ambiguous calls are deliberately not expanded.
+    """
+    index = load_map(repo).get("files", {})
+    owners = _indexed_definition_owners(index)
+    frontier: list[tuple[Path, str, int]] = []
+    root_keys: set[tuple[Path, str]] = set()
+    for path, symbols in root_symbols.items():
+        if not path.is_file():
+            continue
+        try:
+            relative = path.relative_to(repo).as_posix()
+        except ValueError:
+            continue
+        for symbol in symbols:
+            definition = _root_definition_name(index, relative, symbol)
+            key = (path, definition)
+            if key in root_keys:
+                continue
+            root_keys.add(key)
+            frontier.append((path, definition, 0))
+
+    files: list[Path] = []
+    reasons: dict[Path, list[str]] = defaultdict(list)
+    required: dict[Path, list[str]] = defaultdict(list)
+    expanded: set[tuple[Path, str]] = set()
+    discovered: set[tuple[Path, str]] = set()
+
+    def resolve_owner(
+        source_path: Path,
+        class_name: str | None,
+        called: str,
+        receiver_kind: str,
+    ) -> tuple[Path, str] | None:
+        same_file = [
+            (source_path, name)
+            for name, owner_class in _fresh_python_definitions(source_path)
+            if name == called
+            and (
+                receiver_kind == "bare"
+                or (
+                    receiver_kind == "self"
+                    and class_name is not None
+                    and owner_class == class_name
+                )
+            )
+        ]
+        if len(same_file) == 1:
+            return same_file[0]
+        if receiver_kind == "self":
+            return None
+        try:
+            relative = source_path.relative_to(repo).as_posix()
+        except ValueError:
+            return None
+        dependencies = {
+            str(value)
+            for value in index.get(relative, {}).get("dependencies", [])
+            if isinstance(value, str)
+        }
+        indexed = list(dict.fromkeys(owners.get(called.casefold(), [])))
+        direct = [owner for owner in indexed if owner[0] in dependencies]
+        if len(direct) == 1:
+            return repo / direct[0][0], direct[0][1]
+        if receiver_kind in {"bare", "member"} and len(indexed) == 1:
+            return repo / indexed[0][0], indexed[0][1]
+        return None
+
+    while frontier and len(discovered) < MAX_ROOTED_CLOSURE_SYMBOLS:
+        path, symbol, depth = frontier.pop(0)
+        key = (path, symbol)
+        if key in expanded or depth >= MAX_ROOTED_CLOSURE_DEPTH:
+            continue
+        expanded.add(key)
+        call_data = _fresh_python_call_edges(path, symbol)
+        if call_data is None:
+            continue
+        class_name, calls = call_data
+        for called, receiver_kind in calls:
+            owner = resolve_owner(path, class_name, called, receiver_kind)
+            if owner is None or owner in root_keys or owner in discovered:
+                continue
+            owner_path, definition = owner
+            if not owner_path.is_file():
+                continue
+            if owner_path not in files and len(files) >= MAX_ROOTED_CLOSURE_FILES:
+                continue
+            discovered.add(owner)
+            if owner_path not in files:
+                files.append(owner_path)
+            if definition not in required[owner_path]:
+                required[owner_path].append(definition)
+            label = (
+                f"structural implementation from "
+                f"{path.relative_to(repo).as_posix()}::{symbol}: {called}()"
+            )
+            if label not in reasons[owner_path]:
+                reasons[owner_path].append(label)
+            frontier.append((owner_path, definition, depth + 1))
+            if len(discovered) >= MAX_ROOTED_CLOSURE_SYMBOLS:
+                break
+
+    return RetrievalResult(
+        files,
+        dict(reasons),
+        files.copy(),
+        dict(required),
+    )
+
+
+def implementation_closure(
+    repo: Path,
+    task: str,
+    seeds: list[Path],
+    focus_symbols: set[str] | None = None,
+    root_symbols: dict[Path, list[str]] | None = None,
+) -> RetrievalResult:
+    """Follow implementation calls using exact roots when they are available."""
+    if root_symbols:
+        return _rooted_implementation_closure(repo, root_symbols)
+
+    # Compatibility path for callers that only have coarse seed files.
     index = load_map(repo).get("files", {})
     owners: dict[str, set[str]] = defaultdict(set)
     for relative, entry in index.items():
