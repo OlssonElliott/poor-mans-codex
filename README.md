@@ -1,291 +1,841 @@
 # Poor Man's Codex
 
-A lightweight local Codex-style workflow that connects ChatGPT with your local Git repositories.
+A local, patch-based coding workflow that lets ChatGPT work against the **current state of a local Git repository** without giving ChatGPT direct filesystem access and without using the OpenAI API.
 
-The installed CLI command is `chatcode`.
+The installed CLI command is:
 
-ChatCode does not use the OpenAI API. Instead, it packages relevant repository context into a file you upload to ChatGPT. ChatGPT returns a unified Git patch, and ChatCode validates, applies, tests, stores and reviews that patch locally.
+```bash
+chatcode
+```
 
-## Features
+ChatCode builds a task-specific context from your repository, uses a local Qwen model through Ollama to improve retrieval when AI indexing is enabled, packages the exact source ChatGPT needs into `UPLOAD_TO_CHATGPT.md`, and then safely consumes the unified diff ChatGPT returns.
 
-- Builds task-specific context from the current Git repository
-- Maintains a persistent, incrementally updated project graph
-- Includes local staged and unstaged changes
-- Filters common secret files and redacts common secret patterns
-- Applies unified diffs with `git apply`
-- Runs project tests automatically when a supported test setup is detected
-- Stores patch history with before and after snapshots
-- Can safely undo the latest ChatCode patch
-- Opens historical changes as side-by-side diffs in VS Code
-- Requires no OpenAI API key
+The core workflow is:
+
+```text
+local repository
+      │
+      ▼
+chatcode context "task"
+      │
+      ├── static project index
+      ├── optional local Qwen semantic index
+      ├── task/retrieval analysis
+      ├── dependency + implementation expansion
+      └── source/context contract
+      │
+      ▼
+UPLOAD_TO_CHATGPT.md
+      │
+      ▼
+ChatGPT
+      │
+      ▼
+unified diff
+      │
+      ▼
+patches/incoming.diff
+      │
+      ▼
+chatcode apply
+      │
+      ├── patch validation
+      ├── review/confirmation
+      ├── pre-patch test baseline
+      ├── relevant tests
+      ├── full test suite
+      ├── regression comparison
+      ├── history
+      ├── repair context on failure
+      └── follow-up context if the user says the fix did not solve the problem
+```
+
+## What ChatCode is trying to solve
+
+Large language models are usually good at modifying code **when they receive the right code**.
+
+The difficult part is deciding:
+
+- which files matter,
+- which functions/classes inside those files matter,
+- which dependencies have to be included,
+- which backend/frontend/test surfaces belong to the same change,
+- and how to provide enough code to patch safely without sending the entire repository.
+
+ChatCode treats that context-building problem as a first-class part of the tool.
+
+It does not simply search for filenames and dump them into a prompt. It maintains a compact project index, combines deterministic structure with optional local semantic analysis, expands likely implementation relationships, and finally materializes exact current source from the working tree.
 
 ## Requirements
 
-- Python 3.11 or newer
+Required:
+
+- Python 3.11+
 - Git
 - ChatGPT
-- VS Code with the `code` command available in `PATH` for review support
+- the normal build/test tooling used by the repository you want to modify
 
-Your target project also needs its normal test tooling installed if you want ChatCode to run tests automatically.
+Recommended:
 
-## Installation
+- Ollama
+- Qwen 2.5 Coder
+- VS Code with the `code` command in `PATH` for side-by-side review
 
-Clone the repository:
+ChatCode can run in `static` mode without Ollama, but `ai` mode is the intended full retrieval workflow.
 
-git clone git@github.com:OlssonElliott/poor-mans-codex.git  
+No OpenAI API key is required.
+
+## Quick start
+
+### 1. Clone and install ChatCode
+
+Using HTTPS:
+
+```bash
+git clone https://github.com/OlssonElliott/poor-mans-codex.git
 cd poor-mans-codex
-
-Install it in editable mode.
+```
 
 Windows:
 
+```powershell
 py -m pip install -e .
+```
 
-macOS or Linux:
+macOS/Linux:
 
+```bash
 python3 -m pip install -e .
+```
 
-Verify the installation:
+Verify:
 
+```bash
 chatcode --help
+```
 
-The repository is named `poor-mans-codex`, but the CLI command is `chatcode`.
+### 2. Install Ollama and Qwen
 
-## Basic workflow
+Install Ollama from:
 
-Run ChatCode from inside the Git repository you want ChatGPT to work on.
+```text
+https://ollama.com/download
+```
 
-Create a task:
+Then pull the default lightweight model:
 
-chatcode patch-context "Add validation to the contact form"
+```bash
+ollama pull qwen2.5-coder:1.5b
+```
 
-ChatCode creates a repository-specific workspace and opens it automatically.
+If your hardware can comfortably run a larger model, you can configure another Qwen model instead.
 
-The two files you normally care about are:
+### 3. Configure AI indexing
 
-UPLOAD_TO_CHATGPT.md  
-patches/  
- incoming.diff
+From the `poor-mans-codex` directory:
 
-Upload `UPLOAD_TO_CHATGPT.md` to ChatGPT.
+Windows:
 
-The generated file contains the task, relevant source files, Git state and response instructions. ChatGPT should return one unified diff inside a single `diff` code block.
+```powershell
+Copy-Item .env.example .env
+```
 
-Copy the contents of that code block into:
+macOS/Linux:
 
+```bash
+cp .env.example .env
+```
+
+The default configuration is equivalent to:
+
+```env
+CHATCODE_INDEX_MODE=ai
+CHATCODE_QWEN_MODEL=qwen2.5-coder:1.5b
+CHATCODE_QWEN_ENABLED=true
+```
+
+`CHATCODE_INDEX_MODE=ai` enables local semantic indexing through Ollama.
+
+To disable model calls completely:
+
+```env
+CHATCODE_INDEX_MODE=static
+```
+
+### 4. Go to the project you want to modify
+
+ChatCode is run **inside the target Git repository**, not inside the ChatCode repository.
+
+Example:
+
+```bash
+cd C:\repos\my-project
+```
+
+### 5. Create context for a task
+
+```bash
+chatcode context "Players should be able to give items to another player after the receiver accepts the request"
+```
+
+ChatCode builds or updates the repository index, retrieves the relevant implementation surfaces and creates:
+
+```text
+UPLOAD_TO_CHATGPT.md
+```
+
+inside that repository's ChatCode workspace.
+
+The workspace directory is printed and opened automatically.
+
+### 6. Upload the generated file to ChatGPT
+
+Upload `UPLOAD_TO_CHATGPT.md` as-is.
+
+The file already contains:
+
+- the task,
+- current repository state,
+- selected source,
+- source line ranges,
+- patch instructions,
+- and the response format ChatCode expects.
+
+For code changes, ChatGPT should return one unified diff.
+
+### 7. Save the returned diff
+
+Put the returned patch into:
+
+```text
 patches/incoming.diff
+```
 
-Then run:
+You can paste either the raw unified diff or the complete outer Markdown `diff` code block. ChatCode strips a supported outer code fence automatically.
 
+### 8. Apply and validate
+
+```bash
 chatcode apply
+```
 
-ChatCode validates and applies the patch locally. It then runs tests when possible and asks:
+ChatCode first checks the patch without changing the repository. In the interactive flow you can review the full diff before confirming the apply.
 
-ChatCode: Do you want to review changes? (y/n):
+After the patch is applied, ChatCode runs relevant tests when it can safely identify them and then runs the full detected test suite.
 
-Enter `y` to open the exact before and after change as a side-by-side diff in VS Code.
+If validation passes, ChatCode asks whether the patch actually solved your problem.
 
-## Commands
+If you answer **no**, it asks what is still wrong and creates a fresh `FOLLOWUP_CONTEXT.md` against the new working-tree state.
 
-### `chatcode status`
+---
 
-Show the current repository and Git status.
+# Most useful commands
 
-chatcode status
+| Command | What it is for |
+|---|---|
+| `chatcode context "task"` | Normal workflow. Builds a rich task context including selected source, repository structure, Git state and available test information. |
+| `chatcode patch-context "task"` | Leaner patch-oriented context focused on exact current working-tree source. |
+| `chatcode apply` | Validate, preview, apply and test `patches/incoming.diff`. |
+| `chatcode check` | Run a standalone repository health check without first creating a coding task. |
+| `chatcode repair` | Re-open the current freshness-validated repair context after a failed patch/test flow. |
+| `chatcode followup` | Regenerate the latest unresolved follow-up context from the current repository state. |
+| `chatcode undo` | Safely reverse the latest ChatCode-applied patch. |
+| `chatcode review` | Open the latest ChatCode change as a before/after VS Code diff. |
+| `chatcode review 2` | Review another history entry by number. |
+| `chatcode history` | Show applied/undone ChatCode patch history. |
+| `chatcode test` | Run the detected project test suite directly. |
+| `chatcode status` | Show repository/branch status. |
+| `chatcode status --reindex` | Throw away the cached project index and rebuild it from source. |
 
-### `chatcode context`
+## `chatcode context`
 
-Generate a new ChatGPT context file for a task.
+```bash
+chatcode context "Describe the change you want"
+```
 
-chatcode context "Describe the task here"
+This is the most useful default command.
 
-Each new context clears `patches/incoming.diff` so an old patch is not accidentally reused.
+It includes more repository-level evidence than `patch-context`, including project structure, staged/unstaged Git state and the latest failed test output when available.
 
-### `chatcode patch-context`
+It also uses the same current-source materialization pipeline used for patch generation.
 
-Generate patch-oriented context from the exact current working-tree files:
+Each new context clears the default `incoming.diff` so an old patch cannot accidentally be reused for a new task.
 
-chatcode patch-context "Describe the code change here"
+## `chatcode patch-context`
 
-This is the preferred command when asking ChatGPT to produce a patch. Relevant files are read directly from disk; modified patch targets are preferentially included in full, while very large files use labeled, symbol-aware excerpts. Every included source file has a SHA-256 digest. Paths in the generated context use forward slashes.
+```bash
+chatcode patch-context "Describe the patch you want"
+```
 
-General `chatcode context` behavior remains available for analysis tasks.
+Use this when you want a smaller, explicitly patch-focused upload.
 
-Both context commands synchronize `project-map.json` in the target repository's
-ChatCode workspace. The compact index stores file hashes, summaries, tags,
-high-level symbols, imports and direct source dependencies. It is not written
-inside the target repository. Unchanged files are not reanalyzed, so edits made
-manually in an IDE are detected on the next context command without requiring
-`chatcode apply`.
+It still runs the retrieval/indexing pipeline and materializes exact current source, but avoids some of the extra repository context included by the normal `context` command.
 
-Python is analyzed with its standard AST. JavaScript/TypeScript and the other
-currently indexed code suffixes use a conservative structural fallback. File
-metadata ranking and shallow dependency expansion supplement the existing
-filename, content and Git-change ranking. Low-level calls and state accesses are
-not persisted.
+## `chatcode apply`
 
-ChatCode has two explicit indexing modes. `ai` uses compact Qwen metadata as the
-primary file selector and does not run the repository-wide legacy content
-ranker. `static` never invokes Ollama and uses deterministic path, symbol,
-import and content ranking. Both modes retain only lightweight hashes,
-languages, symbols, imports and direct dependencies in `project-map.json`.
-
-Select a mode in ChatCode's local `.env` (copy `.env.example`):
-
-$env:CHATCODE_QWEN_MODEL = "qwen2.5-coder:7b"  
-$env:CHATCODE_INDEX_MODE = "ai"  
-chatcode context "why does the door reopen?"
-
-An explicit `CHATCODE_INDEX_MODE` always wins. If it is omitted, the older
-`CHATCODE_QWEN_ENABLED` toggle remains supported; otherwise a configured
-`CHATCODE_QWEN_MODEL` selects AI mode and no model selects static mode.
-
-Before AI indexing starts, ChatCode invokes the configured model through the
-same prompt, structured-output and parser path used for real files. A failed
-preflight skips the semantic phase and uses static retrieval for that run. A
-circuit breaker also stops a run when at least four of its first five file
-analyses fail for the same reason. Completed semantic results remain cached.
-
-Qwen only returns a compact summary, tags and important symbol names; it never
-writes code or produces a relation graph. Missing Ollama, timeouts, model errors
-and malformed responses are classified while deterministic metadata remains
-available as a fallback.
-
-The deterministic map is saved before Qwen starts. Semantic state is cached per
-file using its source hash, model name and analyzer version, and each completed
-file is checkpointed atomically. Context generation shows semantic progress and
-an approximate ETA. If it is interrupted, rerunning the command resumes pending
-files without repeating completed work. `chatcode apply` updates the static map
-immediately and leaves semantic enrichment for the next context command.
-
-### `chatcode apply`
-
-Apply the default `patches/incoming.diff`.
-
+```bash
 chatcode apply
+```
 
-Apply a specific patch file:
+This is not a blind `git apply`.
 
-chatcode apply path/to/change.diff
+Before repository files are changed, ChatCode:
 
-Skip automatic tests:
+1. normalizes the returned unified diff,
+2. validates patch paths,
+3. blocks absolute paths, path traversal and `.git` modifications,
+4. validates hunk context,
+5. asks Git to parse the patch,
+6. checks whether the context became stale,
+7. runs `git apply --check`,
+8. creates a non-mutating preview.
 
-chatcode apply --no-test
+In the normal interactive workflow ChatCode then shows a summary, offers a full diff review and asks for confirmation before modifying the repository.
 
-Skip the review prompt:
+After applying, it runs test validation and compares the result against the pre-patch baseline.
 
-chatcode apply --no-review
+## `chatcode check`
 
-ChatCode also strips an outer Markdown `diff`, `patch` or unlabeled code fence from `incoming.diff` before applying it.
+```bash
+chatcode check
+```
 
-Before changing any file, `chatcode apply` parses the unified diff, recalculates hunk counts, serializes a canonical patch, asks Git to parse it with `git apply --numstat`, and then runs `git apply --check`. Only a patch that passes every stage is applied.
+Runs the project's detected test suite against the current working tree.
 
-Malformed syntax, stale context, and valid patches that do not match the working tree are reported as separate failure types. Each produces `PATCH_REPAIR_CONTEXT.md` with failure-specific diagnostics and exact current working-tree context. A failed validation never partially applies the patch, and ChatCode never uses `git apply --reject`.
+If stable failing test IDs are available, ChatCode can create a focused `CHECK_REPAIR_CONTEXT.md` for selected failures.
 
-### `chatcode test`
+This is useful when the repository is already broken before you start a new ChatCode task.
 
-Run the detected project test suite manually.
+## `chatcode repair`
 
-chatcode test
+```bash
+chatcode repair
+```
 
-ChatCode currently detects test setups for:
+When a patch introduces a regression or a repair attempt still fails its target tests, ChatCode creates a repair context containing:
 
-- npm, pnpm, Yarn and Bun
+- the original task,
+- the unsuccessful patch,
+- failing test information,
+- exact current working-tree source,
+- and explicit repair targets.
+
+`chatcode repair` only exposes that context if its working-tree assumptions are still fresh.
+
+## `chatcode followup`
+
+A patch can be technically correct and have green tests while still not solving the real problem.
+
+After a successful apply ChatCode asks:
+
+```text
+Did the patch solve your problem? [Y/n]
+```
+
+If you answer no, ChatCode asks for runtime/user feedback and builds `FOLLOWUP_CONTEXT.md` against the **new** repository state.
+
+You can later regenerate the unresolved follow-up with:
+
+```bash
+chatcode followup
+```
+
+## `chatcode undo`
+
+```bash
+chatcode undo
+```
+
+Reverses the latest ChatCode patch using stored history.
+
+The reversal is verified rather than forced. ChatCode does not use destructive recovery commands such as `git reset --hard`.
+
+## `chatcode review`
+
+```bash
+chatcode review
+```
+
+Opens the latest stored before/after snapshots in VS Code.
+
+To review an older entry:
+
+```bash
+chatcode review 2
+```
+
+Because history stores snapshots, review does not depend on what the working tree looks like later.
+
+---
+
+# How retrieval works
+
+ChatCode uses multiple retrieval layers rather than trusting one ranking method.
+
+## 1. Persistent static project index
+
+Indexable source types are currently:
+
+```text
+.py
+.js
+.jsx
+.ts
+.tsx
+.java
+.kt
+.php
+```
+
+Each indexed file receives a SHA-256 source hash and compact structural metadata.
+
+Python uses the standard Python AST and records high-level definitions such as:
+
+- classes,
+- functions,
+- methods,
+- command handlers,
+- qualified symbol names,
+- imports.
+
+Other supported source types use a conservative generic structural parser for top-level symbols and JavaScript/TypeScript-style imports.
+
+Direct file dependencies are resolved from imports where possible.
+
+The index is stored as:
+
+```text
+project-map.json
+```
+
+inside ChatCode's per-repository workspace, not inside the target repository.
+
+Unchanged files are reused by hash instead of being re-analyzed every run.
+
+## 2. Optional local Qwen semantic metadata
+
+In `ai` mode, eligible source files are also analyzed locally through Ollama.
+
+Qwen is **not** asked to rewrite the repository or invent a dependency graph.
+
+For each eligible file it returns only compact metadata:
+
+```json
+{
+  "summary": "...",
+  "tags": ["..."],
+  "important_symbols": ["..."]
+}
+```
+
+The allowed `important_symbols` are restricted back to symbols ChatCode already found statically.
+
+Semantic results are cached by:
+
+- source hash,
+- model name,
+- analyzer version.
+
+The deterministic project map is saved before slow model calls begin, and completed semantic files are checkpointed as they finish.
+
+If indexing is interrupted, a later run can resume pending semantic work.
+
+If Ollama/model preflight fails, ChatCode falls back to static retrieval for that run.
+
+## 3. Task-level retrieval
+
+When you run:
+
+```bash
+chatcode context "some task"
+```
+
+ChatCode combines several signals.
+
+### Explicit targets
+
+Code-shaped references in the task are resolved first when possible, such as:
+
+```text
+DashboardAPI
+some_function()
+/discord-command
+```
+
+### Task surfaces
+
+Broader tasks are split into requirement-like surfaces so a multi-layer request does not collapse into one high-scoring file.
+
+This matters for tasks that span areas such as:
+
+```text
+backend + API + frontend + tests
+```
+
+### Indexed ranking
+
+Paths, symbols, imports and optional Qwen semantic metadata are scored against the task.
+
+Initial matches can pull in shallow indexed dependencies.
+
+### Qwen task hints
+
+In AI mode, Qwen gets a bounded vocabulary of **real indexed symbol IDs** and maps the natural-language task to likely existing symbols.
+
+Qwen is not trusted to invent arbitrary repository paths here.
+
+Returned hints are accepted only when they map back to supplied candidates.
+
+### Structural expansion
+
+ChatCode then expands the selected roots with deterministic relationships such as:
+
+- transport/dispatcher roots,
+- implementation calls,
+- direct call-site/test relationships,
+- selected-file dependencies.
+
+A bounded completeness pass can ask Qwen whether an already-known candidate appears to be missing.
+
+## 4. Source coverage
+
+Finding the correct file is not enough.
+
+A large file may contain many unrelated definitions, while the actual patch requires only a few specific handlers/helpers.
+
+For broader tasks, `source_coverage` ranks concrete definitions inside the files retrieval already selected.
+
+This stage does not perform open-ended project discovery. It asks:
+
+> Inside the files we already trust as relevant, which definitions are needed to cover the requested layers?
+
+## 5. Context contract
+
+The context contract is stricter than ordinary retrieval.
+
+It separates context into concepts such as:
+
+- mandatory patch source,
+- high-priority supporting source,
+- ordinary support.
+
+For complex tasks it tries to identify complete structural owners rather than isolated keyword matches.
+
+Examples include:
+
+- backend transport/dispatch handlers,
+- related serializers/helpers,
+- major UI owners,
+- representative API tests,
+- the correct test fixture/setup.
+
+Python methods can be materialized with qualified locators such as:
+
+```text
+DashboardAPI._handle
+DashboardAPITests.setUp
+```
+
+This prevents an unrelated method with the same short name from being selected accidentally.
+
+If required source cannot be materialized safely, the generated context is marked incomplete instead of silently pretending enough code was provided.
+
+## 6. Exact current-source materialization
+
+The final code sent to ChatGPT is re-read from the current working tree.
+
+Depending on file size and the contract, ChatCode emits source as:
+
+```text
+FULL FILE
+SYMBOL CONTEXT
+EXCERPT
+```
+
+Source sections include current line ranges and hashes where applicable.
+
+This means the final patch context is based on what is actually on disk now, including relevant uncommitted work, rather than reconstructing an old version from the index.
+
+---
+
+# Apply and validation model
+
+The model generates a patch, but ChatCode remains the local execution layer.
+
+## Before apply
+
+The candidate diff is parsed and canonicalized.
+
+ChatCode validates:
+
+- repository-relative paths,
+- no `..` traversal,
+- no absolute paths,
+- no `.git` modification,
+- sufficient hunk context,
+- current-context freshness,
+- Git applicability.
+
+No repository mutation occurs if these checks fail.
+
+## Baseline
+
+Before mutation, ChatCode captures the current repository state and runs or reuses a verified pre-patch full test baseline.
+
+This matters because a red test after the patch is not automatically a regression if it was already failing before the patch.
+
+## After apply
+
+ChatCode tries to run a narrow relevant Python test selection first when it can map changed source to tests safely.
+
+The full detected test suite then remains the main validation gate.
+
+Post-patch failures are classified relative to the baseline as:
+
+- new regressions,
+- pre-existing failures,
+- unresolved repair targets,
+- unclear/infrastructure failures.
+
+The resulting patch and before/after snapshots are stored in ChatCode history.
+
+---
+
+# Test detection
+
+ChatCode currently detects common test setups for:
+
+- npm / pnpm / Yarn / Bun projects
 - Maven
 - Gradle
-- pytest
+- Python (`pytest` or `unittest`)
 - Composer
 
-If no supported test command is found, ChatCode reports that tests could not be run automatically.
+If no supported test command can be identified, ChatCode reports that automated tests are unavailable instead of inventing a command.
 
-### `chatcode undo`
+Your project's normal dependencies/toolchain still need to be installed locally.
 
-Reverse the latest patch applied by ChatCode.
+---
 
-chatcode undo
+# Indexing modes
 
-Undo without running tests afterwards:
+## AI mode
 
-chatcode undo --no-test
+```env
+CHATCODE_INDEX_MODE=ai
+CHATCODE_QWEN_MODEL=qwen2.5-coder:1.5b
+```
 
-Undo uses the stored patch and refuses to force a reversal when the current files no longer match safely.
+Uses deterministic structure plus local Qwen metadata and task-level semantic hints.
 
-### `chatcode history`
+Best choice for normal use.
 
-Show ChatCode patch history.
+## Static mode
 
-chatcode history
+```env
+CHATCODE_INDEX_MODE=static
+```
 
-History records whether an entry is applied or undone, the affected files and available test status.
+Never invokes Ollama.
 
-### `chatcode review`
+Uses paths, symbols, imports, deterministic content/structure and dependency expansion.
 
-Review the latest ChatCode history entry in VS Code:
+Useful when:
 
-chatcode review
+- Ollama is unavailable,
+- you want the fastest deterministic run,
+- you are debugging retrieval without semantic assistance.
 
-Review another history entry by number:
+## Rebuilding the index
 
-chatcode review 2
+Normally the index updates incrementally.
 
-New history entries include before and after snapshots, so review shows the exact change ChatCode applied even if the working tree later changes.
+To force a clean rebuild:
 
-## Workspace
+```bash
+chatcode status --reindex
+```
 
-Generated files are stored under ChatCode's own `workspace` directory rather than inside the repository being edited.
+This is useful after major indexing changes or when debugging an old/stale map.
 
-A workspace looks roughly like this:
+---
 
-workspace/  
- my-project/  
- \_<repo-hash>/  
- UPLOAD_TO_CHATGPT.md  
- patches/  
- incoming.diff  
- test-results/  
- latest.md  
- history/  
- applied/  
- undone/
+# First run can take longer
 
-`UPLOAD_TO_CHATGPT.md` is the request you upload to ChatGPT.
+The first AI-mode run against a larger repository can take significantly longer because Qwen may need to semantically analyze many eligible files.
 
-`patches/incoming.diff` is where you paste the patch returned by ChatGPT.
+Later runs are much faster when files have not changed because semantic results are reused from cache.
 
-`test-results/latest.md` contains the latest detected test run.
+Progress is checkpointed file by file.
 
-`history/` stores applied and undone ChatCode changes.
+If you interrupt semantic indexing, rerun the same context command and ChatCode can continue pending work instead of starting the completed semantic work from zero.
 
-## Safety
+---
 
-ChatCode performs several checks before generated changes are applied.
+# Workspace layout
 
-It validates patch paths, prevents patches from modifying `.git`, checks patches with `git apply --check`, and uses reversible Git patches instead of destructive commands such as `git reset --hard`.
+ChatCode keeps generated state outside the target repository in its own workspace.
 
-Context generation ignores common secret files such as `.env`, credential files and private keys. It also redacts several common token, password and secret patterns from source context, Git diffs and test output.
+A repository workspace looks roughly like:
 
-Secret detection is best-effort and is not a guarantee. Review generated context before uploading it if a repository contains sensitive information.
+```text
+workspace/
+└── my-project/
+    └── _<repo-hash>/
+        ├── UPLOAD_TO_CHATGPT.md
+        ├── project-map.json
+        ├── patches/
+        │   └── incoming.diff
+        ├── test-results/
+        │   ├── latest.md
+        │   ├── baseline.md
+        │   ├── targeted.md
+        │   └── full-suite.md
+        ├── history/
+        │   ├── applied/
+        │   └── undone/
+        ├── PATCH_REPAIR_CONTEXT.md
+        ├── CHECK_REPAIR_CONTEXT.md
+        ├── FOLLOWUP_CONTEXT.md
+        └── followup-state.json
+```
 
-## How the ChatGPT bridge works
+Not every file exists at all times.
 
-ChatCode itself contains no AI model and does not automate the ChatGPT interface.
+The workspace path contains a hash of the absolute repository path, so repositories with the same directory name can still receive separate ChatCode state.
 
-The workflow is deliberately simple:
+---
 
-local repository  
-↓  
-chatcode context  
-↓  
-UPLOAD_TO_CHATGPT.md  
-↓  
-ChatGPT  
-↓  
-incoming.diff  
-↓  
-chatcode apply  
-├── tests  
-├── history  
-├── review  
-└── undo
+# Safety and trust boundaries
 
-This keeps your local Git repository under your control while still allowing ChatGPT to work with local, unpushed and uncommitted code.
+ChatCode is designed so that ChatGPT produces a patch while local code performs the actual repository operations.
+
+Current safeguards include:
+
+- ignored secret files/directories,
+- best-effort redaction of common secret/token/password patterns,
+- repository-relative patch path validation,
+- `.git` protection,
+- hunk/context validation,
+- stale-context detection,
+- `git apply --check`,
+- explicit interactive review/confirmation,
+- pre-patch test baseline,
+- post-patch targeted/full tests,
+- reversible patch history.
+
+Secret detection is **best effort**, not a proof that an export contains no sensitive information.
+
+Review `UPLOAD_TO_CHATGPT.md` before uploading it when working with sensitive repositories.
+
+Likewise, patch applicability and green tests establish technical correctness better than authority. The current implementation does not yet enforce a strict capability policy that limits every patch hunk to only the exact paths/source regions exported to the model.
+
+Treat repository content and model output as untrusted inputs and review important changes before keeping them.
+
+---
+
+# Troubleshooting
+
+## Qwen/Ollama is unavailable
+
+Check:
+
+```bash
+ollama --version
+ollama list
+```
+
+Make sure the configured model exists:
+
+```bash
+ollama pull qwen2.5-coder:1.5b
+```
+
+If AI preflight fails, ChatCode should continue with static retrieval for that run.
+
+## Initial indexing is taking a long time
+
+This is expected on the first AI-mode pass over a larger repository.
+
+Completed semantic analysis is cached and checkpointed, so later runs should reuse unchanged files.
+
+For debugging or a fast deterministic run:
+
+```env
+CHATCODE_INDEX_MODE=static
+```
+
+## Retrieval looks stale or strange
+
+Force a clean project-map rebuild:
+
+```bash
+chatcode status --reindex
+```
+
+Then regenerate the context.
+
+## Patch does not apply
+
+Run:
+
+```bash
+chatcode apply
+```
+
+A syntax/applicability/stale-context failure creates a repair context with current working-tree information rather than partially applying the patch.
+
+Upload the generated repair context to ChatGPT and use the instructions ChatCode prints.
+
+## Tests fail after apply
+
+ChatCode compares the post-patch failures against the pre-patch baseline.
+
+For a new regression it creates `PATCH_REPAIR_CONTEXT.md`.
+
+Use:
+
+```bash
+chatcode repair
+```
+
+to expose the latest valid repair context again.
+
+## Tests pass but the feature is still wrong
+
+Answer `n` when ChatCode asks:
+
+```text
+Did the patch solve your problem? [Y/n]
+```
+
+Describe what is still wrong.
+
+ChatCode creates `FOLLOWUP_CONTEXT.md` against the current source, including the fact that the previous patch applied and validation passed.
+
+---
+
+# Design principles
+
+ChatCode intentionally keeps the responsibilities separate:
+
+```text
+Qwen:
+semantic hints and compact retrieval metadata
+
+ChatGPT:
+reason about supplied code and produce a unified diff
+
+ChatCode:
+index, retrieve, materialize current source, validate, apply, test,
+review, track history, repair and follow up
+
+Git:
+final patch applicability and repository state
+```
+
+The goal is not to make a local model write the whole patch.
+
+The goal is to make sure the stronger patch-generating model receives the **smallest useful context that is still complete enough to make a correct change**.
+
+That is the core idea behind Poor Man's Codex.
