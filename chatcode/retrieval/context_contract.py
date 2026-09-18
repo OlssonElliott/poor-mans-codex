@@ -7,6 +7,7 @@ already selected. It does not invent paths and performs no model calls.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -99,6 +100,36 @@ TEST_ACTION_TERMS = {
     "api",
     "room",
 }
+
+STRUCTURAL_OWNER_SCORE = 10_000
+STRUCTURAL_OWNER_ROLES = frozenset({"transport", "ui", "tests"})
+TRANSPORT_CORE_OWNER_ORDER = (
+    "handle",
+    "_handle",
+    "dispatch",
+    "_dispatch",
+    "route",
+    "_route",
+)
+TRANSPORT_HTTP_OWNER_ORDER = (
+    "do_get",
+    "do_post",
+    "do_put",
+    "do_patch",
+    "do_delete",
+    "do_options",
+)
+TRANSPORT_SERIALIZER_ORDER = (
+    "_node_data",
+    "node_data",
+    "_graph_data",
+    "graph_data",
+    "serialize",
+    "_serialize",
+)
+MAX_STRUCTURAL_UI_OWNERS = 4
+MAX_STRUCTURAL_TEST_METHODS = 3
+MAX_STRUCTURAL_TEST_SUITE_LINES = 1200
 
 
 @dataclass
@@ -267,20 +298,228 @@ def _owner_surface_score(
     return -1_000
 
 
+def _mentions_symbol(text: str, symbol: str) -> bool:
+    if not symbol:
+        return False
+    return re.search(
+        rf"(?<![A-Za-z0-9_$]){re.escape(symbol)}(?![A-Za-z0-9_$])",
+        text,
+    ) is not None
+
+
+def _is_ui_owner(definition: DefinitionEvidence) -> bool:
+    if definition.kind not in {"function", "class"}:
+        return False
+    name_tokens = _tokens(definition.name)
+    return bool(
+        _matching_terms(UI_OWNER_TERMS, name_tokens)
+        or definition.name[:1].isupper()
+    )
+
+
+def _ui_owner_text(
+    definition: DefinitionEvidence,
+    definitions: list[DefinitionEvidence],
+) -> str:
+    """Rebuild a UI owner's evidence across nested local definitions.
+
+    Generic JS/TS evidence is split at every regex-recognized declaration,
+    including local arrow functions inside a component. Join those non-owner
+    fragments back onto the component so parent/child references remain
+    visible to structural owner resolution.
+    """
+    try:
+        start = definitions.index(definition)
+    except ValueError:
+        return definition.text
+
+    chunks = [definition.text]
+    for trailing in definitions[start + 1:]:
+        if _is_ui_owner(trailing):
+            break
+        chunks.append(trailing.text)
+    return "".join(chunks)
+
+
+def _structural_owner_candidates(
+    requirement: str,
+    owner_terms: set[str],
+    preferred_paths: set[Path],
+    anchor_symbols: dict[Path, list[str]],
+    evidence: list[tuple[Path, set[str], set[str], list[DefinitionEvidence]]],
+) -> tuple[list[tuple[str, int, DefinitionEvidence]], set[str]]:
+    """Resolve known patch owners without making them compete on relevance score.
+
+    Retrieval/scoring decides which files and anchors are relevant. Once a
+    selected file exposes a known architectural surface, structural rules own
+    the final mandatory-source decision.
+    """
+    roles = _requirement_roles(requirement)
+    selected: list[tuple[str, int, DefinitionEvidence]] = []
+    resolved_roles: set[str] = set()
+    seen: set[tuple[str, Path, str]] = set()
+
+    def add(role: str, definition: DefinitionEvidence) -> None:
+        key = (role, definition.path, definition.name)
+        if key in seen:
+            return
+        seen.add(key)
+        selected.append((role, STRUCTURAL_OWNER_SCORE, definition))
+
+    if "transport" in roles:
+        rows = [
+            row
+            for row in evidence
+            if row[0] in preferred_paths and "transport" in row[2]
+        ]
+        anchored = [row for row in rows if anchor_symbols.get(row[0])]
+        for path, _path_tokens, _file_roles, definitions in (anchored or rows)[:2]:
+            methods = {
+                definition.name.casefold(): definition
+                for definition in definitions
+                if definition.kind in {"function", "method"}
+            }
+            claimed_dispatch = False
+            for name in TRANSPORT_CORE_OWNER_ORDER:
+                definition = methods.get(name)
+                if definition is None:
+                    continue
+                add("transport", definition)
+                claimed_dispatch = True
+
+            if not claimed_dispatch:
+                for name in TRANSPORT_HTTP_OWNER_ORDER:
+                    definition = methods.get(name)
+                    if definition is None:
+                        continue
+                    add("transport", definition)
+                    claimed_dispatch = True
+
+            if not claimed_dispatch:
+                continue
+
+            # Serializers are part of the transport patch surface, not
+            # relevance competitors. Exact names keep this bounded and avoid
+            # promoting unrelated helpers such as *_template_data.
+            for name in TRANSPORT_SERIALIZER_ORDER:
+                definition = methods.get(name)
+                if definition is not None:
+                    add("transport", definition)
+            resolved_roles.add("transport")
+
+    if "ui" in roles:
+        rows = [
+            row
+            for row in evidence
+            if row[0] in preferred_paths and "ui" in row[2]
+        ]
+        for path, _path_tokens, _file_roles, definitions in rows:
+            anchors = {
+                symbol.casefold()
+                for symbol in anchor_symbols.get(path, [])
+            }
+            if not anchors:
+                continue
+            owners = [definition for definition in definitions if _is_ui_owner(definition)]
+            owner_text = {
+                definition: _ui_owner_text(definition, definitions)
+                for definition in owners
+            }
+            seeds = [
+                definition
+                for definition in owners
+                if definition.name.casefold() in anchors
+            ]
+            if not seeds:
+                continue
+
+            path_selected: list[DefinitionEvidence] = []
+            for definition in seeds:
+                if definition not in path_selected:
+                    path_selected.append(definition)
+
+            # One structural hop in both directions is enough to recover the
+            # common parent/child component pair without walking every dialog
+            # referenced by a large editor component.
+            for candidate in owners:
+                if candidate in path_selected:
+                    continue
+                if any(
+                    _mentions_symbol(owner_text[candidate], seed.name)
+                    or _mentions_symbol(owner_text[seed], candidate.name)
+                    for seed in seeds
+                ):
+                    path_selected.append(candidate)
+                if len(path_selected) >= MAX_STRUCTURAL_UI_OWNERS:
+                    break
+
+            for definition in path_selected[:MAX_STRUCTURAL_UI_OWNERS]:
+                add("ui", definition)
+            resolved_roles.add("ui")
+
+    if "tests" in roles:
+        for path, _path_tokens, file_roles, definitions in evidence:
+            if "tests" not in file_roles:
+                continue
+            matching_tests = [
+                definition
+                for definition in definitions
+                if (
+                    definition.kind in {"function", "method"}
+                    and definition.name.casefold().startswith("test")
+                    and (
+                        _matching_terms(owner_terms, _tokens(definition.name))
+                        or any(term in definition.text.casefold() for term in owner_terms)
+                    )
+                )
+            ][:MAX_STRUCTURAL_TEST_METHODS]
+            if not matching_tests:
+                continue
+
+            for definition in matching_tests:
+                add("tests", definition)
+
+            # Preserve the suite owner when it is reasonably bounded. This
+            # gives the patch model the class-level fixture/context needed to
+            # add sibling regression tests without forcing huge test classes
+            # into the hard contract.
+            for definition in definitions:
+                if (
+                    definition.kind == "class"
+                    and definition.line_count <= MAX_STRUCTURAL_TEST_SUITE_LINES
+                    and any(
+                        _mentions_symbol(definition.text, test.name)
+                        for test in matching_tests
+                    )
+                ):
+                    add("tests", definition)
+                    break
+            resolved_roles.add("tests")
+
+    return selected, resolved_roles
+
+
 def _owner_surface_candidates(
     requirement: str,
     requirement_terms: set[str],
     task_terms: set[str],
     preferred_paths: set[Path],
+    anchor_symbols: dict[Path, list[str]],
     evidence: list[tuple[Path, set[str], set[str], list[DefinitionEvidence]]],
 ) -> list[tuple[str, int, DefinitionEvidence]]:
     """Return bounded owners that must be patchable for this requirement."""
     roles = _requirement_roles(requirement)
     owner_terms = requirement_terms | task_terms
-    selected: list[tuple[str, int, DefinitionEvidence]] = []
+    selected, structurally_resolved = _structural_owner_candidates(
+        requirement,
+        owner_terms,
+        preferred_paths,
+        anchor_symbols,
+        evidence,
+    )
 
     for role in ("transport", "ui", "tests"):
-        if role not in roles:
+        if role not in roles or role in structurally_resolved:
             continue
         ranked: list[tuple[int, DefinitionEvidence]] = []
         for path, path_tokens, file_roles, definitions in evidence:
@@ -476,9 +715,18 @@ def plan_context_contract(
             kind_added = 0
             for score, definition in ranked:
                 key = (definition.path, definition.name)
-                accepted = key in selected_keys or add_required(
-                    definition.path, definition.name
-                )
+                if key in selected_keys:
+                    accepted = True
+                elif kind in STRUCTURAL_OWNER_ROLES:
+                    # Scoring identifies useful evidence for owner-managed
+                    # surfaces, but only structural owner resolution below may
+                    # hard-claim it as mandatory source.
+                    add_priority(definition.path, definition.name)
+                    accepted = True
+                else:
+                    accepted = add_required(
+                        definition.path, definition.name
+                    )
                 if not accepted:
                     continue
                 requirement_map.setdefault(definition.path, [])
@@ -507,11 +755,22 @@ def plan_context_contract(
             | set(existing_targets)
             | set(coverage_plan.symbols)
         )
+        owner_anchors: dict[Path, list[str]] = {}
+        for path in preferred_paths:
+            symbols = (
+                existing_targets.get(path)
+                or requirement_map.get(path)
+                or coverage_plan.symbols.get(path)
+                or []
+            )
+            if symbols:
+                owner_anchors[path] = list(dict.fromkeys(symbols))
         owner_candidates = _owner_surface_candidates(
             requirement,
             requirement_terms,
             task_terms,
             preferred_paths,
+            owner_anchors,
             evidence,
         )
         selected_test_paths: set[Path] = set()
@@ -527,9 +786,14 @@ def plan_context_contract(
                 requirement_map[definition.path].append(definition.name)
             if role == "tests":
                 selected_test_paths.add(definition.path)
+            owner_basis = (
+                "structural"
+                if score == STRUCTURAL_OWNER_SCORE
+                else f"score {score}"
+            )
             plan.diagnostics.append(
                 f"requirement owner {role}: {definition.path.name}::"
-                f"{definition.name} (score {score})"
+                f"{definition.name} ({owner_basis})"
             )
             if role == "ui":
                 owner_definitions = next(

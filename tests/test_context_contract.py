@@ -407,6 +407,156 @@ class ContextContractTests(unittest.TestCase):
             context,
         )
 
+    def test_structural_owner_resolution_beats_scoring_distractors(self) -> None:
+        api = self.write(
+            "rpg_bot/dashboard_api.py",
+            "def _container_template_data(value):\n"
+            "    return {'support_only': value}\n\n"
+            "def _node_data(room):\n"
+            "    return {'STRUCTURAL_NODE_SERIALIZER': room}\n\n"
+            "def _graph_data(graph):\n"
+            "    return {'STRUCTURAL_GRAPH_SERIALIZER': graph}\n\n"
+            "class DashboardAPI:\n"
+            "    def handle(self, method, path, body=None):\n"
+            "        marker = 'STRUCTURAL_HANDLE'\n"
+            "        return self._handle(method, path, body or {})\n\n"
+            "    def _handle(self, method, path, body):\n"
+            "        marker = 'STRUCTURAL_ROUTER'\n"
+            "        if path.startswith('/api/rooms/'):\n"
+            "            return 200, _node_data(body)\n"
+            "        return 200, _graph_data(body)\n\n"
+            "    def do_GET(self):\n"
+            "        return 'room feature dashboard api create update delete'\n\n"
+            "    def do_POST(self):\n"
+            "        return 'room feature dashboard api create update delete'\n\n"
+            "    def do_PATCH(self):\n"
+            "        return 'room feature dashboard api create update delete'\n\n"
+            "    def do_DELETE(self):\n"
+            "        return 'room feature dashboard api create update delete'\n",
+        )
+        editor = self.write(
+            "dashboard/app/dungeon-editor.tsx",
+            "function RoomFeatureDialog() {\n"
+            "  return <div>room feature create edit delete dashboard</div>;\n"
+            "}\n\n"
+            "function RoomFeaturePanel() {\n"
+            "  return <div>room feature list edit delete dashboard</div>;\n"
+            "}\n\n"
+            "export function DungeonEditor() {\n"
+            "  const marker = 'STRUCTURAL_DUNGEON_EDITOR';\n"
+            "  return <RoomInspector room={{ id: 'hall' }} />;\n"
+            "}\n\n"
+            "function RoomInspector({ room }: { room: { id: string } }) {\n"
+            "  const marker = 'STRUCTURAL_ROOM_INSPECTOR';\n"
+            "  return <section>{room.id}</section>;\n"
+            "}\n",
+        )
+        api_tests = self.write(
+            "tests/test_dashboard_api.py",
+            "import unittest\n\n"
+            "class DashboardAPITests(unittest.TestCase):\n"
+            "    def setUp(self):\n"
+            "        self.setup_marker = 'STRUCTURAL_API_SETUP'\n\n"
+            "    def test_room_feature_create_route(self):\n"
+            "        marker = 'STRUCTURAL_CREATE_TEST'\n"
+            "        self.assertIn('room', marker.lower())\n\n"
+            "    def test_room_feature_delete_route(self):\n"
+            "        marker = 'STRUCTURAL_DELETE_TEST'\n"
+            "        self.assertIn('room', marker.lower())\n\n"
+            "    def test_unrelated_portrait_route(self):\n"
+            "        self.assertTrue('portrait')\n",
+        )
+        files = [api, editor, api_tests]
+        save_map(self.repo, {"version": 3, "files": {
+            "rpg_bot/dashboard_api.py": {
+                "symbols": [
+                    {"name": "_container_template_data"},
+                    {"name": "_node_data"},
+                    {"name": "_graph_data"},
+                    {"name": "DashboardAPI"},
+                    {"name": "handle"},
+                    {"name": "_handle"},
+                    {"name": "do_GET"},
+                    {"name": "do_POST"},
+                    {"name": "do_PATCH"},
+                    {"name": "do_DELETE"},
+                ],
+                "dependencies": [],
+            },
+            "dashboard/app/dungeon-editor.tsx": {
+                "symbols": [
+                    {"name": "RoomFeatureDialog"},
+                    {"name": "RoomFeaturePanel"},
+                    {"name": "DungeonEditor"},
+                    {"name": "RoomInspector"},
+                ],
+                "dependencies": [],
+            },
+            "tests/test_dashboard_api.py": {
+                "symbols": [
+                    {"name": "DashboardAPITests"},
+                    {"name": "setUp"},
+                    {"name": "test_room_feature_create_route"},
+                    {"name": "test_room_feature_delete_route"},
+                    {"name": "test_unrelated_portrait_route"},
+                ],
+                "dependencies": [],
+            },
+        }})
+        retrieval_targets = {
+            api: ["_container_template_data"],
+            editor: ["RoomInspector"],
+        }
+
+        coverage = plan_source_coverage(
+            self.repo, ROOM_FEATURE_TASK, files, retrieval_targets
+        )
+        contract = plan_context_contract(
+            self.repo,
+            ROOM_FEATURE_TASK,
+            files,
+            retrieval_targets,
+            coverage,
+        )
+
+        self.assertIn("handle", contract.mandatory_symbols.get(api, []))
+        self.assertIn("_handle", contract.mandatory_symbols.get(api, []))
+        self.assertIn("_node_data", contract.mandatory_symbols.get(api, []))
+        self.assertIn("_graph_data", contract.mandatory_symbols.get(api, []))
+        self.assertIn("DungeonEditor", contract.mandatory_symbols.get(editor, []))
+        self.assertIn("RoomInspector", contract.mandatory_symbols.get(editor, []))
+        self.assertIn("DashboardAPITests", contract.mandatory_symbols.get(api_tests, []))
+        self.assertIn("setUp", contract.mandatory_symbols.get(api_tests, []))
+        self.assertIn(
+            "test_room_feature_create_route",
+            contract.mandatory_symbols.get(api_tests, []),
+        )
+        self.assertIn(
+            "test_room_feature_delete_route",
+            contract.mandatory_symbols.get(api_tests, []),
+        )
+
+        with patch(
+            "chatcode.context_builder.collect_relevant_files",
+            return_value=(files, retrieval_targets),
+        ):
+            output = build_context(self.repo, ROOM_FEATURE_TASK)
+
+        context = output.read_text(encoding="utf-8")
+        for marker in (
+            "STRUCTURAL_HANDLE",
+            "STRUCTURAL_ROUTER",
+            "STRUCTURAL_NODE_SERIALIZER",
+            "STRUCTURAL_GRAPH_SERIALIZER",
+            "STRUCTURAL_DUNGEON_EDITOR",
+            "STRUCTURAL_ROOM_INSPECTOR",
+            "STRUCTURAL_API_SETUP",
+            "STRUCTURAL_CREATE_TEST",
+            "STRUCTURAL_DELETE_TEST",
+        ):
+            self.assertIn(marker, context)
+        self.assertNotIn("===== CONTEXT CONTRACT INCOMPLETE =====", context)
+
     def test_priority_coverage_cannot_displace_mandatory_owner_bundle(self) -> None:
         api = self.write(
             "rpg_bot/dashboard_api.py",
