@@ -109,6 +109,9 @@ class ContextContractPlan:
     symbols: dict[Path, list[str]] = field(default_factory=dict)
     # Only requirement-owned source may veto publication.
     mandatory_symbols: dict[Path, list[str]] = field(default_factory=dict)
+    # High-priority coverage support renders before ordinary support, but does
+    # not participate in the publication veto.
+    priority_symbols: dict[Path, list[str]] = field(default_factory=dict)
     # Retrieval/coverage roots remain useful evidence but never veto publication.
     support_symbols: dict[Path, list[str]] = field(default_factory=dict)
     requirement_symbols: dict[str, dict[Path, list[str]]] = field(default_factory=dict)
@@ -216,8 +219,6 @@ def _owner_surface_score(
             score = 1_300
         elif lowered in TRANSPORT_SERIALIZER_NAMES:
             score = 1_000
-        elif lowered.endswith("_data") and (name_hits or body_hits or path_hits):
-            score = 650
         else:
             return -1_000
         return (
@@ -392,6 +393,14 @@ def plan_context_contract(
         if symbol not in bucket:
             bucket.append(symbol)
 
+    def add_priority(path: Path, symbol: str) -> None:
+        add_union(path, symbol)
+        if symbol in plan.mandatory_symbols.get(path, []):
+            return
+        bucket = plan.priority_symbols.setdefault(path, [])
+        if symbol not in bucket:
+            bucket.append(symbol)
+
     def add_required(path: Path, symbol: str) -> bool:
         key = (path, symbol)
         if key in selected_keys:
@@ -419,7 +428,14 @@ def plan_context_contract(
     except Exception:
         index = {}
     evidence = _evidence(repo, files, index)
-    task_terms = _domain_terms(task)
+    # Support-only clauses must not leak nouns into owner scoring for an
+    # unrelated implementation requirement.
+    implementation_terms: set[str] = set()
+    for candidate_requirement in requirements:
+        if _requirement_is_support_only(candidate_requirement):
+            continue
+        implementation_terms.update(_domain_terms(candidate_requirement))
+    task_terms = implementation_terms or _domain_terms(task)
 
     for requirement in requirements:
         if _requirement_is_support_only(requirement):
@@ -515,6 +531,37 @@ def plan_context_contract(
                 f"requirement owner {role}: {definition.path.name}::"
                 f"{definition.name} (score {score})"
             )
+            if role == "ui":
+                owner_definitions = next(
+                    (
+                        definitions
+                        for evidence_path, _path_tokens, _roles, definitions in evidence
+                        if evidence_path == definition.path
+                    ),
+                    [],
+                )
+                bundle_added = 0
+                for support in owner_definitions:
+                    if support.kind not in {"type", "interface", "enum"}:
+                        continue
+                    if support.name not in definition.text:
+                        continue
+                    support_key = (support.path, support.name)
+                    support_accepted = (
+                        support_key in selected_keys
+                        or add_required(support.path, support.name)
+                    )
+                    if not support_accepted:
+                        continue
+                    requirement_map.setdefault(support.path, [])
+                    if support.name not in requirement_map[support.path]:
+                        requirement_map[support.path].append(support.name)
+                    plan.diagnostics.append(
+                        f"requirement owner type: {support.path.name}::{support.name}"
+                    )
+                    bundle_added += 1
+                    if bundle_added >= 8:
+                        break
 
         # A route test is not useful patch context without its fixture owner.
         # Promote setup only for test files that actually supplied an owner.
@@ -554,34 +601,45 @@ def plan_context_contract(
         if not clean_map:
             plan.diagnostics.append(f"requirement evidence unresolved: {requirement}")
 
-    # Coverage already proved these definitions are important architectural
-    # evidence. If a requirement has made the file itself mandatory, keep the
-    # coverage definitions in the mandatory block too so they are rendered
-    # before unrelated selected source. Coverage on support-only files remains
-    # non-blocking and cannot veto publication.
+    # Coverage on a requirement-owned file is useful high-priority context,
+    # but it is not itself proof that the task must patch that definition.
+    # Keep it ahead of ordinary support without inflating the publication
+    # contract or stealing budget from the actual owner bundle.
     mandatory_paths = set(plan.mandatory_symbols)
     for path, symbols in coverage_plan.symbols.items():
         if path not in mandatory_paths:
             continue
-        bucket = plan.mandatory_symbols.setdefault(path, [])
         for symbol in symbols:
-            if symbol in bucket:
+            if symbol in plan.mandatory_symbols.get(path, []):
                 continue
-            bucket.append(symbol)
-            add_union(path, symbol)
+            add_priority(path, symbol)
             plan.diagnostics.append(
-                f"mandatory-path coverage: {path.name}::{symbol}"
+                f"priority-path coverage: {path.name}::{symbol}"
             )
 
-    # A requirement-owned definition is mandatory, not support. Keep the two
-    # classes disjoint so publication checks cannot accidentally see retrieval
-    # noise as a veto again.
-    for path in list(plan.support_symbols):
+    # Keep mandatory, priority and ordinary support disjoint. Publication
+    # checks consume only mandatory_symbols.
+    for path in list(plan.priority_symbols):
         mandatory = set(plan.mandatory_symbols.get(path, []))
         kept = [
             symbol
-            for symbol in plan.support_symbols[path]
+            for symbol in plan.priority_symbols[path]
             if symbol not in mandatory
+        ]
+        if kept:
+            plan.priority_symbols[path] = kept
+        else:
+            del plan.priority_symbols[path]
+
+    for path in list(plan.support_symbols):
+        reserved = (
+            set(plan.mandatory_symbols.get(path, []))
+            | set(plan.priority_symbols.get(path, []))
+        )
+        kept = [
+            symbol
+            for symbol in plan.support_symbols[path]
+            if symbol not in reserved
         ]
         if kept:
             plan.support_symbols[path] = kept

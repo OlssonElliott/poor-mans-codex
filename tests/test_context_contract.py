@@ -407,6 +407,137 @@ class ContextContractTests(unittest.TestCase):
             context,
         )
 
+    def test_priority_coverage_cannot_displace_mandatory_owner_bundle(self) -> None:
+        api = self.write(
+            "rpg_bot/dashboard_api.py",
+            "def _container_template_data(value):\n"
+            f"    padding = {'x' * 40000!r}\n"
+            "    return {'inventory_template': value, 'padding': padding}\n\n"
+            "def _node_data(room):\n"
+            "    return {'OWNER_NODE_SERIALIZER': room}\n\n"
+            "def _graph_data(graph):\n"
+            "    return {'OWNER_GRAPH_SERIALIZER': graph}\n\n"
+            "class DashboardAPI:\n"
+            "    def handle(self, method, path, body=None):\n"
+            "        marker = 'OWNER_HANDLE'\n"
+            "        return self._handle(method, path, body or {})\n\n"
+            "    def _handle(self, method, path, body):\n"
+            "        marker = 'OWNER_ROUTER'\n"
+            "        if path.startswith('/api/rooms/'):\n"
+            "            return 200, body\n"
+            "        return 404, {}\n",
+        )
+        editor = self.write(
+            "dashboard/app/dungeon-editor.tsx",
+            "type RoomNodeData = { id: string; name: string };\n"
+            "type ContentKind = 'enemy' | 'item' | 'container';\n\n"
+            "export function DungeonEditor() {\n"
+            "  const ownerStateMarker = 'OWNER_DUNGEON_STATE';\n"
+            "  const [selected, setSelected] = useState<RoomNodeData | null>(null);\n"
+            "  const [kind, setKind] = useState<ContentKind | null>(null);\n"
+            "  return <RoomInspector room={selected} />;\n"
+            "}\n\n"
+            "function RoomInspector({ room }: { room: RoomNodeData | null }) {\n"
+            "  const ownerContentsMarker = 'OWNER_ROOM_CONTENTS';\n"
+            "  return <section>{room?.name ?? 'Room Contents'}</section>;\n"
+            "}\n",
+        )
+        api_tests = self.write(
+            "tests/test_dashboard_api.py",
+            "import unittest\n\n"
+            "class DashboardAPITests(unittest.TestCase):\n"
+            "    def setUp(self):\n"
+            "        self.setup_marker = 'OWNER_API_SETUP'\n\n"
+            "    def test_room_create_route(self):\n"
+            "        marker = 'OWNER_CREATE_ROUTE_TEST'\n"
+            "        self.assertIn('room', marker.lower())\n",
+        )
+        files = [api, editor, api_tests]
+        save_map(self.repo, {"version": 3, "files": {
+            "rpg_bot/dashboard_api.py": {
+                "symbols": [
+                    {"name": "_container_template_data"},
+                    {"name": "_node_data"},
+                    {"name": "_graph_data"},
+                    {"name": "DashboardAPI"},
+                    {"name": "handle"},
+                    {"name": "_handle"},
+                ],
+                "dependencies": [],
+            },
+            "dashboard/app/dungeon-editor.tsx": {
+                "symbols": [
+                    {"name": "RoomNodeData"},
+                    {"name": "ContentKind"},
+                    {"name": "DungeonEditor"},
+                    {"name": "RoomInspector"},
+                ],
+                "dependencies": [],
+            },
+            "tests/test_dashboard_api.py": {
+                "symbols": [
+                    {"name": "DashboardAPITests"},
+                    {"name": "setUp"},
+                    {"name": "test_room_create_route"},
+                ],
+                "dependencies": [],
+            },
+        }})
+        retrieval_targets = {
+            api: ["_container_template_data"],
+            editor: ["RoomInspector"],
+        }
+        coverage = plan_source_coverage(
+            self.repo, ROOM_FEATURE_TASK, files, retrieval_targets
+        )
+        coverage.symbols.setdefault(api, [])
+        if "_container_template_data" not in coverage.symbols[api]:
+            coverage.symbols[api].append("_container_template_data")
+
+        contract = plan_context_contract(
+            self.repo,
+            ROOM_FEATURE_TASK,
+            files,
+            retrieval_targets,
+            coverage,
+        )
+        self.assertNotIn(
+            "_container_template_data",
+            contract.mandatory_symbols.get(api, []),
+        )
+        self.assertIn(
+            "_container_template_data",
+            contract.priority_symbols.get(api, []),
+        )
+        self.assertIn("RoomNodeData", contract.mandatory_symbols.get(editor, []))
+        self.assertIn("ContentKind", contract.mandatory_symbols.get(editor, []))
+
+        with patch(
+            "chatcode.context_builder.collect_relevant_files",
+            return_value=(files, retrieval_targets),
+        ), patch(
+            "chatcode.context_builder.plan_source_coverage",
+            return_value=coverage,
+        ), patch.dict(
+            os.environ,
+            {
+                "CHATCODE_CONTEXT_BUDGET_CHARS": "10000",
+                "CHATCODE_CONTEXT_HARD_BUDGET_CHARS": "70000",
+            },
+            clear=False,
+        ):
+            output = build_context(self.repo, ROOM_FEATURE_TASK)
+
+        context = output.read_text(encoding="utf-8")
+        self.assertNotIn("===== CONTEXT CONTRACT INCOMPLETE =====", context)
+        self.assertIn("OWNER_HANDLE", context)
+        self.assertIn("OWNER_ROUTER", context)
+        self.assertIn("OWNER_DUNGEON_STATE", context)
+        self.assertIn("OWNER_ROOM_CONTENTS", context)
+        self.assertIn("OWNER_API_SETUP", context)
+        self.assertIn("type RoomNodeData", context)
+        self.assertIn("type ContentKind", context)
+
     def test_contract_budget_expands_to_fit_large_required_handler(self) -> None:
         marker = "CURRENT_REQUIRED_HANDLER_"
         api = self.write(

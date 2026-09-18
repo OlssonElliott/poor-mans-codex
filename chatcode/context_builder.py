@@ -2568,15 +2568,40 @@ def build_patch_source_context(
         changed_files,
         explicit_files,
     )
-    required_context = "\n".join(
+    mandatory_context = "\n".join(
         part for part in (coverage_context, other_context) if part
     )
     materialization_states = {**coverage_states, **other_states}
 
-    required_rendered_chars = sum(
-        len(section) for section in required_context.splitlines(keepends=True)
+    mandatory_rendered_chars = sum(
+        len(section) for section in mandatory_context.splitlines(keepends=True)
         if "REQUIRED SOURCE UNAVAILABLE:" not in section
     )
+    priority_budget = max(0, budget - mandatory_rendered_chars)
+    priority_sections: list[str] = []
+    priority_used = 0
+    if contract_plan.active and priority_budget > 0:
+        for path, symbols in contract_plan.priority_symbols.items():
+            relative = path.relative_to(repo).as_posix()
+            for symbol in symbols:
+                node = _fresh_symbol_node(path, symbol)
+                if node is None:
+                    continue
+                section = (
+                    f"===== SYMBOL CONTEXT: {relative}::{symbol} "
+                    f"[priority support] source lines {node[2]}-{node[3]} =====\n"
+                    f"{node[0]}\n"
+                )
+                if priority_used + len(section) > priority_budget:
+                    continue
+                priority_sections.append(section)
+                priority_used += len(section)
+
+    priority_context = "\n".join(priority_sections)
+    required_context = "\n".join(
+        part for part in (mandatory_context, priority_context) if part
+    )
+    required_rendered_chars = mandatory_rendered_chars + priority_used
     remaining_budget = max(0, budget - required_rendered_chars)
     dependency_reserve = int(remaining_budget * PATCH_DEPENDENCY_RESERVE_RATIO)
     primary_budget = max(0, remaining_budget - dependency_reserve)
