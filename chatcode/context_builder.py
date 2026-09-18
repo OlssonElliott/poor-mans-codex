@@ -1691,7 +1691,18 @@ def _generic_symbol_span(
             if brace >= 0 and (semicolon < 0 or brace < semicolon):
                 end_index = _balanced_source_end(content, brace, "{", "}")
     elif match.group("kind"):
-        brace = content.find("{", search_from)
+        body_search_from = search_from
+        kind = match.group("kind") or ""
+        if "function" in kind:
+            # A typed/destructured parameter can contain braces before the
+            # actual function body, e.g. function Panel({ value }: { ... }) {.
+            # Skip the complete parameter list before looking for the body.
+            params = content.find("(", search_from)
+            if params >= 0:
+                params_end = _balanced_source_end(content, params, "(", ")")
+                if params_end is not None:
+                    body_search_from = params_end
+        brace = content.find("{", body_search_from)
         if brace >= 0:
             end_index = _balanced_source_end(content, brace, "{", "}")
     else:

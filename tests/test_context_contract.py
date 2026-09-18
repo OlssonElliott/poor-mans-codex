@@ -268,6 +268,145 @@ class ContextContractTests(unittest.TestCase):
         self.assertIn("def handle", context)
         self.assertIn("function RoomInspector", context)
 
+    def test_requirement_owner_expansion_materializes_patchable_surfaces(self) -> None:
+        api = self.write(
+            "rpg_bot/dashboard_api.py",
+            "def _container_template_data(value):\n"
+            "    return {'wrong_support_marker': value}\n\n"
+            "def _node_data(room):\n"
+            "    return {'OWNER_NODE_SERIALIZER': room}\n\n"
+            "def _graph_data(graph):\n"
+            "    return {'OWNER_GRAPH_SERIALIZER': graph}\n\n"
+            "class DashboardAPI:\n"
+            "    def handle(self, method, path, body=None):\n"
+            "        marker = 'OWNER_HANDLE'\n"
+            "        return self._handle(method, path, body or {})\n\n"
+            "    def _handle(self, method, path, body):\n"
+            "        marker = 'OWNER_ROUTER'\n"
+            "        if path.startswith('/api/rooms/'):\n"
+            "            return 200, body\n"
+            "        return 404, {}\n",
+        )
+        editor = self.write(
+            "dashboard/app/dungeon-editor.tsx",
+            "export function DungeonEditor() {\n"
+            "  const [graph, setGraph] = useState(null);\n"
+            "  const ownerStateMarker = 'OWNER_DUNGEON_STATE';\n"
+            "  const saveRoom = async () => setGraph(graph);\n"
+            "  return <RoomInspector room={{ id: 'hall' }} onSave={saveRoom} />;\n"
+            "}\n\n"
+            "function RoomInspector({ room, onSave }: {\n"
+            "  room: { id: string };\n"
+            "  onSave: () => Promise<void>;\n"
+            "}) {\n"
+            "  const ownerContentsMarker = 'OWNER_ROOM_CONTENTS';\n"
+            "  return <section>Room Contents {room.id}</section>;\n"
+            "}\n\n"
+            "function ItemLibraryDialog() {\n"
+            "  return <div>Existing item library reference</div>;\n"
+            "}\n",
+        )
+        api_tests = self.write(
+            "tests/test_dashboard_api.py",
+            "import unittest\n\n"
+            "class DashboardAPITests(unittest.TestCase):\n"
+            "    def setUp(self):\n"
+            "        self.setup_marker = 'OWNER_API_SETUP'\n"
+            "        self.api = object()\n\n"
+            "    def test_room_create_route(self):\n"
+            "        marker = 'OWNER_CREATE_ROUTE_TEST'\n"
+            "        self.assertIn('room', marker.lower())\n\n"
+            "    def test_room_delete_route(self):\n"
+            "        marker = 'OWNER_DELETE_ROUTE_TEST'\n"
+            "        self.assertIn('room', marker.lower())\n\n"
+            "    def test_unrelated_portrait_route(self):\n"
+            "        marker = 'portrait'\n"
+            "        self.assertTrue(marker)\n",
+        )
+        files = [api, editor, api_tests]
+        save_map(self.repo, {"version": 3, "files": {
+            "rpg_bot/dashboard_api.py": {
+                "symbols": [
+                    {"name": "_container_template_data"},
+                    {"name": "_node_data"},
+                    {"name": "_graph_data"},
+                    {"name": "DashboardAPI"},
+                    {"name": "handle"},
+                    {"name": "_handle"},
+                ],
+                "dependencies": [],
+            },
+            "dashboard/app/dungeon-editor.tsx": {
+                "symbols": [
+                    {"name": "DungeonEditor"},
+                    {"name": "RoomInspector"},
+                    {"name": "ItemLibraryDialog"},
+                ],
+                "dependencies": [],
+            },
+            "tests/test_dashboard_api.py": {
+                "symbols": [
+                    {"name": "DashboardAPITests"},
+                    {"name": "setUp"},
+                    {"name": "test_room_create_route"},
+                    {"name": "test_room_delete_route"},
+                    {"name": "test_unrelated_portrait_route"},
+                ],
+                "dependencies": [],
+            },
+        }})
+        retrieval_targets = {
+            api: ["_container_template_data"],
+            editor: ["RoomInspector"],
+        }
+
+        coverage = plan_source_coverage(
+            self.repo, ROOM_FEATURE_TASK, files, retrieval_targets
+        )
+        contract = plan_context_contract(
+            self.repo,
+            ROOM_FEATURE_TASK,
+            files,
+            retrieval_targets,
+            coverage,
+        )
+
+        self.assertIn("handle", contract.mandatory_symbols.get(api, []))
+        self.assertIn("_handle", contract.mandatory_symbols.get(api, []))
+        self.assertIn("_node_data", contract.mandatory_symbols.get(api, []))
+        self.assertIn("_graph_data", contract.mandatory_symbols.get(api, []))
+        self.assertIn("DungeonEditor", contract.mandatory_symbols.get(editor, []))
+        self.assertIn("RoomInspector", contract.mandatory_symbols.get(editor, []))
+        self.assertIn("setUp", contract.mandatory_symbols.get(api_tests, []))
+        self.assertTrue(
+            any(
+                name.startswith("test_room_")
+                for name in contract.mandatory_symbols.get(api_tests, [])
+            )
+        )
+
+        with patch(
+            "chatcode.context_builder.collect_relevant_files",
+            return_value=(files, retrieval_targets),
+        ):
+            output = build_context(self.repo, ROOM_FEATURE_TASK)
+
+        context = output.read_text(encoding="utf-8")
+        for marker in (
+            "OWNER_HANDLE",
+            "OWNER_ROUTER",
+            "OWNER_NODE_SERIALIZER",
+            "OWNER_GRAPH_SERIALIZER",
+            "OWNER_DUNGEON_STATE",
+            "OWNER_ROOM_CONTENTS",
+            "OWNER_API_SETUP",
+        ):
+            self.assertIn(marker, context)
+        self.assertNotIn(
+            "tests/test_dashboard_api.py [source unavailable; do not patch]",
+            context,
+        )
+
     def test_contract_budget_expands_to_fit_large_required_handler(self) -> None:
         marker = "CURRENT_REQUIRED_HANDLER_"
         api = self.write(
