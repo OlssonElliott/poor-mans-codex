@@ -839,3 +839,11 @@ The goal is not to make a local model write the whole patch.
 The goal is to make sure the stronger patch-generating model receives the **smallest useful context that is still complete enough to make a correct change**.
 
 That is the core idea behind Poor Man's Codex.
+
+---
+
+## License
+
+Copyright © 2026 Elliott Olsson. All rights reserved.
+
+No license is granted for commercial use, redistribution, or derivative works without prior written permission.
