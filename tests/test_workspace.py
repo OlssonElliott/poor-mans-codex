@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
-from chatcode.workspace import atomic_write_text
+from chatcode.workspace import (
+    TEMPORARY_WORKSPACE_MAX_AGE_SECONDS,
+    atomic_write_text,
+    cleanup_stale_temporary_workspaces,
+)
 
 
 class AtomicWriteTests(unittest.TestCase):
@@ -17,6 +23,39 @@ class AtomicWriteTests(unittest.TestCase):
 
             self.assertEqual(destination.read_text(encoding="utf-8"), "complete context")
             self.assertEqual(list(destination.parent.glob(".*.tmp")), [])
+
+
+class TemporaryWorkspaceCleanupTests(unittest.TestCase):
+    def test_removes_only_stale_temporary_repository_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stale = root / "tmpabc12345"
+            recent = root / "tmpdef67890"
+            ordinary = root / "my-project"
+            for directory in (stale, recent, ordinary):
+                (directory / "_workspace").mkdir(parents=True)
+
+            now = time.time()
+            old = now - TEMPORARY_WORKSPACE_MAX_AGE_SECONDS - 1
+            os.utime(stale, (old, old))
+
+            cleanup_stale_temporary_workspaces(root, now=now)
+
+            self.assertFalse(stale.exists())
+            self.assertTrue(recent.exists())
+            self.assertTrue(ordinary.exists())
+
+    def test_preserves_the_active_workspace_even_when_its_parent_is_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "tmpabc12345" / "_workspace"
+            workspace.mkdir(parents=True)
+            old = time.time() - TEMPORARY_WORKSPACE_MAX_AGE_SECONDS - 1
+            os.utime(workspace.parent, (old, old))
+
+            cleanup_stale_temporary_workspaces(root, active_workspace=workspace)
+
+            self.assertTrue(workspace.exists())
 
 
 if __name__ == "__main__":

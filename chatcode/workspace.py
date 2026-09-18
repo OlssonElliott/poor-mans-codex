@@ -2,8 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
+import shutil
 import tempfile
+import time
 from pathlib import Path
+
+
+TEMPORARY_REPOSITORY_NAME = re.compile(r"tmp[a-z0-9_]{8}\Z")
+TEMPORARY_WORKSPACE_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 
 
 def get_workspace_root() -> Path:
@@ -24,6 +31,57 @@ def get_workspace_root() -> Path:
     )
 
     return workspace_root
+
+
+def cleanup_stale_temporary_workspaces(
+    workspace_root: Path,
+    *,
+    active_workspace: Path | None = None,
+    now: float | None = None,
+) -> None:
+    """Remove old workspaces created for Python-style temporary repositories.
+
+    This deliberately ignores all normal repository names.  A generous age
+    limit also avoids disturbing a long-running command, while the active
+    workspace is explicitly excluded regardless of its age.
+    """
+    workspace_root = workspace_root.resolve()
+    active_workspace = (
+        active_workspace.resolve() if active_workspace is not None else None
+    )
+    cutoff = (
+        time.time() if now is None else now
+    ) - TEMPORARY_WORKSPACE_MAX_AGE_SECONDS
+
+    try:
+        candidates = list(workspace_root.iterdir())
+    except OSError:
+        return
+
+    for candidate in candidates:
+        if (
+            not candidate.is_dir()
+            or candidate.is_symlink()
+            or not TEMPORARY_REPOSITORY_NAME.fullmatch(candidate.name)
+        ):
+            continue
+
+        try:
+            resolved_candidate = candidate.resolve()
+            if resolved_candidate.parent != workspace_root:
+                continue
+            if (
+                active_workspace is not None
+                and active_workspace.is_relative_to(resolved_candidate)
+            ):
+                continue
+            if candidate.stat().st_mtime >= cutoff:
+                continue
+            shutil.rmtree(candidate)
+        except OSError:
+            # Cleanup is opportunistic: a locked or concurrently used folder
+            # is left for a future invocation.
+            continue
 
 
 def atomic_write_text(
@@ -68,8 +126,9 @@ def get_repo_workspace(
         .encode("utf-8")
     ).hexdigest()[:8]
 
+    workspace_root = get_workspace_root()
     workspace = (
-        get_workspace_root()
+        workspace_root
         / repo_name
         / f"_{repo_hash}"
     )
@@ -77,6 +136,11 @@ def get_repo_workspace(
     workspace.mkdir(
         parents=True,
         exist_ok=True,
+    )
+
+    cleanup_stale_temporary_workspaces(
+        workspace_root,
+        active_workspace=workspace,
     )
 
     return workspace
