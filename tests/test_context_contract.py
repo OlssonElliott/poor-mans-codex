@@ -27,6 +27,16 @@ Persist container edits and keep room instances independent.
 """
 
 
+ROOM_FEATURE_TASK = """\
+Room Features backend already exists in WorldService and persistence.
+Add Dashboard API routes for create read update and delete Room Features.
+Update DungeonEditor and RoomInspector so Room Features can be listed edited and deleted.
+Add an Add Room Feature dialog using the existing dashboard UI style.
+Keep Room Features separate from inventory items and containers.
+Add relevant tests for the Dashboard API flow.
+"""
+
+
 class ContextContractTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -130,6 +140,133 @@ class ContextContractTests(unittest.TestCase):
         self.assertIn("RoomInspector", contract.symbols[editor])
         self.assertNotIn("CharacterPortraitPanel", contract.symbols.get(editor, []))
         self.assertTrue(any(contract.requirement_symbols.values()))
+
+    def test_noisy_retrieval_roots_are_support_not_publication_blockers(self) -> None:
+        api = self.write(
+            "rpg_bot/dashboard_api.py",
+            "class DashboardAPI:\n"
+            "    def handle(self, method, path, payload):\n"
+            "        if path.startswith('/room-features'):\n"
+            "            return self.world.create_room_feature(payload)\n"
+            "    def _node_data(self, room):\n"
+            "        return {'room_features': room.features}\n",
+        )
+        editor = self.write(
+            "dashboard/app/dungeon-editor.tsx",
+            "export function DungeonEditor() {\n"
+            "  const [roomFeatures, setRoomFeatures] = useState([]);\n"
+            "  return <RoomInspector roomFeatures={roomFeatures} />;\n"
+            "}\n"
+            "export function RoomInspector() {\n"
+            "  return <section>Room Features</section>;\n"
+            "}\n"
+            "export function RoomFeatureDialog() {\n"
+            "  return <div>Name Type Description Delete</div>;\n"
+            "}\n",
+        )
+        service = self.write(
+            "rpg_bot/world_service.py",
+            "class WorldService:\n"
+            "    def create_room_feature(self, payload):\n"
+            "        return self.database.create_room_feature(payload)\n"
+            "    def update_room_feature(self, feature_id, payload):\n"
+            "        return self.database.update_room_feature(feature_id, payload)\n"
+            "    def delete_room_feature(self, feature_id):\n"
+            "        return self.database.delete_room_feature(feature_id)\n",
+        )
+        noisy_names = [
+            "inventory",
+            "read_button",
+            "drop_button",
+            "character",
+            "_item_label",
+            "_item_label_for_quantity",
+            "_inventory_lines",
+            "__init__",
+        ]
+        inventory = self.write(
+            "rpg_bot/commands/inventory.py",
+            "".join(
+                f"def {name}():\n"
+                f"    marker = {name!r}\n"
+                f"    padding = {'x' * 3200!r}\n"
+                "    return marker, padding\n\n"
+                for name in noisy_names
+            ),
+        )
+        files = [api, editor, service, inventory]
+        save_map(self.repo, {"version": 3, "files": {
+            "rpg_bot/dashboard_api.py": {
+                "symbols": [
+                    {"name": "DashboardAPI"}, {"name": "handle"},
+                    {"name": "_node_data"},
+                ],
+                "dependencies": [],
+            },
+            "dashboard/app/dungeon-editor.tsx": {
+                "symbols": [
+                    {"name": "DungeonEditor"}, {"name": "RoomInspector"},
+                    {"name": "RoomFeatureDialog"},
+                ],
+                "dependencies": [],
+            },
+            "rpg_bot/world_service.py": {
+                "symbols": [
+                    {"name": "WorldService"}, {"name": "create_room_feature"},
+                    {"name": "update_room_feature"}, {"name": "delete_room_feature"},
+                ],
+                "dependencies": [],
+            },
+            "rpg_bot/commands/inventory.py": {
+                "symbols": [{"name": name} for name in noisy_names],
+                "dependencies": [],
+            },
+        }})
+        retrieval_targets = {
+            api: ["handle"],
+            editor: ["RoomInspector"],
+            inventory: noisy_names,
+        }
+        coverage = plan_source_coverage(
+            self.repo, ROOM_FEATURE_TASK, files, retrieval_targets
+        )
+        contract = plan_context_contract(
+            self.repo,
+            ROOM_FEATURE_TASK,
+            files,
+            retrieval_targets,
+            coverage,
+        )
+
+        self.assertIn("handle", contract.mandatory_symbols.get(api, []))
+        self.assertIn("RoomInspector", contract.mandatory_symbols.get(editor, []))
+        for symbol in noisy_names:
+            self.assertNotIn(
+                symbol, contract.mandatory_symbols.get(inventory, [])
+            )
+            self.assertIn(symbol, contract.support_symbols.get(inventory, []))
+
+        with patch(
+            "chatcode.context_builder.collect_relevant_files",
+            return_value=(files, retrieval_targets),
+        ), patch.dict(
+            os.environ,
+            {
+                "CHATCODE_CONTEXT_BUDGET_CHARS": "8000",
+                "CHATCODE_CONTEXT_HARD_BUDGET_CHARS": "18000",
+            },
+            clear=False,
+        ):
+            output = build_context(self.repo, ROOM_FEATURE_TASK)
+
+        context = output.read_text(encoding="utf-8")
+        self.assertNotIn("===== CONTEXT CONTRACT INCOMPLETE =====", context)
+        self.assertNotIn(
+            "REQUIRED SOURCE UNAVAILABLE: rpg_bot/commands/inventory.py",
+            context,
+        )
+        self.assertIn("def handle", context)
+        self.assertIn("function RoomInspector", context)
 
     def test_contract_budget_expands_to_fit_large_required_handler(self) -> None:
         marker = "CURRENT_REQUIRED_HANDLER_"

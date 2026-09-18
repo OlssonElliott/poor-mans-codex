@@ -2311,20 +2311,13 @@ def build_patch_source_context(
         target_metadata,
         coverage_plan,
     )
-    coverage_keys: set[tuple[Path, str]] = set()
+    # Keep every discovered root available for optional source focusing.
     for source in (coverage_plan.symbols, contract_plan.symbols):
         for path, symbols in source.items():
             target_metadata.setdefault(path, [])
             for symbol in symbols:
-                coverage_keys.add((path, symbol))
                 if symbol not in target_metadata[path]:
                     target_metadata[path].append(symbol)
-    if contract_plan.active:
-        coverage_keys.update(
-            (path, symbol)
-            for path, symbols in base_target_metadata.items()
-            for symbol in symbols
-        )
 
     base_materialization_targets = _materialization_targets(
         repo,
@@ -2336,29 +2329,92 @@ def build_patch_source_context(
     }
     coverage_targets: list[tuple[Path, str, str]] = []
     other_targets: list[tuple[Path, str, str]] = []
-    for path, symbol, priority in base_materialization_targets:
-        if (path, symbol) in coverage_keys:
-            coverage_targets.append((path, symbol, "source coverage"))
-        else:
-            other_targets.append((path, symbol, priority))
-    for source, priority in (
-        (coverage_plan.symbols, "source coverage"),
-        (contract_plan.symbols, "requirement contract"),
-    ):
-        for path, symbols in source.items():
+
+    if contract_plan.active:
+        mandatory_keys = {
+            (path, symbol)
+            for path, symbols in contract_plan.mandatory_symbols.items()
+            for symbol in symbols
+        }
+        # Direct build_patch_source_context callers historically use
+        # target_symbols as an explicit contract. Production context capture
+        # passes critical_paths, so retrieval candidates are not promoted here.
+        if critical_paths is None:
+            mandatory_keys.update(
+                (path, symbol)
+                for path, symbols in base_target_metadata.items()
+                for symbol in symbols
+            )
+        # Exact paths named by the user are explicit contract surfaces.
+        mandatory_keys.update(
+            (path, symbol)
+            for path, symbols in base_target_metadata.items()
+            if path in explicit_files
+            for symbol in symbols
+        )
+
+        seen_mandatory: set[tuple[Path, str]] = set()
+        contract_owned = {
+            (path, symbol)
+            for path, symbols in contract_plan.mandatory_symbols.items()
+            for symbol in symbols
+        }
+        for path, symbol, priority in base_materialization_targets:
+            key = (path, symbol)
+            if key in mandatory_keys:
+                coverage_targets.append((
+                    path,
+                    symbol,
+                    "requirement contract" if key in contract_owned else priority,
+                ))
+                seen_mandatory.add(key)
+            else:
+                other_targets.append((path, symbol, priority))
+                target_metadata.setdefault(path, [])
+                if symbol not in target_metadata[path]:
+                    target_metadata[path].append(symbol)
+
+        for path, symbols in contract_plan.mandatory_symbols.items():
+            for symbol in symbols:
+                key = (path, symbol)
+                if key in seen_mandatory:
+                    continue
+                coverage_targets.append((path, symbol, "requirement contract"))
+                seen_mandatory.add(key)
+
+        # Only mandatory targets participate in the hard materialization
+        # invariant. Support roots remain opportunistic below.
+        materialization_targets = list(coverage_targets)
+    else:
+        coverage_keys = {
+            (path, symbol)
+            for path, symbols in coverage_plan.symbols.items()
+            for symbol in symbols
+        }
+        for path, symbol, priority in base_materialization_targets:
+            if (path, symbol) in coverage_keys:
+                coverage_targets.append((path, symbol, "source coverage"))
+            else:
+                other_targets.append((path, symbol, priority))
+        for path, symbols in coverage_plan.symbols.items():
             for symbol in symbols:
                 if (path, symbol) not in base_keys and not any(
                     target_path == path and target_symbol == symbol
                     for target_path, target_symbol, _priority in coverage_targets
                 ):
-                    coverage_targets.append((path, symbol, priority))
-    materialization_targets = [*coverage_targets, *other_targets]
+                    coverage_targets.append((path, symbol, "source coverage"))
+        materialization_targets = [*coverage_targets, *other_targets]
 
     dependencies = _dependency_paths(repo, files)
+    support_target_paths = (
+        [path for path, _symbol, _priority in other_targets]
+        if contract_plan.active else []
+    )
     primary = list(dict.fromkeys([
         *[path for path in files if path in explicit_files],
         *[path for path in files if path in changed_files],
         *files,
+        *support_target_paths,
     ]))
     supporting = [path for path in sorted(dependencies) if path not in primary]
 
@@ -2374,16 +2430,22 @@ def build_patch_source_context(
         )
         budget = _effective_context_budget(budget, contract_cost)
 
-    required_paths = list(dict.fromkeys([
-        *[
-            path for path in primary
-            if path in changed_files
-            and "tests" not in {part.casefold() for part in path.relative_to(repo).parts}
-            and "test" not in path.stem.casefold()
-            and "spec" not in path.stem.casefold()
-        ],
-        *(critical_paths if critical_paths is not None else base_target_metadata),
-    ]))
+    if contract_plan.active:
+        required_paths = list(dict.fromkeys([
+            *[path for path, _symbol, _priority in coverage_targets],
+            *[path for path in primary if path in explicit_files],
+        ]))
+    else:
+        required_paths = list(dict.fromkeys([
+            *[
+                path for path in primary
+                if path in changed_files
+                and "tests" not in {part.casefold() for part in path.relative_to(repo).parts}
+                and "test" not in path.stem.casefold()
+                and "spec" not in path.stem.casefold()
+            ],
+            *(critical_paths if critical_paths is not None else base_target_metadata),
+        ]))
 
     coverage_context = ""
     coverage_states: dict[tuple[Path, str], tuple[str, str]] = {}
@@ -2468,16 +2530,28 @@ def build_patch_source_context(
         if "REQUIRED SOURCE UNAVAILABLE:" not in section
     )
     remaining_required_budget = max(0, budget - coverage_rendered_chars)
-    coverage_path_set = set(coverage_plan.paths) | set(contract_plan.paths)
-    other_required_paths = [
-        path
-        for path in required_paths
-        if path not in coverage_path_set or path in changed_files
-    ]
+    if contract_plan.active:
+        coverage_path_set = {
+            path for path, _symbol, _priority in coverage_targets
+        }
+        other_required_paths = [
+            path for path in required_paths
+            if path not in coverage_path_set
+        ]
+        required_other_targets: list[tuple[Path, str, str]] = []
+    else:
+        coverage_path_set = set(coverage_plan.paths)
+        other_required_paths = [
+            path
+            for path in required_paths
+            if path not in coverage_path_set or path in changed_files
+        ]
+        required_other_targets = other_targets
+
     other_context, other_states = _render_required_symbols(
         repo,
         task,
-        other_targets,
+        required_other_targets,
         other_required_paths,
         remaining_required_budget,
         changed_files,
@@ -2498,11 +2572,15 @@ def build_patch_source_context(
     sections: list[str] = [required_context] if required_context else []
     used = 0
 
-    # Selected files are possible patch targets. Allocate their share first so
-    # a broad dependency, README, or an early oversized selection cannot make
-    # a later selected test silently vanish from the authoritative source.
+    # Selected files are possible patch targets. Mandatory paths were already
+    # rendered above. Support roots are opportunistic and never veto publication
+    # merely because their exact source does not fit.
+    required_path_set = set(required_paths)
     for position, path in enumerate(primary):
-        if path in target_metadata:
+        if (
+            (contract_plan.active and path in required_path_set)
+            or (not contract_plan.active and path in target_metadata)
+        ):
             continue
         try:
             remaining = len(primary) - position
@@ -2515,6 +2593,7 @@ def build_patch_source_context(
                 explicit_files,
                 max_chars=allowance,
                 required_symbols=target_metadata.get(path),
+                focus_symbols=target_metadata.get(path),
             )
         except OSError:
             continue
@@ -2524,16 +2603,32 @@ def build_patch_source_context(
         used += len(section)
 
     for path in supporting:
-        if path in target_metadata:
+        if (
+            (contract_plan.active and path in required_path_set)
+            or (not contract_plan.active and path in target_metadata)
+        ):
             continue
         try:
-            section = _render_patch_file_context(
-                repo,
-                path,
-                task,
-                changed_files,
-                explicit_files,
-            )
+            if contract_plan.active:
+                allowance = max(1, remaining_budget - used)
+                section = _render_patch_file_context(
+                    repo,
+                    path,
+                    task,
+                    changed_files,
+                    explicit_files,
+                    max_chars=allowance,
+                    required_symbols=target_metadata.get(path),
+                    focus_symbols=target_metadata.get(path),
+                )
+            else:
+                section = _render_patch_file_context(
+                    repo,
+                    path,
+                    task,
+                    changed_files,
+                    explicit_files,
+                )
         except OSError:
             continue
         if not section or used + len(section) > remaining_budget:

@@ -1339,7 +1339,7 @@ class ApplyFlowTests(unittest.TestCase):
             "Changed attempted_suggestion in commands.py",
         ).read_text(encoding="utf-8")
 
-        self.assertIn("SYMBOL CONTEXT: commands.py::alternative_suggestion", context)
+        self.assertIn("def alternative_suggestion()", context)
         self.assertIn("return f'Visible item ({1} nearby)'", context)
 
     def test_followup_keeps_previous_patch_path_as_explicit_evidence(self) -> None:
