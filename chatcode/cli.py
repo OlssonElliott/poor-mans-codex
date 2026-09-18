@@ -9,6 +9,7 @@ import uuid
 from pathlib import Path
 
 from .context_builder import (
+    ContextBuildError,
     build_safe_status,
     build_context,
     build_patch_context,
@@ -238,18 +239,22 @@ def command_context(
     repo = get_repo_root()
     reporter = ConsoleIndexReporter()
 
-    if patch_oriented:
-        output = build_patch_context(
-            repo,
-            task,
-            index_progress=reporter,
-        )
-    else:
-        output = build_context(
-            repo,
-            task,
-            index_progress=reporter,
-        )
+    try:
+        if patch_oriented:
+            output = build_patch_context(
+                repo,
+                task,
+                index_progress=reporter,
+            )
+        else:
+            output = build_context(
+                repo,
+                task,
+                index_progress=reporter,
+            )
+    except ContextBuildError as exc:
+        print(f"Context not created: {exc}", file=sys.stderr)
+        return
 
     patch_file = get_default_patch_file(
         repo

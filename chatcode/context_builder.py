@@ -41,6 +41,7 @@ from .retrieval.hybrid_retriever import (
     test_callsite_closure,
 )
 from .retrieval.source_coverage import plan_source_coverage
+from .retrieval.context_contract import plan_context_contract
 from .workspace import (
     atomic_write_text,
     get_repo_workspace,
@@ -150,8 +151,17 @@ PATCH_FULL_FILE_CHARS = 20_000
 PATCH_DIRTY_FULL_FILE_CHARS = 48_000
 PATCH_EXCERPT_RADIUS = 32
 PATCH_CONTEXT_BUDGET_CHARS = 90_000
+PATCH_CONTEXT_HARD_BUDGET_CHARS = 180_000
+PATCH_CONTEXT_ELASTIC_RESERVE_CHARS = 12_000
+PATCH_CONTRACT_FULL_FILE_MAX_CHARS = 120_000
+PATCH_CONTRACT_FULL_FILE_RATIO = 1.20
 PATCH_DEPENDENCY_RESERVE_RATIO = 0.25
 CONTEXT_CAPTURE_RETRIES = 3
+
+
+class ContextBuildError(RuntimeError):
+    """Raised when ChatCode cannot publish a safe patch context."""
+
 
 CONTEXT_PURPOSE = (
     "This request concerns maintenance of the users own local software repository."
@@ -1273,6 +1283,16 @@ def _context_budget_chars() -> int:
     )
 
 
+def _context_hard_budget_chars() -> int:
+    return max(
+        _context_budget_chars(),
+        _configured_positive_int(
+            "CHATCODE_CONTEXT_HARD_BUDGET_CHARS",
+            PATCH_CONTEXT_HARD_BUDGET_CHARS,
+        ),
+    )
+
+
 def _dirty_current_line_ranges(repo: Path, path: Path) -> list[tuple[int, int]]:
     """Return new-side dirty hunk coordinates without treating diff as source."""
     try:
@@ -1822,6 +1842,134 @@ def _fresh_symbol_node(
     return None
 
 
+def _full_current_file_section(repo: Path, path: Path) -> str:
+    content, digest = _read_current_text_and_hash(path)
+    relative = path.relative_to(repo).as_posix()
+    line_count = max(1, len(content.splitlines()))
+    return (
+        f"===== FULL FILE: {relative} =====\n"
+        f"SHA-256: {digest}\n"
+        f"Source line range: 1-{line_count}\n\n"
+        f"{content}\n"
+    )
+
+
+def _context_contract_blocks(
+    repo: Path,
+    targets: list[tuple[Path, str, str]],
+) -> tuple[
+    list[tuple[str, list[tuple[Path, str, str]], str]],
+    list[tuple[Path, str, str]],
+]:
+    """Build exact mandatory source blocks before any budget allocation."""
+    grouped: dict[Path, list[tuple[str, str]]] = {}
+    seen: set[tuple[Path, str]] = set()
+    for path, symbol, priority in targets:
+        key = (path, symbol)
+        if key in seen:
+            continue
+        seen.add(key)
+        grouped.setdefault(path, []).append((symbol, priority))
+
+    blocks: list[tuple[str, list[tuple[Path, str, str]], str]] = []
+    unresolved: list[tuple[Path, str, str]] = []
+    for path, symbols in grouped.items():
+        exact: list[tuple[str, tuple[Path, str, str]]] = []
+        missing: list[tuple[Path, str, str]] = []
+        relative = path.relative_to(repo).as_posix()
+        for symbol, priority in symbols:
+            node = _fresh_symbol_node(path, symbol)
+            key = (path, symbol, priority)
+            if node is None:
+                missing.append(key)
+                continue
+            section = (
+                f"===== SYMBOL CONTEXT: {relative}::{symbol} [{priority}] "
+                f"source lines {node[2]}-{node[3]} =====\n"
+                f"{node[0]}\n"
+            )
+            exact.append((section, key))
+
+        full_section = ""
+        try:
+            candidate = _full_current_file_section(repo, path)
+            if len(candidate) <= PATCH_CONTRACT_FULL_FILE_MAX_CHARS:
+                full_section = candidate
+        except OSError:
+            pass
+
+        exact_chars = sum(len(section) for section, _key in exact)
+        promote_full = bool(full_section) and (
+            bool(missing)
+            or (
+                len(exact) >= 3
+                and len(full_section)
+                <= int(max(1, exact_chars) * PATCH_CONTRACT_FULL_FILE_RATIO)
+            )
+        )
+        if promote_full:
+            keys = [
+                (path, symbol, priority)
+                for symbol, priority in symbols
+            ]
+            blocks.append((full_section, keys, "fallback"))
+            continue
+
+        blocks.extend(
+            (section, [key], "rendered")
+            for section, key in exact
+        )
+        unresolved.extend(missing)
+
+    return blocks, unresolved
+
+
+def _render_context_contract_blocks(
+    repo: Path,
+    blocks: list[tuple[str, list[tuple[Path, str, str]], str]],
+    unresolved: list[tuple[Path, str, str]],
+    budget: int,
+) -> tuple[str, dict[tuple[Path, str], tuple[str, str]]]:
+    sections: list[str] = []
+    states: dict[tuple[Path, str], tuple[str, str]] = {}
+    missing = list(unresolved)
+    used = 0
+
+    for section, keys, state in blocks:
+        if used + len(section) > budget:
+            missing.extend(keys)
+            continue
+        sections.append(section)
+        used += len(section)
+        for path, symbol, priority in keys:
+            states[(path, symbol)] = (
+                ("fallback", "FULL FILE")
+                if state == "fallback"
+                else ("rendered", priority)
+            )
+
+    for path, symbol, priority in dict.fromkeys(missing):
+        if (path, symbol) in states:
+            continue
+        relative = path.relative_to(repo).as_posix()
+        states[(path, symbol)] = ("unavailable", "context contract")
+        sections.append(
+            f"===== REQUIRED SOURCE UNAVAILABLE: {relative}::{symbol} "
+            "[reason: context contract; do not patch] =====\n"
+        )
+
+    return "\n".join(sections), states
+
+
+def _effective_context_budget(base_budget: int, required_chars: int) -> int:
+    """Grow only broad contract contexts, never past the configured hard cap."""
+    if required_chars <= base_budget:
+        return base_budget
+    hard_budget = _context_hard_budget_chars()
+    desired = required_chars + PATCH_CONTEXT_ELASTIC_RESERVE_CHARS
+    return min(hard_budget, max(base_budget, desired))
+
+
 def _materialization_targets(
     repo: Path, target_symbols: dict[Path, list[str]], max_inherited: int = 64,
 ) -> list[tuple[Path, str, str]]:
@@ -2156,13 +2304,27 @@ def build_patch_source_context(
         files,
         target_metadata,
     )
+    contract_plan = plan_context_contract(
+        repo,
+        task,
+        files,
+        target_metadata,
+        coverage_plan,
+    )
     coverage_keys: set[tuple[Path, str]] = set()
-    for path, symbols in coverage_plan.symbols.items():
-        target_metadata.setdefault(path, [])
-        for symbol in symbols:
-            coverage_keys.add((path, symbol))
-            if symbol not in target_metadata[path]:
-                target_metadata[path].append(symbol)
+    for source in (coverage_plan.symbols, contract_plan.symbols):
+        for path, symbols in source.items():
+            target_metadata.setdefault(path, [])
+            for symbol in symbols:
+                coverage_keys.add((path, symbol))
+                if symbol not in target_metadata[path]:
+                    target_metadata[path].append(symbol)
+    if contract_plan.active:
+        coverage_keys.update(
+            (path, symbol)
+            for path, symbols in base_target_metadata.items()
+            for symbol in symbols
+        )
 
     base_materialization_targets = _materialization_targets(
         repo,
@@ -2179,10 +2341,17 @@ def build_patch_source_context(
             coverage_targets.append((path, symbol, "source coverage"))
         else:
             other_targets.append((path, symbol, priority))
-    for path, symbols in coverage_plan.symbols.items():
-        for symbol in symbols:
-            if (path, symbol) not in base_keys:
-                coverage_targets.append((path, symbol, "source coverage"))
+    for source, priority in (
+        (coverage_plan.symbols, "source coverage"),
+        (contract_plan.symbols, "requirement contract"),
+    ):
+        for path, symbols in source.items():
+            for symbol in symbols:
+                if (path, symbol) not in base_keys and not any(
+                    target_path == path and target_symbol == symbol
+                    for target_path, target_symbol, _priority in coverage_targets
+                ):
+                    coverage_targets.append((path, symbol, priority))
     materialization_targets = [*coverage_targets, *other_targets]
 
     dependencies = _dependency_paths(repo, files)
@@ -2194,6 +2363,17 @@ def build_patch_source_context(
     supporting = [path for path in sorted(dependencies) if path not in primary]
 
     budget = _context_budget_chars()
+    contract_blocks: list[tuple[str, list[tuple[Path, str, str]], str]] = []
+    contract_unresolved: list[tuple[Path, str, str]] = []
+    if contract_plan.active and coverage_targets:
+        contract_blocks, contract_unresolved = _context_contract_blocks(
+            repo, coverage_targets
+        )
+        contract_cost = sum(
+            len(section) for section, _keys, _state in contract_blocks
+        )
+        budget = _effective_context_budget(budget, contract_cost)
+
     required_paths = list(dict.fromkeys([
         *[
             path for path in primary
@@ -2208,15 +2388,23 @@ def build_patch_source_context(
     coverage_context = ""
     coverage_states: dict[tuple[Path, str], tuple[str, str]] = {}
     if coverage_targets:
-        coverage_context, coverage_states = _render_required_symbols(
-            repo,
-            task,
-            coverage_targets,
-            coverage_plan.paths,
-            budget,
-            changed_files,
-            explicit_files,
-        )
+        if contract_plan.active:
+            coverage_context, coverage_states = _render_context_contract_blocks(
+                repo,
+                contract_blocks,
+                contract_unresolved,
+                budget,
+            )
+        else:
+            coverage_context, coverage_states = _render_required_symbols(
+                repo,
+                task,
+                coverage_targets,
+                coverage_plan.paths,
+                budget,
+                changed_files,
+                explicit_files,
+            )
 
         # Validate coverage against the exact fresh definition text. A fallback
         # excerpt that does not contain the complete node is not enough for a
@@ -2280,7 +2468,7 @@ def build_patch_source_context(
         if "REQUIRED SOURCE UNAVAILABLE:" not in section
     )
     remaining_required_budget = max(0, budget - coverage_rendered_chars)
-    coverage_path_set = set(coverage_plan.paths)
+    coverage_path_set = set(coverage_plan.paths) | set(contract_plan.paths)
     other_required_paths = [
         path
         for path in required_paths
@@ -2357,6 +2545,36 @@ def build_patch_source_context(
     rendered = _enforce_materialization_invariant(
         repo, rendered, materialization_targets, materialization_states
     )
+    if contract_plan.active:
+        incomplete: list[str] = []
+        for path, symbol, _priority in coverage_targets:
+            state, detail = coverage_states.get(
+                (path, symbol), ("unavailable", "missing state")
+            )
+            node = _fresh_symbol_node(path, symbol)
+            exact_present = node is not None and node[0] in rendered
+            full_present = (
+                detail == "FULL FILE"
+                and f"===== FULL FILE: {path.relative_to(repo).as_posix()} ====="
+                in rendered
+            )
+            if state not in {"rendered", "fallback"} or not (
+                exact_present or full_present
+            ):
+                incomplete.append(
+                    f"{path.relative_to(repo).as_posix()}::{symbol}"
+                )
+        if incomplete:
+            rendered += (
+                "\n===== CONTEXT CONTRACT INCOMPLETE =====\n"
+                + "\n".join(f"- {item}" for item in dict.fromkeys(incomplete))
+                + "\n"
+            )
+
+    if get_boolean_setting("CHATCODE_RETRIEVAL_DEBUG") and contract_plan.active:
+        print("Context contract planner:", file=os.sys.stderr)
+        for diagnostic in contract_plan.diagnostics:
+            print(f"- {diagnostic}", file=os.sys.stderr)
     if get_boolean_setting("CHATCODE_RETRIEVAL_DEBUG") and coverage_plan.symbols:
         print("Source coverage planner:", file=os.sys.stderr)
         for diagnostic in coverage_plan.diagnostics:
@@ -2565,6 +2783,30 @@ def _format_selected_files(files: list[Path], repo: Path, source_context: str) -
     return "\n".join(lines) or "None"
 
 
+def _assert_publishable_context_contract(
+    output_file: Path, source_context: str,
+) -> None:
+    marker = "===== CONTEXT CONTRACT INCOMPLETE ====="
+    if marker not in source_context:
+        return
+    try:
+        output_file.unlink(missing_ok=True)
+    except OSError:
+        pass
+    tail = source_context.split(marker, 1)[1]
+    missing = [
+        line[2:]
+        for line in tail.splitlines()
+        if line.startswith("- ") and "::" in line
+    ]
+    details = ", ".join(missing[:8]) or "required source"
+    raise ContextBuildError(
+        "ChatCode could not materialize all mandatory current source "
+        f"within the hard context budget: {details}. "
+        "No UPLOAD_TO_CHATGPT.md was published."
+    )
+
+
 def build_patch_context(
     repo: Path,
     task: str,
@@ -2591,6 +2833,7 @@ def build_patch_context(
         files,
         target_symbols,
     )
+    _assert_publishable_context_contract(output_file, source_context)
     parts = [
         "# ChatCode Patch Context",
         "",
@@ -2783,6 +3026,7 @@ def build_context(
         files,
         target_symbols,
     )
+    _assert_publishable_context_contract(output_file, source_context)
 
     parts = [
         "# ChatCode Context",
