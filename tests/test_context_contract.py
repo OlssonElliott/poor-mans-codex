@@ -525,7 +525,7 @@ class ContextContractTests(unittest.TestCase):
         self.assertIn("_graph_data", contract.mandatory_symbols.get(api, []))
         self.assertIn("DungeonEditor", contract.mandatory_symbols.get(editor, []))
         self.assertIn("RoomInspector", contract.mandatory_symbols.get(editor, []))
-        self.assertIn("DashboardAPITests", contract.mandatory_symbols.get(api_tests, []))
+        self.assertNotIn("DashboardAPITests", contract.mandatory_symbols.get(api_tests, []))
         self.assertIn("setUp", contract.mandatory_symbols.get(api_tests, []))
         self.assertIn(
             "test_room_feature_create_route",
@@ -553,6 +553,263 @@ class ContextContractTests(unittest.TestCase):
             "STRUCTURAL_API_SETUP",
             "STRUCTURAL_CREATE_TEST",
             "STRUCTURAL_DELETE_TEST",
+        ):
+            self.assertIn(marker, context)
+        self.assertNotIn("===== CONTEXT CONTRACT INCOMPLETE =====", context)
+
+    def test_selected_transport_and_tests_activate_without_role_words(self) -> None:
+        task = """\
+Room Features backend already exists with persistence and WorldService support.
+Implement Room Features in the DM dashboard.
+In the room editor, list existing features, add new ones, edit them and remove them.
+"""
+        api = self.write(
+            "rpg_bot/dashboard_api.py",
+            "def _node_data(room):\n"
+            "    return {'EVIDENCE_NODE': room}\n\n"
+            "class DashboardAPI:\n"
+            "    def handle(self, method, path, body=None):\n"
+            "        return self._handle(method, path, body or {})\n\n"
+            "    def _handle(self, method, path, body):\n"
+            "        marker = 'EVIDENCE_ROUTER'\n"
+            "        return 200, _node_data(body)\n",
+        )
+        server = self.write(
+            "rpg_bot/dashboard_server.py",
+            "class DashboardRequestHandler:\n"
+            "    def _send_json(self, status, payload):\n"
+            "        marker = 'HTTP_ADAPTER_SEND_JSON'\n"
+            "        return status, payload\n\n"
+            "    def do_GET(self):\n"
+            "        marker = 'HTTP_ADAPTER_GET'\n"
+            "        return self._send_json(200, {})\n",
+        )
+        editor = self.write(
+            "dashboard/app/dungeon-editor.tsx",
+            "export function DungeonEditor() {\n"
+            "  return <RoomInspector />;\n"
+            "}\n\n"
+            "function RoomInspector() {\n"
+            "  return <section>Room Features</section>;\n"
+            "}\n",
+        )
+        api_tests = self.write(
+            "tests/test_dashboard_api.py",
+            "import unittest\n\n"
+            "class DashboardAPITests(unittest.TestCase):\n"
+            "    def setUp(self):\n"
+            "        self.marker = 'EVIDENCE_SETUP'\n\n"
+            "    def test_room_feature_existing_route(self):\n"
+            "        marker = 'EVIDENCE_API_TEST'\n"
+            "        self.assertIn('room', marker.lower())\n",
+        )
+        files = [api, server, editor, api_tests]
+        save_map(self.repo, {"version": 3, "files": {
+            "rpg_bot/dashboard_api.py": {
+                "symbols": [
+                    {"name": "_node_data"},
+                    {"name": "DashboardAPI"},
+                    {"name": "handle"},
+                    {"name": "_handle"},
+                ],
+                "dependencies": [],
+            },
+            "rpg_bot/dashboard_server.py": {
+                "symbols": [
+                    {"name": "DashboardRequestHandler"},
+                    {"name": "_send_json"},
+                    {"name": "do_GET"},
+                ],
+                "dependencies": [
+                    "rpg_bot/dashboard_api.py",
+                ],
+            },
+            "dashboard/app/dungeon-editor.tsx": {
+                "symbols": [
+                    {"name": "DungeonEditor"},
+                    {"name": "RoomInspector"},
+                ],
+                "dependencies": [],
+            },
+            "tests/test_dashboard_api.py": {
+                "symbols": [
+                    {"name": "DashboardAPITests"},
+                    {"name": "setUp"},
+                    {"name": "test_room_feature_existing_route"},
+                ],
+                "dependencies": [],
+            },
+        }})
+        retrieval_targets = {
+            api: ["_node_data"],
+            server: ["DashboardRequestHandler"],
+            editor: ["RoomInspector"],
+            api_tests: ["test_room_feature_existing_route"],
+        }
+
+        coverage = plan_source_coverage(
+            self.repo, task, files, retrieval_targets
+        )
+        contract = plan_context_contract(
+            self.repo,
+            task,
+            files,
+            retrieval_targets,
+            coverage,
+        )
+
+        self.assertIn("handle", contract.mandatory_symbols.get(api, []))
+        self.assertIn("_handle", contract.mandatory_symbols.get(api, []))
+        self.assertNotIn("do_GET", contract.mandatory_symbols.get(server, []))
+        self.assertNotIn("_send_json", contract.mandatory_symbols.get(server, []))
+        self.assertIn(
+            "test_room_feature_existing_route",
+            contract.mandatory_symbols.get(api_tests, []),
+        )
+        self.assertIn("setUp", contract.mandatory_symbols.get(api_tests, []))
+
+    def test_qualified_python_owners_materialize_ambiguous_backend_and_setup(self) -> None:
+        api = self.write(
+            "rpg_bot/dashboard_api.py",
+            "def _node_data(room):\n"
+            "    return {'QUALIFIED_NODE_SERIALIZER': room}\n\n"
+            "def _room_feature_data(value):\n"
+            "    return {'QUALIFIED_ROOM_FEATURE_HELPER': value}\n\n"
+            "class UnrelatedAPI:\n"
+            "    def handle(self, method, path, body=None):\n"
+            "        return self._handle(method, path, body or {})\n\n"
+            "    def _handle(self, method, path, body):\n"
+            "        return 418, body\n\n"
+            "class DashboardAPI:\n"
+            "    def handle(self, method, path, body=None):\n"
+            "        marker = 'QUALIFIED_DASHBOARD_HANDLE'\n"
+            "        return self._handle(method, path, body or {})\n\n"
+            "    def _handle(self, method, path, body):\n"
+            "        marker = 'QUALIFIED_DASHBOARD_ROUTER'\n"
+            "        return 200, _room_feature_data(_node_data(body))\n",
+        )
+        editor = self.write(
+            "dashboard/app/dungeon-editor.tsx",
+            "export function DungeonEditor() {\n"
+            "  return <RoomInspector />;\n"
+            "}\n\n"
+            "function RoomInspector() {\n"
+            "  return <section>Room Features</section>;\n"
+            "}\n",
+        )
+        api_tests = self.write(
+            "tests/test_dashboard_api.py",
+            "import unittest\n\n"
+            "class PortraitAPITests(unittest.TestCase):\n"
+            "    def setUp(self):\n"
+            "        self.marker = 'WRONG_SETUP'\n\n"
+            "    def test_portrait_route(self):\n"
+            "        self.assertTrue(True)\n\n"
+            "class DashboardAPITests(unittest.TestCase):\n"
+            "    def setUp(self):\n"
+            "        self.marker = 'QUALIFIED_DASHBOARD_SETUP'\n\n"
+            "    def test_room_feature_create_route(self):\n"
+            "        marker = 'QUALIFIED_CREATE_TEST'\n"
+            "        self.assertIn('room', marker.lower())\n\n"
+            "    def test_room_feature_delete_route(self):\n"
+            "        marker = 'QUALIFIED_DELETE_TEST'\n"
+            "        self.assertIn('room', marker.lower())\n",
+        )
+        files = [api, editor, api_tests]
+        save_map(self.repo, {"version": 3, "files": {
+            "rpg_bot/dashboard_api.py": {
+                "symbols": [
+                    {"name": "_node_data", "qualified_name": "_node_data", "kind": "function"},
+                    {"name": "_room_feature_data", "qualified_name": "_room_feature_data", "kind": "function"},
+                    {"name": "UnrelatedAPI", "qualified_name": "UnrelatedAPI", "kind": "class"},
+                    {"name": "handle", "qualified_name": "UnrelatedAPI.handle", "kind": "method"},
+                    {"name": "_handle", "qualified_name": "UnrelatedAPI._handle", "kind": "method"},
+                    {"name": "DashboardAPI", "qualified_name": "DashboardAPI", "kind": "class"},
+                    {"name": "handle", "qualified_name": "DashboardAPI.handle", "kind": "method"},
+                    {"name": "_handle", "qualified_name": "DashboardAPI._handle", "kind": "method"},
+                ],
+                "dependencies": [],
+            },
+            "dashboard/app/dungeon-editor.tsx": {
+                "symbols": [
+                    {"name": "DungeonEditor"},
+                    {"name": "RoomInspector"},
+                ],
+                "dependencies": [],
+            },
+            "tests/test_dashboard_api.py": {
+                "symbols": [
+                    {"name": "PortraitAPITests", "qualified_name": "PortraitAPITests", "kind": "class"},
+                    {"name": "setUp", "qualified_name": "PortraitAPITests.setUp", "kind": "method"},
+                    {"name": "test_portrait_route", "qualified_name": "PortraitAPITests.test_portrait_route", "kind": "method"},
+                    {"name": "DashboardAPITests", "qualified_name": "DashboardAPITests", "kind": "class"},
+                    {"name": "setUp", "qualified_name": "DashboardAPITests.setUp", "kind": "method"},
+                    {"name": "test_room_feature_create_route", "qualified_name": "DashboardAPITests.test_room_feature_create_route", "kind": "method"},
+                    {"name": "test_room_feature_delete_route", "qualified_name": "DashboardAPITests.test_room_feature_delete_route", "kind": "method"},
+                ],
+                "dependencies": [],
+            },
+        }})
+        retrieval_targets = {
+            api: ["_node_data"],
+            editor: ["RoomInspector"],
+        }
+
+        coverage = plan_source_coverage(
+            self.repo, ROOM_FEATURE_TASK, files, retrieval_targets
+        )
+        contract = plan_context_contract(
+            self.repo,
+            ROOM_FEATURE_TASK,
+            files,
+            retrieval_targets,
+            coverage,
+        )
+
+        self.assertIn(
+            "DashboardAPI.handle",
+            contract.mandatory_symbols.get(api, []),
+        )
+        self.assertIn(
+            "DashboardAPI._handle",
+            contract.mandatory_symbols.get(api, []),
+        )
+        self.assertIn(
+            "_room_feature_data",
+            contract.mandatory_symbols.get(api, []),
+        )
+        self.assertNotIn(
+            "UnrelatedAPI._handle",
+            contract.mandatory_symbols.get(api, []),
+        )
+        self.assertIn(
+            "DashboardAPITests.setUp",
+            contract.mandatory_symbols.get(api_tests, []),
+        )
+        self.assertNotIn(
+            "PortraitAPITests.setUp",
+            contract.mandatory_symbols.get(api_tests, []),
+        )
+        self.assertNotIn(
+            "DashboardAPITests",
+            contract.mandatory_symbols.get(api_tests, []),
+        )
+
+        with patch(
+            "chatcode.context_builder.collect_relevant_files",
+            return_value=(files, retrieval_targets),
+        ):
+            output = build_context(self.repo, ROOM_FEATURE_TASK)
+
+        context = output.read_text(encoding="utf-8")
+        for marker in (
+            "QUALIFIED_DASHBOARD_HANDLE",
+            "QUALIFIED_DASHBOARD_ROUTER",
+            "QUALIFIED_NODE_SERIALIZER",
+            "QUALIFIED_ROOM_FEATURE_HELPER",
+            "QUALIFIED_DASHBOARD_SETUP",
+            "QUALIFIED_CREATE_TEST",
+            "QUALIFIED_DELETE_TEST",
         ):
             self.assertIn(marker, context)
         self.assertNotIn("===== CONTEXT CONTRACT INCOMPLETE =====", context)

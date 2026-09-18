@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import ast
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from chatcode.indexing.project_graph import load_map
@@ -136,6 +136,16 @@ class DefinitionEvidence:
     kind: str
     text: str
     line_count: int
+    owner: str | None = None
+    qualified_name: str | None = None
+    ambiguous: bool = False
+
+    @property
+    def materialization_name(self) -> str:
+        """Return a source locator that stays safe when method names collide."""
+        if self.ambiguous and self.qualified_name:
+            return self.qualified_name
+        return self.name
 
 
 @dataclass
@@ -239,6 +249,7 @@ def _python_definitions(path: Path, source: str) -> list[DefinitionEvidence]:
             "class" if isinstance(node, ast.ClassDef) else "function",
             text,
             line_count,
+            qualified_name=node.name,
         ))
         if not isinstance(node, ast.ClassDef):
             continue
@@ -252,13 +263,18 @@ def _python_definitions(path: Path, source: str) -> list[DefinitionEvidence]:
                 "class" if isinstance(member, ast.ClassDef) else "method",
                 member_text,
                 member_lines,
+                owner=node.name,
+                qualified_name=f"{node.name}.{member.name}",
             ))
     counts: dict[str, int] = {}
     for definition in raw:
         counts[definition.name] = counts.get(definition.name, 0) + 1
-    # The existing materializer resolves by unqualified name. Do not promote
-    # ambiguous methods that it cannot map back to a unique source node safely.
-    return [definition for definition in raw if counts[definition.name] == 1]
+    # Preserve ambiguous methods instead of deleting their evidence. Their
+    # qualified locator is used only when an unqualified name would be unsafe.
+    return [
+        replace(definition, ambiguous=counts[definition.name] > 1)
+        for definition in raw
+    ]
 
 
 def _generic_definitions(path: Path, source: str) -> list[DefinitionEvidence]:
@@ -561,7 +577,8 @@ def plan_source_coverage(
     selected_keys: set[tuple[Path, str]] = set()
 
     def add(definition: DefinitionEvidence, reason: str) -> bool:
-        key = (definition.path, definition.name)
+        symbol = definition.materialization_name
+        key = (definition.path, symbol)
         if key in selected_keys:
             return False
         if len(selected_keys) >= MAX_COVERAGE_SYMBOLS:
@@ -574,7 +591,7 @@ def plan_source_coverage(
         per_file[definition.path] = per_file.get(definition.path, 0) + 1
         if definition.path not in plan.paths:
             plan.paths.append(definition.path)
-        plan.symbols.setdefault(definition.path, []).append(definition.name)
+        plan.symbols.setdefault(definition.path, []).append(symbol)
         plan.reasons[key] = reason
         return True
 

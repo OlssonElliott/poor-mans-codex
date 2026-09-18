@@ -1739,6 +1739,37 @@ def _generic_symbol_span(
     return start_line, end_line
 
 
+def _python_symbol_node(tree: ast.Module, symbol: str) -> ast.AST | None:
+    """Resolve one current Python definition, including Class.method locators."""
+    parts = symbol.split(".")
+    if len(parts) == 1:
+        matches = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and node.name == symbol
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    body: list[ast.stmt] = list(tree.body)
+    current: ast.AST | None = None
+    for position, part in enumerate(parts):
+        matches = [
+            node
+            for node in body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and node.name == part
+        ]
+        if len(matches) != 1:
+            return None
+        current = matches[0]
+        if position < len(parts) - 1:
+            if not isinstance(current, ast.ClassDef):
+                return None
+            body = list(current.body)
+    return current
+
+
 def _fresh_symbol_ranges(content: str, path: Path, symbols: list[str]) -> list[tuple[int, int]]:
     """Locate requested definitions in fresh Python or JS/TS source."""
     if not symbols:
@@ -1757,34 +1788,44 @@ def _fresh_symbol_ranges(content: str, path: Path, symbols: list[str]) -> list[t
     if suffix != ".py":
         return []
 
-    wanted = set(symbols)
     try:
         tree = ast.parse(content)
     except SyntaxError:
         return []
     ranges: list[tuple[int, int, bool, str]] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+    for symbol in symbols:
+        node = _python_symbol_node(tree, symbol)
+        if (
+            node is None
+            or not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            or not hasattr(node, "end_lineno")
+        ):
             continue
-        if node.name not in wanted or not hasattr(node, "end_lineno"):
-            continue
-        start = min([node.lineno, *(item.lineno for item in node.decorator_list)] if node.decorator_list else [node.lineno])
-        ranges.append((start, node.end_lineno, isinstance(node, ast.ClassDef), node.name))
+        start = min(
+            [node.lineno, *(item.lineno for item in node.decorator_list)]
+            if node.decorator_list else [node.lineno]
+        )
+        ranges.append((
+            start,
+            node.end_lineno,
+            isinstance(node, ast.ClassDef),
+            symbol,
+        ))
     # When an explicit class and concrete methods inside it are both targets,
     # the methods are the precise patch surface. Emitting the enclosing class
     # would turn distant methods into one enormous range and waste the budget.
     filtered = [
-        (start, end, name)
-        for start, end, is_class, name in ranges
+        (start, end, symbol)
+        for start, end, is_class, symbol in ranges
         if not is_class or not any(
             not other_is_class and start <= other_start and other_end <= end
-            for other_start, other_end, other_is_class, _other_name in ranges
+            for other_start, other_end, other_is_class, _other_symbol in ranges
         )
     ]
-    order = {name: index for index, name in enumerate(symbols)}
+    order = {symbol: index for index, symbol in enumerate(symbols)}
     return [
         (start, end)
-        for start, end, _name in sorted(
+        for start, end, symbol in sorted(
             filtered, key=lambda item: (order.get(item[2], len(order)), item[0])
         )
     ]
@@ -1815,42 +1856,43 @@ def _fresh_symbol_node(
         tree = ast.parse(content)
     except SyntaxError:
         return None
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            continue
-        if node.name != symbol or not hasattr(node, "end_lineno"):
-            continue
-        start = min(
-            [node.lineno, *(item.lineno for item in node.decorator_list)]
-            if node.decorator_list else [node.lineno]
+    node = _python_symbol_node(tree, symbol)
+    if (
+        node is None
+        or not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        or not hasattr(node, "end_lineno")
+    ):
+        return None
+    start = min(
+        [node.lineno, *(item.lineno for item in node.decorator_list)]
+        if node.decorator_list else [node.lineno]
+    )
+    calls = [
+        call.func.attr if isinstance(call.func, ast.Attribute) else call.func.id
+        for call in sorted(
+            (item for item in ast.walk(node) if isinstance(item, ast.Call)),
+            key=lambda item: (item.lineno, item.col_offset),
         )
-        calls = [
-            call.func.attr if isinstance(call.func, ast.Attribute) else call.func.id
-            for call in sorted(
-                (item for item in ast.walk(node) if isinstance(item, ast.Call)),
-                key=lambda item: (item.lineno, item.col_offset),
+        if isinstance(call.func, (ast.Attribute, ast.Name))
+    ]
+    # Decorator callbacks are implementation dependencies even though the
+    # callback is passed by name rather than invoked in the function body
+    # (for example ``@autocomplete(item=choice_provider)``).
+    for decorator in node.decorator_list:
+        for call in (
+            item for item in ast.walk(decorator) if isinstance(item, ast.Call)
+        ):
+            calls.extend(
+                keyword.value.id
+                for keyword in call.keywords
+                if isinstance(keyword.value, ast.Name)
             )
-            if isinstance(call.func, (ast.Attribute, ast.Name))
-        ]
-        # Decorator callbacks are implementation dependencies even though the
-        # callback is passed by name rather than invoked in the function body
-        # (for example ``@autocomplete(item=choice_provider)``).
-        for decorator in node.decorator_list:
-            for call in (
-                item for item in ast.walk(decorator) if isinstance(item, ast.Call)
-            ):
-                calls.extend(
-                    keyword.value.id
-                    for keyword in call.keywords
-                    if isinstance(keyword.value, ast.Name)
-                )
-        return (
-            "".join(lines[start - 1:node.end_lineno]),
-            list(dict.fromkeys(calls)),
-            start,
-            node.end_lineno,
-        )
-    return None
+    return (
+        "".join(lines[start - 1:node.end_lineno]),
+        list(dict.fromkeys(calls)),
+        start,
+        node.end_lineno,
+    )
 
 
 def _full_current_file_section(repo: Path, path: Path) -> str:
