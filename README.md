@@ -175,7 +175,7 @@ cd C:\repos\my-project
 ### 5. Create context for a task
 
 ```bash
-chatcode context "Players should be able to give items to another player after the receiver accepts the request"
+chatcode context "Add a new API endpoint for updating user profile settings."
 ```
 
 ChatCode builds or updates the repository index, retrieves the relevant implementation surfaces and creates:
