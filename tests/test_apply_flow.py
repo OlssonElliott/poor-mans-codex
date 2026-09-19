@@ -8,7 +8,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from chatcode.context_state import get_stale_context_reason, save_context_state
+from chatcode.context_state import (
+    get_context_kind,
+    get_stale_context_reason,
+    save_context_state,
+)
 from chatcode.patch import (
     PatchError,
     ApplyResult,
@@ -1217,6 +1221,37 @@ class ApplyFlowTests(unittest.TestCase):
 
         self.assertIn("app.py", second.paths)
         self.assertEqual(self.source.read_text(encoding="utf-8"), "value = 3\n")
+
+    def test_successful_repair_consumes_generation_before_context_is_deleted(self) -> None:
+        save_context_state(self.repo, task="feature library task")
+        first = apply_patch(self.repo, self.canonical_patch(1, 2))
+        failure = "tests.test_regression"
+        failed = TestResult(**{
+            **self.result(1).__dict__,
+            "failed_tests": frozenset({failure}),
+        })
+        build_test_failure_repair_context(
+            self.repo,
+            first,
+            TestValidation(
+                baseline=self.result(),
+                targeted=None,
+                full=failed,
+                status="regressions",
+                new_failures=frozenset({failure}),
+            ),
+        )
+
+        apply_patch(self.repo, self.canonical_patch(2, 3))
+
+        self.assertFalse(get_repair_context_file(self.repo).exists())
+        self.assertEqual(get_context_kind(self.repo), "consumed")
+        self.assertIsNone(get_stale_context_reason(self.repo, {"app.py"}))
+
+        # A later patch is independent of the already-consumed repair
+        # generation even though its repair Markdown has been removed.
+        apply_patch(self.repo, self.canonical_patch(3, 4))
+        self.assertEqual(self.source.read_text(encoding="utf-8"), "value = 4\n")
 
     def test_repair_patch_rejects_manual_edit_after_repair_context(self) -> None:
         save_context_state(self.repo, task="normal task")

@@ -217,6 +217,10 @@ def get_stale_context_reason(
 
     expected_context_hash = state.get("context_sha256")
     context_kind = state.get("context_kind", "normal")
+    if context_kind == "consumed":
+        # The published context has already produced an applied patch. Keep
+        # its task for provenance without constraining a later patch.
+        return None
     is_repair = context_kind == "repair"
     if isinstance(expected_context_hash, str) and expected_context_hash:
         context_filename = state.get("context_filename", "UPLOAD_TO_CHATGPT.md")

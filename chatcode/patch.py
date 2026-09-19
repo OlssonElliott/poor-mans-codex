@@ -1927,6 +1927,18 @@ def _apply_patch_core(
     except Exception:
         pass
 
+    # Normal and repair contexts are single-use. Once their patch has been
+    # applied, keeping that generation active makes a later unrelated patch
+    # appear stale. Repair contexts are especially vulnerable because their
+    # Markdown file is removed immediately below while context-state.json would
+    # otherwise continue pointing at it.
+    if get_context_kind(repo) in {"normal", "repair"}:
+        save_context_state(
+            repo,
+            task=get_context_task(repo),
+            context_kind="consumed",
+        )
+
     _clear_repair_context(repo)
     _clear_incoming_patch(repo)
 
