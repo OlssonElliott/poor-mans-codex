@@ -5,6 +5,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from .generic_structure import GENERIC_SYMBOL
+
 
 MAX_SYMBOLS = 100
 MAX_IMPORTS = 100
@@ -91,16 +93,6 @@ class _PythonVisitor(ast.NodeVisitor):
                 self.imports.append(f"{base}{separator}{alias.name}")
 
 
-GENERIC_SYMBOL = re.compile(
-    r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?"
-    r"(?:(?P<kind>class|interface|function|enum)\s+"
-    r"(?P<named>[A-Za-z_$][\w$]*)|"
-    r"type\s+(?P<type_name>[A-Za-z_$][\w$]*)\s*=|"
-    r"(?:const|let|var)\s+(?P<binding>[A-Za-z_$][\w$]*)"
-    r"(?:\s*:\s*[^=\n]+)?\s*=\s*(?:async\s*)?"
-    r"(?:<[^>\n]+>\s*)?\([^)]*\)(?:\s*:\s*[^=\n]+)?\s*=>)",
-    re.MULTILINE,
-)
 GENERIC_IMPORT = re.compile(
     r"(?:import\s+(?:[^;]*?\s+from\s+)?|require\s*\(\s*)['\"]([^'\"]+)['\"]"
 )

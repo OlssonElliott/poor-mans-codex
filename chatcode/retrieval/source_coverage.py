@@ -14,8 +14,12 @@ import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from chatcode.indexing.generic_structure import (
+    GENERIC_SYMBOL,
+    GENERIC_SYMBOL_SUFFIXES,
+    generic_symbol_span,
+)
 from chatcode.indexing.project_graph import load_map
-from chatcode.indexing.static_analyzer import GENERIC_SYMBOL
 from chatcode.retrieval.hybrid_retriever import (
     _surface_tokens,
     _task_is_complex,
@@ -26,7 +30,7 @@ from chatcode.retrieval.hybrid_retriever import (
 MAX_COVERAGE_FILES = 8
 MAX_COVERAGE_SYMBOLS = 28
 MAX_COVERAGE_SYMBOLS_PER_FILE = 6
-GENERIC_SUFFIXES = {".js", ".jsx", ".ts", ".tsx"}
+GENERIC_SUFFIXES = set(GENERIC_SYMBOL_SUFFIXES)
 
 ROLE_TRIGGERS = {
     "persistence": frozenset({
@@ -278,9 +282,9 @@ def _python_definitions(path: Path, source: str) -> list[DefinitionEvidence]:
 
 
 def _generic_definitions(path: Path, source: str) -> list[DefinitionEvidence]:
-    matches = list(GENERIC_SYMBOL.finditer(source))
+    lines = source.splitlines(keepends=True)
     definitions: list[DefinitionEvidence] = []
-    for index, match in enumerate(matches):
+    for match in GENERIC_SYMBOL.finditer(source):
         name = (
             match.group("named")
             or match.group("type_name")
@@ -288,15 +292,15 @@ def _generic_definitions(path: Path, source: str) -> list[DefinitionEvidence]:
         )
         if not name:
             continue
+        span = generic_symbol_span(source, name)
+        if span is None:
+            continue
         kind = match.group("kind") or ("type" if match.group("type_name") else "function")
-        start = match.start()
-        next_start = matches[index + 1].start() if index + 1 < len(matches) else len(source)
-        # This text is only evidence for ranking. Exact materialization is done
-        # later from fresh source by context_builder's JS/TS locator.
-        end = min(next_start, start + 16_000)
-        text = source[start:end]
-        line_count = max(1, text.count("\n") + 1)
-        definitions.append(DefinitionEvidence(path, name, kind, text, line_count))
+        start, end = span
+        text = "".join(lines[start - 1:end])
+        definitions.append(
+            DefinitionEvidence(path, name, kind, text, max(1, end - start + 1))
+        )
     return definitions
 
 

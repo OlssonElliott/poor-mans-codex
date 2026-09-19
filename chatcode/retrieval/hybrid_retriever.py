@@ -16,6 +16,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from chatcode.config import get_setting
+from chatcode.indexing.generic_structure import (
+    GENERIC_SYMBOL,
+    GENERIC_SYMBOL_SUFFIXES,
+    generic_symbol_span,
+)
 from chatcode.indexing.project_graph import load_map
 
 
@@ -248,6 +253,58 @@ def _python_definition_literal_terms(path: Path) -> dict[str, dict[str, int]]:
     return result
 
 
+_GENERIC_STRING_LITERAL = re.compile(
+    r"""(?s)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)"""
+)
+_GENERIC_JSX_TEXT = re.compile(r">([^<>{}]+)<")
+
+
+def _generic_definition_literal_terms(path: Path) -> dict[str, dict[str, int]]:
+    """Return literal/JSX words owned by complete JS/TS definitions."""
+    try:
+        source = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    lines = source.splitlines(keepends=True)
+    result: dict[str, dict[str, int]] = {}
+    for match in GENERIC_SYMBOL.finditer(source):
+        name = (
+            match.group("named")
+            or match.group("type_name")
+            or match.group("binding")
+        )
+        if not name:
+            continue
+        span = generic_symbol_span(source, name)
+        if span is None:
+            continue
+        start, end = span
+        text = "".join(lines[start - 1:end])
+        terms: dict[str, int] = {}
+        for literal in _GENERIC_STRING_LITERAL.finditer(text):
+            value = literal.group(0)[1:-1]
+            for word in re.findall(r"[A-Za-z0-9]+", value):
+                if len(word) >= 3:
+                    terms.setdefault(word.casefold(), 1)
+        for jsx_text in _GENERIC_JSX_TEXT.finditer(text):
+            for word in re.findall(r"[A-Za-z0-9]+", jsx_text.group(1)):
+                if len(word) >= 3:
+                    terms[word.casefold()] = 2
+        if terms:
+            owned = result.setdefault(name, {})
+            for word, weight in terms.items():
+                owned[word] = max(weight, owned.get(word, 0))
+    return result
+
+
+def _definition_literal_terms(path: Path) -> dict[str, dict[str, int]]:
+    if path.suffix.casefold() == ".py":
+        return _python_definition_literal_terms(path)
+    if path.suffix.casefold() in GENERIC_SYMBOL_SUFFIXES:
+        return _generic_definition_literal_terms(path)
+    return {}
+
+
 def resolve_task_surface_roots(repo: Path, task: str) -> RetrievalResult:
     """Find concrete indexed roots for each explicit requirement in the task."""
     surfaces = _task_surfaces(task)
@@ -295,10 +352,10 @@ def resolve_task_surface_roots(repo: Path, task: str) -> RetrievalResult:
                     ],
                 ])
             )
-            literal_terms_by_file.setdefault(
-                relative, _python_definition_literal_terms(repo / relative)
-                if relative.casefold().endswith(".py") else {},
-            )
+            if relative not in literal_terms_by_file:
+                literal_terms_by_file[relative] = _definition_literal_terms(
+                    repo / relative
+                )
             for symbol in entry.get("symbols", []):
                 if not isinstance(symbol, dict) or not symbol.get("name"):
                     continue
@@ -307,13 +364,6 @@ def resolve_task_surface_roots(repo: Path, task: str) -> RetrievalResult:
                 symbol_tokens = _surface_tokens(symbol_text)
                 overlap = tokens & (symbol_tokens | file_tokens | semantic_tokens)
                 role_symbol_overlap = role_symbol_terms & symbol_tokens
-                if not overlap and not role_symbol_overlap:
-                    continue
-                score = (
-                    70 * len(tokens & symbol_tokens)
-                    + 25 * len(tokens & file_tokens)
-                    + 15 * len(tokens & semantic_tokens)
-                )
                 definition_name = str(symbol.get("definition_name") or name)
                 # Runtime examples in task/feedback are direct evidence for
                 # the definition that owns their literal/template fragments.
@@ -321,8 +371,15 @@ def resolve_task_surface_roots(repo: Path, task: str) -> RetrievalResult:
                     definition_name, {}
                 )
                 literal_overlap = tokens & owned_literal_terms.keys()
+                if not overlap and not role_symbol_overlap and not literal_overlap:
+                    continue
                 if runtime_evidence_only and not literal_overlap:
                     continue
+                score = (
+                    70 * len(tokens & symbol_tokens)
+                    + 25 * len(tokens & file_tokens)
+                    + 15 * len(tokens & semantic_tokens)
+                )
                 score += 240 * sum(owned_literal_terms[word] for word in literal_overlap)
                 if name.casefold() in tokens:
                     score += 120

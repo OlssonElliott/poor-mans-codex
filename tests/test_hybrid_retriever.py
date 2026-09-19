@@ -145,6 +145,34 @@ class HybridRetrieverTests(unittest.TestCase):
 
         self.assertIn("loose_item_autocomplete", result.required_symbols[commands])
 
+    def test_typescript_jsx_literal_promotes_owning_component(self) -> None:
+        editor = self.write(
+            "dashboard/app/dungeon-editor.tsx",
+            "export function DungeonEditor() {\n"
+            "  return <button type=\"button\">Item library</button>;\n"
+            "}\n\n"
+            "function ItemLibraryDialog() {\n"
+            "  return <div>Catalog</div>;\n"
+            "}\n",
+        )
+        self.map({
+            "dashboard/app/dungeon-editor.tsx": {
+                "dependencies": [],
+                "symbols": [
+                    {"name": "DungeonEditor", "kind": "function"},
+                    {"name": "ItemLibraryDialog", "kind": "function"},
+                ],
+            },
+        })
+
+        result = resolve_task_surface_roots(
+            self.repo,
+            "Add a feature library button next to Item library.",
+        )
+
+        self.assertIn(editor, result.files)
+        self.assertIn("DungeonEditor", result.required_symbols[editor])
+
     def test_unresolved_followup_uses_callback_binding_to_find_alternative(self) -> None:
         commands = self.write(
             "commands/items.py",

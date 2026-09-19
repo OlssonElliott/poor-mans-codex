@@ -141,6 +141,65 @@ class ContextContractTests(unittest.TestCase):
         self.assertNotIn("CharacterPortraitPanel", contract.symbols.get(editor, []))
         self.assertTrue(any(contract.requirement_symbols.values()))
 
+    def test_large_typescript_owner_keeps_late_child_reference(self) -> None:
+        padding = "".join(
+            f"  const filler_{index} = '{'x' * 48}';\n"
+            for index in range(420)
+        )
+        editor = self.write(
+            "dashboard/app/dungeon-editor.tsx",
+            "export function DungeonEditor() {\n"
+            + padding
+            + "  return <ItemLibraryDialog />;\n"
+            "}\n\n"
+            "function ItemLibraryDialog() {\n"
+            "  return <div>Item library</div>;\n"
+            "}\n",
+        )
+        self.assertGreater(
+            editor.read_text(encoding="utf-8").find("return <ItemLibraryDialog"),
+            16_000,
+        )
+        save_map(self.repo, {"version": 3, "files": {
+            "dashboard/app/dungeon-editor.tsx": {
+                "symbols": [
+                    {"name": "DungeonEditor", "kind": "function"},
+                    {"name": "ItemLibraryDialog", "kind": "function"},
+                ],
+                "dependencies": [],
+            },
+        }})
+        task = """\
+Add a feature library button next to Item library.
+Create reusable room feature templates.
+Update the dashboard UI for placing room features.
+Keep the existing item library behavior unchanged.
+"""
+        existing = {editor: ["ItemLibraryDialog"]}
+        coverage = plan_source_coverage(self.repo, task, [editor], existing)
+
+        contract = plan_context_contract(
+            self.repo,
+            task,
+            [editor],
+            existing,
+            coverage,
+        )
+
+        self.assertIn("DungeonEditor", contract.mandatory_symbols.get(editor, []))
+
+        context = build_patch_source_context(
+            self.repo,
+            task,
+            files=[editor],
+            target_symbols=existing,
+        )
+        self.assertIn(
+            "SYMBOL CONTEXT: dashboard/app/dungeon-editor.tsx::DungeonEditor",
+            context,
+        )
+        self.assertIn("return <ItemLibraryDialog />;", context)
+
     def test_noisy_retrieval_roots_are_support_not_publication_blockers(self) -> None:
         api = self.write(
             "rpg_bot/dashboard_api.py",
