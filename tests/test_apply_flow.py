@@ -295,6 +295,110 @@ class ApplyFlowTests(unittest.TestCase):
             2,
         )
 
+    def test_blank_line_context_drift_is_reanchored_before_apply(self) -> None:
+        self.source.write_text(
+            "alpha = 1\n"
+            "beta = 2\n"
+            "}\n"
+            "\n"
+            "function target() {\n"
+            "  return 1;\n"
+            "}\n"
+            "omega = 9\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        git(self.repo, "add", "app.py")
+        git(self.repo, "commit", "-qm", "reanchor fixture")
+        self.incoming.write_text(
+            "--- a/app.py\n"
+            "+++ b/app.py\n"
+            "@@ -1,9 +1,10 @@\n"
+            " alpha = 1\n"
+            " beta = 2\n"
+            " }\n"
+            " \n"
+            " \n"
+            "+inserted = True\n"
+            " function target() {\n"
+            "   return 1;\n"
+            " }\n"
+            " omega = 9\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        apply_patch(self.repo, self.incoming)
+
+        self.assertEqual(
+            self.source.read_text(encoding="utf-8"),
+            "alpha = 1\n"
+            "beta = 2\n"
+            "}\n"
+            "\n"
+            "inserted = True\n"
+            "function target() {\n"
+            "  return 1;\n"
+            "}\n"
+            "omega = 9\n",
+        )
+        normalized = self.incoming.read_text(encoding="utf-8")
+        self.assertIn(
+            " }\n \n+inserted = True\n function target() {\n",
+            normalized,
+        )
+
+    def test_ambiguous_blank_line_reanchor_falls_back_to_repair(self) -> None:
+        self.source.write_text(
+            "section\n"
+            "alpha\n"
+            "}\n"
+            "\n"
+            "function target() {\n"
+            "  return 1;\n"
+            "}\n"
+            "separator\n"
+            "section\n"
+            "alpha\n"
+            "}\n"
+            "\n"
+            "function target() {\n"
+            "  return 1;\n"
+            "}\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        git(self.repo, "add", "app.py")
+        git(self.repo, "commit", "-qm", "ambiguous reanchor fixture")
+        self.incoming.write_text(
+            "--- a/app.py\n"
+            "+++ b/app.py\n"
+            "@@ -1,8 +1,9 @@\n"
+            " section\n"
+            " alpha\n"
+            " }\n"
+            " \n"
+            " \n"
+            "+inserted = True\n"
+            " function target() {\n"
+            "   return 1;\n"
+            " }\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        with self.assertRaises(PatchError) as raised:
+            apply_patch(self.repo, self.incoming)
+
+        self.assertEqual(
+            raised.exception.failure_type,
+            "patch_target_mismatch",
+        )
+        self.assertNotIn(
+            "inserted = True",
+            self.source.read_text(encoding="utf-8"),
+        )
+
     def test_successful_apply_removes_repair_context(self) -> None:
         repair = get_repair_context_file(
             self.repo
