@@ -50,9 +50,12 @@ from .workspace import (
 VERIFIED_BASELINE_CACHE_VERSION = 1
 VERIFIED_BASELINE_MAX_AGE_SECONDS = 30 * 60
 from .unified_diff import (
+    DiffLine,
+    Hunk,
     UnifiedDiffError,
     canonicalize_unified_diff,
     parse_unified_diff,
+    serialize_unified_diff,
 )
 from .test_runner import TestResult
 
@@ -496,6 +499,127 @@ def validate_patch_paths(
     return paths
 
 
+MIN_HUNK_CONTEXT_LINES = 3
+
+
+def _required_hunk_context(source_lines: list[str], hunk: Hunk) -> int:
+    removed_lines = sum(line.kind == "-" for line in hunk.lines)
+    return min(
+        MIN_HUNK_CONTEXT_LINES,
+        max(0, len(source_lines) - removed_lines),
+    )
+
+
+def _old_hunk_lines(hunk: Hunk) -> list[str]:
+    return [line.text for line in hunk.lines if line.kind in {" ", "-"}]
+
+
+def _unique_sequence_start(
+    source_lines: list[str],
+    needle: list[str],
+) -> int | None:
+    """Return a zero-based start only when the exact old-side text is unique."""
+    if not needle or len(needle) > len(source_lines):
+        return None
+    match: int | None = None
+    final_start = len(source_lines) - len(needle)
+    for start in range(final_start + 1):
+        if source_lines[start:start + len(needle)] != needle:
+            continue
+        if match is not None:
+            return None
+        match = start
+    return match
+
+
+def _expand_hunk_from_current_source(
+    source_lines: list[str],
+    hunk: Hunk,
+) -> Hunk:
+    context_lines = sum(line.kind == " " for line in hunk.lines)
+    required_context = _required_hunk_context(source_lines, hunk)
+    if context_lines >= required_context:
+        return hunk
+
+    old_lines = _old_hunk_lines(hunk)
+    match_start = _unique_sequence_start(source_lines, old_lines)
+    if match_start is None:
+        return hunk
+
+    match_end = match_start + len(old_lines)
+    missing_context = required_context - context_lines
+    before_capacity = min(MIN_HUNK_CONTEXT_LINES, match_start)
+    after_capacity = min(
+        MIN_HUNK_CONTEXT_LINES,
+        len(source_lines) - match_end,
+    )
+
+    before_count = min(before_capacity, (missing_context + 1) // 2)
+    after_count = min(after_capacity, missing_context - before_count)
+    remaining = missing_context - before_count - after_count
+    if remaining:
+        extra_before = min(before_capacity - before_count, remaining)
+        before_count += extra_before
+        remaining -= extra_before
+    if remaining:
+        extra_after = min(after_capacity - after_count, remaining)
+        after_count += extra_after
+        remaining -= extra_after
+    if remaining:
+        return hunk
+
+    expanded_old_start = match_start - before_count + 1
+    expanded_new_start = expanded_old_start + (hunk.new_start - hunk.old_start)
+    if expanded_new_start < 1:
+        return hunk
+
+    before = tuple(
+        DiffLine(" ", line)
+        for line in source_lines[match_start - before_count:match_start]
+    )
+    after = tuple(
+        DiffLine(" ", line)
+        for line in source_lines[match_end:match_end + after_count]
+    )
+    return replace(
+        hunk,
+        old_start=expanded_old_start,
+        new_start=expanded_new_start,
+        lines=before + hunk.lines + after,
+    )
+
+
+def _expand_thin_hunk_context(repo: Path, patch_text: str) -> str:
+    """Add exact working-tree context when a thin hunk has one safe target."""
+    parsed = parse_unified_diff(patch_text)
+    files = []
+    changed = False
+    for file_patch in parsed.files:
+        if file_patch.old_path == "/dev/null":
+            files.append(file_patch)
+            continue
+        raw_path = file_patch.old_path.removeprefix("a/")
+        source = repo.joinpath(*PurePosixPath(raw_path).parts)
+        try:
+            source_lines = source.read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines()
+        except OSError:
+            files.append(file_patch)
+            continue
+        hunks = tuple(
+            _expand_hunk_from_current_source(source_lines, hunk)
+            for hunk in file_patch.hunks
+        )
+        if hunks != file_patch.hunks:
+            changed = True
+            file_patch = replace(file_patch, hunks=hunks)
+        files.append(file_patch)
+    if not changed:
+        return patch_text
+    return serialize_unified_diff(replace(parsed, files=tuple(files)))
+
+
 def _validate_hunk_context(
     repo: Path,
     patch_text: str,
@@ -515,8 +639,7 @@ def _validate_hunk_context(
             continue
         for hunk in file_patch.hunks:
             context_lines = sum(line.kind == " " for line in hunk.lines)
-            removed_lines = sum(line.kind == "-" for line in hunk.lines)
-            required_context = min(3, max(0, len(source_lines) - removed_lines))
+            required_context = _required_hunk_context(source_lines, hunk)
             # Replacing/deleting the complete file has no possible context.
             if context_lines >= required_context:
                 continue
@@ -1340,6 +1463,7 @@ def _apply_patch_core(
     paths = validate_patch_paths(
         patch_text
     )
+    patch_text = _expand_thin_hunk_context(repo, patch_text)
     try:
         _validate_hunk_context(repo, patch_text)
     except UnifiedDiffError as exc:

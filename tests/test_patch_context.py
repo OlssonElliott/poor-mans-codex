@@ -1419,7 +1419,7 @@ class PatchContextTests(unittest.TestCase):
             incoming.read_text(encoding="utf-8"),
         )
 
-    def test_context_free_hunk_for_large_existing_file_is_rejected_before_apply(self) -> None:
+    def test_context_free_hunk_is_expanded_before_apply_when_target_is_unique(self) -> None:
         source = self.write("app.py", "first\nold\nlast\n")
         self.commit_all()
         incoming = self.root / "fragile.diff"
@@ -1430,19 +1430,18 @@ class PatchContextTests(unittest.TestCase):
             newline="\n",
         )
 
-        with self.assertRaises(PatchError) as raised:
-            apply_patch(self.repo, incoming)
+        apply_patch(self.repo, incoming)
 
         self.assertEqual(
-            raised.exception.failure_type,
-            "insufficient_patch_context",
+            source.read_text(encoding="utf-8"),
+            "first\nnew\nlast\n",
         )
-        repair = get_repair_context_file(self.repo).read_text(encoding="utf-8")
-        self.assertIn("Failure type: `insufficient_patch_context`", repair)
-        self.assertIn("hunk has only 0 unchanged context line(s)", repair)
-        self.assertEqual(source.read_text(encoding="utf-8"), "first\nold\nlast\n")
+        normalized = incoming.read_text(encoding="utf-8")
+        self.assertIn("@@ -1,3 +1,3 @@", normalized)
+        self.assertIn(" first\n-old\n+new\n last\n", normalized)
+        self.assertFalse(get_repair_context_file(self.repo).exists())
 
-    def test_hunk_with_fewer_than_three_available_context_lines_is_rejected(self) -> None:
+    def test_hunk_with_too_little_context_is_expanded_when_target_is_unique(self) -> None:
         source = self.write("app.py", "first\nsecond\nold\nfourth\nfifth\n")
         self.commit_all()
         incoming = self.root / "too-little-context.diff"
@@ -1453,11 +1452,16 @@ class PatchContextTests(unittest.TestCase):
             newline="\n",
         )
 
-        with self.assertRaises(PatchError) as raised:
-            apply_patch(self.repo, incoming)
+        apply_patch(self.repo, incoming)
 
-        self.assertEqual(raised.exception.failure_type, "insufficient_patch_context")
-        self.assertIn("only 2 unchanged context line(s)", str(raised.exception))
+        self.assertEqual(
+            source.read_text(encoding="utf-8"),
+            "first\nsecond\nnew\nfourth\nfifth\n",
+        )
+        normalized = incoming.read_text(encoding="utf-8")
+        self.assertIn("@@ -1,4 +1,4 @@", normalized)
+        self.assertIn(" second\n-old\n+new\n fourth\n", normalized)
+        self.assertFalse(get_repair_context_file(self.repo).exists())
 
     def test_unrelated_uncommitted_change_is_preserved(self) -> None:
         source = self.write("app.py", "old\n")

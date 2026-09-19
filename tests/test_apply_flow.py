@@ -13,6 +13,7 @@ from chatcode.patch import (
     PatchError,
     ApplyResult,
     PatchPreview,
+    _expand_thin_hunk_context,
     TestValidation,
     _classify_test_validation,
     _show_test_validation,
@@ -36,7 +37,7 @@ from chatcode.patch import (
 )
 from chatcode.cli import command_followup
 from chatcode.test_runner import TestResult
-from chatcode.unified_diff import canonicalize_unified_diff
+from chatcode.unified_diff import canonicalize_unified_diff, parse_unified_diff
 from chatcode.workspace import (
     get_default_patch_file,
     get_repair_context_file,
@@ -188,6 +189,111 @@ class ApplyFlowTests(unittest.TestCase):
 
         _before, after = open_diff.call_args.args
         self.assertEqual(after.read_text(encoding="utf-8"), "value = 2\n")
+
+    def test_unique_contextless_hunk_is_expanded_before_apply(self) -> None:
+        self.source.write_text(
+            "alpha = 1\n"
+            "beta = 2\n"
+            "gamma = 3\n"
+            "value = 1\n"
+            "delta = 4\n"
+            "epsilon = 5\n"
+            "zeta = 6\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        git(self.repo, "add", "app.py")
+        git(self.repo, "commit", "-qm", "larger fixture")
+        self.incoming.write_text(
+            "--- a/app.py\n"
+            "+++ b/app.py\n"
+            "@@ -4 +4 @@\n"
+            "-value = 1\n"
+            "+value = 2\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        apply_patch(self.repo, self.incoming)
+
+        parsed = parse_unified_diff(
+            self.incoming.read_text(encoding="utf-8")
+        )
+        hunk = parsed.files[0].hunks[0]
+        self.assertGreaterEqual(
+            sum(line.kind == " " for line in hunk.lines),
+            3,
+        )
+        self.assertIn("value = 2", self.source.read_text(encoding="utf-8"))
+
+    def test_hunk_expansion_uses_uncommitted_working_tree_context(self) -> None:
+        self.source.write_text(
+            "alpha = 1\n"
+            "beta = 2\n"
+            "gamma = 3\n"
+            "value = 1\n"
+            "delta = 4\n"
+            "epsilon = 5\n"
+            "zeta = 6\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        git(self.repo, "add", "app.py")
+        git(self.repo, "commit", "-qm", "larger fixture")
+        self.source.write_text(
+            self.source.read_text(encoding="utf-8").replace(
+                "beta = 2",
+                "beta = 99",
+            ),
+            encoding="utf-8",
+            newline="\n",
+        )
+        patch_text = (
+            "--- a/app.py\n"
+            "+++ b/app.py\n"
+            "@@ -4 +4 @@\n"
+            "-value = 1\n"
+            "+value = 2\n"
+        )
+
+        expanded = _expand_thin_hunk_context(self.repo, patch_text)
+
+        self.assertIn(" beta = 99\n", expanded)
+        self.assertNotIn(" beta = 2\n", expanded)
+
+    def test_ambiguous_contextless_hunk_falls_back_to_repair(self) -> None:
+        self.source.write_text(
+            "alpha = 1\n"
+            "value = 1\n"
+            "middle = 0\n"
+            "value = 1\n"
+            "omega = 9\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        git(self.repo, "add", "app.py")
+        git(self.repo, "commit", "-qm", "ambiguous fixture")
+        self.incoming.write_text(
+            "--- a/app.py\n"
+            "+++ b/app.py\n"
+            "@@ -2 +2 @@\n"
+            "-value = 1\n"
+            "+value = 2\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        with self.assertRaises(PatchError) as raised:
+            apply_patch(self.repo, self.incoming)
+
+        self.assertEqual(
+            raised.exception.failure_type,
+            "insufficient_patch_context",
+        )
+        self.assertEqual(
+            self.source.read_text(encoding="utf-8").count("value = 1"),
+            2,
+        )
 
     def test_successful_apply_removes_repair_context(self) -> None:
         repair = get_repair_context_file(
