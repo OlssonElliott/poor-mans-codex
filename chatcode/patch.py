@@ -1189,6 +1189,61 @@ def get_repair_context_targets(repo: Path) -> frozenset[str]:
     return frozenset(item for item in targets if isinstance(item, str) and item)
 
 
+def _get_repair_context_paths(repo: Path) -> frozenset[str]:
+    """Return the source paths that the active repair context actually exposed."""
+    try:
+        state = json.loads(_repair_state_file(repo).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return frozenset()
+    files = state.get("files")
+    if not isinstance(files, dict):
+        return frozenset()
+    return frozenset(
+        PurePosixPath(raw_path).as_posix()
+        for raw_path in files
+        if isinstance(raw_path, str) and raw_path
+    )
+
+
+def _patch_supersedes_active_repair(
+    repo: Path,
+    patch_paths: set[str],
+    *,
+    force: bool = False,
+) -> bool:
+    """Decide whether an incoming patch is independent of the active repair.
+
+    A repair response may only patch files whose current source was published
+    in PATCH_REPAIR_CONTEXT.md. If the incoming patch expands beyond that
+    bounded scope, it is a new independent patch and must not inherit the old
+    repair generation. ``force`` handles the inherently ambiguous case where a
+    new task happens to touch exactly the same files as the old repair.
+    """
+    if get_context_kind(repo) != "repair":
+        return False
+    if force:
+        return True
+    repair_paths = _get_repair_context_paths(repo)
+    if not repair_paths:
+        # Missing/corrupt repair metadata stays fail-closed.
+        return False
+    normalized_paths = {
+        PurePosixPath(path).as_posix()
+        for path in patch_paths
+    }
+    return not normalized_paths.issubset(repair_paths)
+
+
+def _supersede_active_repair(repo: Path) -> None:
+    """Retire an abandoned repair generation before accepting a new task."""
+    save_context_state(
+        repo,
+        task=None,
+        context_kind="superseded",
+    )
+    _clear_repair_context(repo)
+
+
 def get_repair_context_stale_reason(repo: Path) -> str | None:
     output_file = get_repair_context_file(repo)
     state_file = _repair_state_file(repo)
@@ -1675,6 +1730,7 @@ def _apply_patch_core(
     patch_file: Path,
     *,
     dry_run: bool = False,
+    new_task: bool = False,
 ) -> ApplyResult | PatchPreview:
     patch_file = patch_file.resolve()
 
@@ -1786,7 +1842,18 @@ def _apply_patch_core(
         ).resolve()
     )
 
-    if patch_file == default_patch_file:
+    supersedes_repair = (
+        patch_file == default_patch_file
+        and _patch_supersedes_active_repair(
+            repo,
+            paths,
+            force=new_task,
+        )
+    )
+    if supersedes_repair and not dry_run:
+        _supersede_active_repair(repo)
+
+    if patch_file == default_patch_file and not supersedes_repair:
         stale_reason = (
             get_stale_context_reason(
                 repo,
@@ -2924,14 +2991,24 @@ def _run_apply_flow(
     patch_file: Path,
     *,
     yes: bool = False,
+    new_task: bool = False,
 ) -> ApplyResult:
-    repair_targets = get_active_repair_targets(repo)
     preview = _apply_patch_core(
         repo,
         patch_file,
         dry_run=True,
+        new_task=new_task,
     )
     assert isinstance(preview, PatchPreview)
+    repair_targets = (
+        frozenset()
+        if _patch_supersedes_active_repair(
+            repo,
+            preview.paths,
+            force=new_task,
+        )
+        else get_active_repair_targets(repo)
+    )
 
     # Start only after the candidate has passed all non-mutating applicability
     # checks. The snapshot is rechecked immediately before mutation below.
@@ -3034,6 +3111,7 @@ def _run_apply_flow(
     result = _apply_patch_core(
         repo,
         patch_file,
+        new_task=new_task,
     )
     assert isinstance(result, ApplyResult)
 
@@ -3149,18 +3227,22 @@ def _run_apply_flow(
 def apply_patch(
     repo: Path,
     patch_file: Path,
+    *,
+    new_task: bool = False,
 ) -> ApplyResult:
     if _CLI_APPLY_INVOCATION:
         _run_apply_flow(
             repo,
             patch_file,
             yes=_CLI_APPLY_YES,
+            new_task=new_task,
         )
         raise SystemExit(0)
 
     result = _apply_patch_core(
         repo,
         patch_file,
+        new_task=new_task,
     )
     assert isinstance(result, ApplyResult)
     return result

@@ -217,9 +217,9 @@ def get_stale_context_reason(
 
     expected_context_hash = state.get("context_sha256")
     context_kind = state.get("context_kind", "normal")
-    if context_kind == "consumed":
-        # The published context has already produced an applied patch. Keep
-        # its task for provenance without constraining a later patch.
+    if context_kind in {"consumed", "superseded"}:
+        # Consumed contexts and abandoned repair generations are historical
+        # provenance only. They must not constrain a later independent patch.
         return None
     is_repair = context_kind == "repair"
     if isinstance(expected_context_hash, str) and expected_context_hash:

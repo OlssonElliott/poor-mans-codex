@@ -1253,6 +1253,87 @@ class ApplyFlowTests(unittest.TestCase):
         apply_patch(self.repo, self.canonical_patch(3, 4))
         self.assertEqual(self.source.read_text(encoding="utf-8"), "value = 4\n")
 
+    def test_out_of_scope_patch_supersedes_abandoned_repair_generation(self) -> None:
+        other = self.repo / "other.py"
+        other.write_text("other = 1\n", encoding="utf-8", newline="\n")
+        git(self.repo, "add", "other.py")
+        git(self.repo, "commit", "-qm", "add second source")
+
+        save_context_state(self.repo, task="old feature library task")
+        first = apply_patch(self.repo, self.canonical_patch(1, 2))
+        failed = TestResult(**{
+            **self.result(1).__dict__,
+            "failed_tests": frozenset({"tests.test_regression"}),
+        })
+        build_test_failure_repair_context(
+            self.repo,
+            first,
+            TestValidation(
+                baseline=self.result(),
+                targeted=None,
+                full=failed,
+                status="regressions",
+                new_failures=failed.failed_tests,
+            ),
+        )
+        self.assertEqual(get_context_kind(self.repo), "repair")
+
+        incoming = get_default_patch_file(self.repo)
+        incoming.write_text(
+            "--- a/app.py\n"
+            "+++ b/app.py\n"
+            "@@ -1 +1 @@\n"
+            "-value = 2\n"
+            "+value = 3\n"
+            "--- a/other.py\n"
+            "+++ b/other.py\n"
+            "@@ -1 +1 @@\n"
+            "-other = 1\n"
+            "+other = 2\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        result = apply_patch(self.repo, incoming)
+
+        self.assertEqual(result.paths, {"app.py", "other.py"})
+        self.assertEqual(self.source.read_text(encoding="utf-8"), "value = 3\n")
+        self.assertEqual(other.read_text(encoding="utf-8"), "other = 2\n")
+        self.assertEqual(get_context_kind(self.repo), "superseded")
+        self.assertFalse(get_repair_context_file(self.repo).exists())
+        self.assertIsNone(get_stale_context_reason(self.repo, {"app.py", "other.py"}))
+
+    def test_new_task_flag_supersedes_same_scope_repair_generation(self) -> None:
+        save_context_state(self.repo, task="old task")
+        first = apply_patch(self.repo, self.canonical_patch(1, 2))
+        failed = TestResult(**{
+            **self.result(1).__dict__,
+            "failed_tests": frozenset({"tests.test_regression"}),
+        })
+        build_test_failure_repair_context(
+            self.repo,
+            first,
+            TestValidation(
+                baseline=self.result(),
+                targeted=None,
+                full=failed,
+                status="regressions",
+                new_failures=failed.failed_tests,
+            ),
+        )
+
+        result = apply_patch(
+            self.repo,
+            self.canonical_patch(2, 3),
+            new_task=True,
+        )
+
+        self.assertEqual(result.paths, {"app.py"})
+        self.assertEqual(self.source.read_text(encoding="utf-8"), "value = 3\n")
+        self.assertEqual(get_context_kind(self.repo), "superseded")
+        self.assertFalse(get_repair_context_file(self.repo).exists())
+        self.assertIsNone(get_stale_context_reason(self.repo, {"app.py"}))
+
     def test_repair_patch_rejects_manual_edit_after_repair_context(self) -> None:
         save_context_state(self.repo, task="normal task")
         first = apply_patch(self.repo, self.canonical_patch(1, 2))
@@ -1729,6 +1810,7 @@ class ApplyFlowTests(unittest.TestCase):
             self.repo,
             self.incoming,
             yes=False,
+            new_task=False,
         )
 
     def test_cli_yes_flag_is_consumed_before_parser(self) -> None:

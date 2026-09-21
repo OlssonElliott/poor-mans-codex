@@ -407,6 +407,7 @@ def command_apply(
     patch_path: str | None,
     no_test: bool,
     no_review: bool,
+    new_task: bool = False,
 ) -> int:
     repo = get_repo_root()
 
@@ -423,6 +424,7 @@ def command_apply(
         result = apply_patch(
             repo,
             patch_file,
+            new_task=new_task,
         )
 
     except PatchAlreadyApplied:
@@ -830,6 +832,17 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    apply_parser.add_argument(
+        "--new-task",
+        action="store_true",
+        help=(
+            "Treat incoming.diff as a new independent task and supersede "
+            "any active repair generation. Normally ChatCode detects this "
+            "automatically when the patch leaves the repair context's file "
+            "scope; use this flag when both tasks touch exactly the same files."
+        ),
+    )
+
     undo_parser = (
         subparsers.add_parser(
             "undo",
@@ -933,6 +946,7 @@ def main() -> None:
                     args.patch,
                     args.no_test,
                     args.no_review,
+                    args.new_task,
                 )
 
                 if returncode != 0:
