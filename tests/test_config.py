@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from chatcode.config import get_boolean_setting, get_index_mode, get_setting
-from chatcode.cli import create_parser
+from chatcode.cli import command_status, create_parser
 
 
 class ConfigTests(unittest.TestCase):
@@ -17,6 +17,99 @@ class ConfigTests(unittest.TestCase):
     def test_followup_command_parses(self) -> None:
         args = create_parser().parse_args(["followup"])
         self.assertEqual(args.command, "followup")
+
+    def test_status_shows_completed_background_suite(self) -> None:
+        background = {
+            "state": "completed",
+            "returncode": 0,
+            "command": "python -m pytest -n auto",
+            "duration_seconds": 12.5,
+            "failed_tests": [],
+            "report": "report.md",
+        }
+        with patch(
+            "chatcode.cli.get_repo_root", return_value="repo"
+        ), patch(
+            "chatcode.cli.get_branch", return_value="main"
+        ), patch(
+            "chatcode.cli.build_safe_status", return_value=""
+        ), patch(
+            "chatcode.cli.get_background_full_suite_status",
+            return_value=background,
+        ), patch("builtins.print") as output:
+            command_status()
+
+        rendered = "\n".join(
+            str(call.args[0]) for call in output.call_args_list if call.args
+        )
+        self.assertIn("Background full suite: PASSED", rendered)
+        self.assertIn("Duration: 12.50s", rendered)
+
+    def test_status_colors_passed_background_suite_green(self) -> None:
+        background = {
+            "state": "completed",
+            "returncode": 0,
+        }
+        with patch.dict(os.environ, {}, clear=True), patch(
+            "chatcode.patch.sys.stdout.isatty", return_value=True
+        ), patch(
+            "chatcode.cli.get_repo_root", return_value="repo"
+        ), patch(
+            "chatcode.cli.get_branch", return_value="main"
+        ), patch(
+            "chatcode.cli.build_safe_status", return_value=""
+        ), patch(
+            "chatcode.cli.get_background_full_suite_status",
+            return_value=background,
+        ), patch("builtins.print") as output:
+            command_status()
+
+        rendered = "\n".join(
+            str(call.args[0]) for call in output.call_args_list if call.args
+        )
+        self.assertIn("Background full suite: \x1b[32mPASSED\x1b[0m", rendered)
+
+    def test_status_colors_running_background_suite_yellow(self) -> None:
+        background = {
+            "state": "running",
+        }
+        with patch.dict(os.environ, {}, clear=True), patch(
+            "chatcode.patch.sys.stdout.isatty", return_value=True
+        ), patch(
+            "chatcode.cli.get_repo_root", return_value="repo"
+        ), patch(
+            "chatcode.cli.get_branch", return_value="main"
+        ), patch(
+            "chatcode.cli.build_safe_status", return_value=""
+        ), patch(
+            "chatcode.cli.get_background_full_suite_status",
+            return_value=background,
+        ), patch("builtins.print") as output:
+            command_status()
+
+        rendered = "\n".join(
+            str(call.args[0]) for call in output.call_args_list if call.args
+        )
+        self.assertIn("Background full suite: \x1b[33mRUNNING\x1b[0m", rendered)
+
+    def test_status_shows_background_suite_error(self) -> None:
+        with patch(
+            "chatcode.cli.get_repo_root", return_value="repo"
+        ), patch(
+            "chatcode.cli.get_branch", return_value="main"
+        ), patch(
+            "chatcode.cli.build_safe_status", return_value=""
+        ), patch(
+            "chatcode.cli.get_background_full_suite_status",
+            return_value={"state": "error", "error": "worker failed"},
+        ), patch("builtins.print") as output:
+            command_status()
+
+        rendered = "\n".join(
+            str(call.args[0]) for call in output.call_args_list if call.args
+        )
+        self.assertIn("Background full suite: ERROR", rendered)
+        self.assertIn("worker failed", rendered)
 
     def test_process_environment_overrides_dotenv(self) -> None:
         with patch.dict(os.environ, {"CHATCODE_QWEN_MODEL": "session-model"}):

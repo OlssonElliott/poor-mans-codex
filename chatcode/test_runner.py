@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import time
+import tomllib
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +18,7 @@ from .workspace import get_test_results_file
 
 
 MAX_TEST_OUTPUT_CHARS = 100_000
+TEST_PROFILE_FILE = Path(".chatcode") / "tests.toml"
 
 
 class TestError(RuntimeError):
@@ -35,6 +38,73 @@ class TestResult:
     duration_seconds: float
     output_file: Path
     failed_tests: frozenset[str] = frozenset()
+
+
+def _configured_test_command(
+    repo: Path,
+    profile: str,
+) -> TestCommand | None:
+    config_file = repo / TEST_PROFILE_FILE
+    if not config_file.exists():
+        return None
+
+    try:
+        with config_file.open("rb") as stream:
+            payload = tomllib.load(stream)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise TestError(
+            f"Kunde inte läsa {TEST_PROFILE_FILE}: {exc}"
+        ) from exc
+
+    tests = payload.get("tests", {})
+    if not isinstance(tests, dict):
+        raise TestError(
+            f"{TEST_PROFILE_FILE}: [tests] måste vara en tabell."
+        )
+
+    value = tests.get(profile)
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        display = value.strip()
+        if not display:
+            raise TestError(
+                f"{TEST_PROFILE_FILE}: tests.{profile} får inte vara tomt."
+            )
+        lexer = shlex.shlex(display, posix=os.name != "nt")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        args = list(lexer)
+        if os.name == "nt":
+            args = [
+                arg[1:-1]
+                if len(arg) >= 2 and arg[0] == arg[-1] and arg[0] in {"'", '"'}
+                else arg
+                for arg in args
+            ]
+    elif (
+        isinstance(value, list)
+        and value
+        and all(isinstance(arg, str) and arg for arg in value)
+    ):
+        args = list(value)
+        display = (
+            subprocess.list2cmdline(args)
+            if os.name == "nt"
+            else shlex.join(args)
+        )
+    else:
+        raise TestError(
+            f"{TEST_PROFILE_FILE}: tests.{profile} måste vara "
+            "en kommandosträng eller en lista med argument."
+        )
+
+    if not args:
+        raise TestError(
+            f"{TEST_PROFILE_FILE}: tests.{profile} får inte vara tomt."
+        )
+    return TestCommand(display=display, args=args)
 
 
 def _read_json(path: Path) -> dict:
@@ -160,6 +230,8 @@ def _is_python_project(
         "requirements.txt",
         "Pipfile",
         "tox.ini",
+        "pytest.ini",
+        "conftest.py",
     )
 
     if any((repo / marker).exists() for marker in markers):
@@ -263,8 +335,8 @@ def _detect_python_tests(
 
     if _uses_pytest(repo):
         return TestCommand(
-            display=f"{python} -m pytest",
-            args=[python, "-m", "pytest"],
+            display=f"{python} -m pytest -n auto",
+            args=[python, "-m", "pytest", "-n", "auto"],
         )
 
     if not (repo / "tests").is_dir():
@@ -302,6 +374,10 @@ def _detect_composer_tests(
 def detect_test_command(
     repo: Path,
 ) -> TestCommand:
+    configured = _configured_test_command(repo, "full")
+    if configured is not None:
+        return configured
+
     detectors = [
         _detect_node_tests,
         _detect_maven_tests,
@@ -401,8 +477,9 @@ def _write_test_report(
     duration_seconds: float,
     stdout: str,
     stderr: str,
+    output_file: Path | None = None,
 ) -> Path:
-    output_file = get_test_results_file(repo)
+    output_file = output_file or get_test_results_file(repo)
 
     safe_stdout = _truncate_output(stdout)
     safe_stderr = _truncate_output(stderr)
@@ -476,6 +553,8 @@ def _failed_test_ids(
 def _run_test_command(
     repo: Path,
     command: TestCommand,
+    *,
+    output_file: Path | None = None,
 ) -> TestResult:
     args = _prepare_command(command)
 
@@ -503,6 +582,7 @@ def _run_test_command(
         duration_seconds=duration,
         stdout=process.stdout,
         stderr=process.stderr,
+        output_file=output_file,
     )
     return TestResult(
         command=command.display,
@@ -538,14 +618,56 @@ def _relevant_python_test_files(
     return sorted(matches)
 
 
+def unmapped_python_source_paths(
+    repo: Path,
+    changed_paths: set[str],
+) -> list[str]:
+    """Return changed Python source paths without a safe filename mapping.
+
+    This is deliberately a warning heuristic, not a coverage assertion.
+    """
+    if not _is_python_project(repo):
+        return []
+
+    tests_root = repo / "tests"
+    unmapped: list[str] = []
+    for raw_path in sorted(changed_paths):
+        normalized = raw_path.replace("\\", "/")
+        path = Path(normalized)
+        if path.suffix.lower() != ".py":
+            continue
+        if any(part.lower() in {"test", "tests"} for part in path.parts[:-1]):
+            continue
+        if (
+            path.name.startswith("test_")
+            or path.name.endswith("_test.py")
+            or path.name in {"conftest.py", "setup.py"}
+        ):
+            continue
+
+        candidates = (
+            list(tests_root.rglob(f"test_{path.stem}.py"))
+            if tests_root.is_dir()
+            else []
+        )
+        if len(candidates) != 1:
+            unmapped.append(normalized)
+
+    return unmapped
+
+
 def run_relevant_tests(
     repo: Path,
     changed_paths: set[str],
 ) -> TestResult | None:
-    """Run a narrow Python test selection when it can be chosen safely.
+    """Run the configured fast profile or a safe narrow Python selection.
 
-    Unknown mappings deliberately fall back to the mandatory full-suite run.
+    Unknown fallback mappings deliberately defer to the full-suite run.
     """
+    configured = _configured_test_command(repo, "fast")
+    if configured is not None:
+        return _run_test_command(repo, configured)
+
     if not _is_python_project(repo):
         return None
 
@@ -555,10 +677,13 @@ def run_relevant_tests(
 
     python = _project_python(repo)
     if _uses_pytest(repo):
-        target_args = [str(path.relative_to(repo)) for path in test_files]
+        target_args = [path.relative_to(repo).as_posix() for path in test_files]
         targeted = TestCommand(
-            display=f"{python} -m pytest {' '.join(target_args)}",
-            args=[python, "-m", "pytest", *target_args],
+            display=(
+                f"{python} -m pytest -n auto "
+                f"{' '.join(target_args)}"
+            ),
+            args=[python, "-m", "pytest", "-n", "auto", *target_args],
         )
     elif len(test_files) == 1:
         targeted = TestCommand(
@@ -573,6 +698,8 @@ def run_relevant_tests(
 
 def run_project_tests(
     repo: Path,
+    *,
+    output_file: Path | None = None,
 ) -> TestResult:
     command = detect_test_command(repo)
-    return _run_test_command(repo, command)
+    return _run_test_command(repo, command, output_file=output_file)

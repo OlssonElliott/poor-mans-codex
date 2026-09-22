@@ -13,3 +13,9 @@ chatcode = "chatcode.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["chatcode*"]
+
+[tool.pytest.ini_options]
+# ChatCode keeps patch previews and history snapshots under ``workspace/``.
+# They can contain copies of tests, but are artifacts rather than part of this
+# repository's test suite.
+testpaths = ["tests"]

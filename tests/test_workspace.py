@@ -57,6 +57,21 @@ class TemporaryWorkspaceCleanupTests(unittest.TestCase):
 
             self.assertTrue(workspace.exists())
 
+    def test_removes_a_temporary_workspace_after_one_day(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stale = root / "tmpabc12345"
+            stale.mkdir()
+            now = time.time()
+            os.utime(
+                stale,
+                (now - TEMPORARY_WORKSPACE_MAX_AGE_SECONDS - 1,) * 2,
+            )
+
+            cleanup_stale_temporary_workspaces(root, now=now)
+
+            self.assertFalse(stale.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -49,6 +49,10 @@ from .workspace import (
 
 VERIFIED_BASELINE_CACHE_VERSION = 1
 VERIFIED_BASELINE_MAX_AGE_SECONDS = 30 * 60
+BACKGROUND_FULL_SUITE_STATUS = "background-full-suite.json"
+BACKGROUND_RUN_ARTIFACT = re.compile(
+    r"background-full-suite-[0-9a-f]{32}\.(?:json|md)\Z"
+)
 from .unified_diff import (
     DiffLine,
     Hunk,
@@ -204,6 +208,217 @@ def save_verified_baseline(repo: Path, snapshot: RepositorySnapshot, result) -> 
     atomic_write_text(get_verified_baseline_cache_file(repo), json.dumps(payload, indent=2) + "\n")
 
 
+def _background_full_suite_status_file(repo: Path) -> Path:
+    return get_repo_workspace(repo) / BACKGROUND_FULL_SUITE_STATUS
+
+
+def _background_full_suite_run_file(repo: Path, run_id: str) -> Path:
+    return get_repo_workspace(repo) / f"background-full-suite-{run_id}.json"
+
+
+def _background_full_suite_report_file(repo: Path, run_id: str) -> Path:
+    return get_test_results_dir(repo) / f"background-full-suite-{run_id}.md"
+
+
+def _cleanup_background_full_suite_artifacts(
+    repo: Path,
+    *,
+    keep_run_id: str,
+) -> None:
+    """Remove obsolete run-owned artifacts without touching other files."""
+    locations = (
+        get_repo_workspace(repo),
+        get_test_results_dir(repo),
+    )
+    keep_names = {
+        f"background-full-suite-{keep_run_id}.json",
+        f"background-full-suite-{keep_run_id}.md",
+    }
+    for location in locations:
+        try:
+            resolved_location = location.resolve()
+            candidates = list(location.iterdir())
+        except OSError:
+            continue
+        for candidate in candidates:
+            if (
+                candidate.name in keep_names
+                or not BACKGROUND_RUN_ARTIFACT.fullmatch(candidate.name)
+            ):
+                continue
+            try:
+                resolved = candidate.resolve()
+                if resolved.parent != resolved_location or not candidate.is_file():
+                    continue
+                candidate.unlink()
+            except OSError:
+                continue
+
+    # One legacy shared report may remain from versions before per-run reports.
+    try:
+        (get_test_results_dir(repo) / "background-full-suite.md").unlink(
+            missing_ok=True
+        )
+    except OSError:
+        pass
+
+
+def _write_background_full_suite_status(
+    repo: Path,
+    payload: dict,
+    *,
+    run_file: bool = False,
+) -> None:
+    destination = (
+        _background_full_suite_run_file(repo, str(payload["run_id"]))
+        if run_file
+        else _background_full_suite_status_file(repo)
+    )
+    atomic_write_text(
+        destination,
+        json.dumps(payload, indent=2) + "\n",
+    )
+
+
+def get_background_full_suite_status(repo: Path) -> dict | None:
+    """Return the current run's status without accepting an older worker."""
+    try:
+        pointer = json.loads(
+            _background_full_suite_status_file(repo).read_text(encoding="utf-8")
+        )
+        run_id = str(pointer["run_id"])
+        run_path = _background_full_suite_run_file(repo, run_id)
+        if run_path.is_file():
+            status = json.loads(run_path.read_text(encoding="utf-8"))
+            if status.get("run_id") == run_id:
+                return status
+        return pointer
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _snapshot_from_payload(payload: dict) -> RepositorySnapshot:
+    return RepositorySnapshot(
+        branch=str(payload["branch"]),
+        file_hashes=tuple((str(path), str(digest)) for path, digest in payload["file_hashes"]),
+        status=str(payload["status"]),
+        staged_diff_sha256=str(payload["staged_diff_sha256"]),
+    )
+
+
+def _complete_background_full_suite(
+    repo_name: str,
+    snapshot_payload: dict,
+    run_id: str,
+) -> None:
+    """Worker entry point for the detached post-apply full test suite."""
+    repo = Path(repo_name)
+    snapshot = _snapshot_from_payload(snapshot_payload)
+    report = _background_full_suite_report_file(repo, run_id)
+    is_current = False
+    try:
+        from .test_runner import run_project_tests
+
+        result = run_project_tests(repo, output_file=report)
+        current_snapshot = _capture_repository_snapshot(repo)
+        current_status = get_background_full_suite_status(repo)
+        is_current = (
+            current_status is not None
+            and current_status.get("run_id") == run_id
+        )
+        if is_current and current_snapshot == snapshot:
+            save_verified_baseline(repo, snapshot, result)
+        status = {
+            "run_id": run_id,
+            "state": "completed",
+            "snapshot": snapshot_payload,
+            "returncode": result.returncode,
+            "report": str(result.output_file),
+            "command": result.command,
+            "duration_seconds": result.duration_seconds,
+            "failed_tests": sorted(result.failed_tests),
+            "completed_at": time.time(),
+        }
+    except Exception as exc:
+        status = {
+            "run_id": run_id,
+            "state": "error",
+            "snapshot": snapshot_payload,
+            "error": str(exc),
+            "completed_at": time.time(),
+        }
+    _write_background_full_suite_status(repo, status, run_file=True)
+    if is_current:
+        _cleanup_background_full_suite_artifacts(repo, keep_run_id=run_id)
+
+
+def _complete_background_full_suite_from_status(
+    repo_name: str,
+    run_id: str,
+) -> None:
+    """Load the large snapshot from disk so Windows argv stays small."""
+    repo = Path(repo_name)
+    try:
+        payload = json.loads(
+            _background_full_suite_run_file(repo, run_id).read_text(encoding="utf-8")
+        )
+        if payload.get("run_id") != run_id or payload.get("state") != "running":
+            return
+        snapshot_payload = payload["snapshot"]
+        if not isinstance(snapshot_payload, dict):
+            raise TypeError("background snapshot is not an object")
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        _write_background_full_suite_status(repo, {
+            "run_id": run_id,
+            "state": "error",
+            "error": f"Could not load background test state: {exc}",
+            "completed_at": time.time(),
+        }, run_file=True)
+        return
+    _complete_background_full_suite(repo_name, snapshot_payload, run_id)
+
+
+def _start_background_full_suite(
+    repo: Path,
+    snapshot: RepositorySnapshot,
+) -> None:
+    """Launch a full suite that can outlive the current ``chatcode apply``."""
+    run_id = uuid.uuid4().hex
+    snapshot_payload = _snapshot_payload(snapshot)
+    _cleanup_background_full_suite_artifacts(repo, keep_run_id=run_id)
+    initial_status = {
+        "run_id": run_id,
+        "state": "running",
+        "snapshot": snapshot_payload,
+        "started_at": time.time(),
+    }
+    _write_background_full_suite_status(repo, initial_status, run_file=True)
+    _write_background_full_suite_status(repo, initial_status)
+    worker = (
+        "import sys; from chatcode.patch import _complete_background_full_suite_from_status; "
+        "_complete_background_full_suite_from_status(sys.argv[1], sys.argv[2])"
+    )
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = (
+            subprocess.CREATE_NO_WINDOW
+            | subprocess.CREATE_NEW_PROCESS_GROUP
+        )
+    try:
+        subprocess.Popen(
+            [sys.executable, "-c", worker, str(repo), run_id],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            creationflags=creationflags,
+        )
+    except OSError:
+        _background_full_suite_status_file(repo).unlink(missing_ok=True)
+        _background_full_suite_run_file(repo, run_id).unlink(missing_ok=True)
+        raise
+
+
 _ANSI = {
     "green": "\x1b[32m", "red": "\x1b[31m", "yellow": "\x1b[33m",
     "cyan": "\x1b[36m",
@@ -250,8 +465,25 @@ def _classify_test_validation(
     targeted,
     full,
     repair_targets: frozenset[str] = frozenset(),
+    *,
+    full_suite_pending: bool = False,
+    infrastructure_error: bool = False,
 ) -> TestValidation:
     """Classify post-patch failures without claiming more than the output shows."""
+    if full_suite_pending:
+        return TestValidation(
+            baseline, targeted, full, "pending",
+            repair_targets=repair_targets,
+        )
+    if (
+        infrastructure_error
+        and full is None
+        and (targeted is None or targeted.returncode == 0)
+    ):
+        return TestValidation(
+            baseline, targeted, full, "infrastructure_error",
+            repair_targets=repair_targets,
+        )
     if targeted is None and full is None:
         return TestValidation(
             baseline, targeted, full, "unavailable",
@@ -329,6 +561,8 @@ def _show_test_validation(validation: TestValidation) -> None:
         "regressions": ("FAILED", "red"),
         "repair_failed": ("REPAIR UNSUCCESSFUL", "red"),
         "targeted_failed": ("FAILED", "red"),
+        "pending": ("FULL SUITE RUNNING IN BACKGROUND", "cyan"),
+        "infrastructure_error": ("TEST INFRASTRUCTURE ERROR", "yellow"),
     }.get(validation.status, ("REVIEW REQUIRED", "yellow"))
     print("\nFunctional validation: " + _status(*functional_status))
     for label, result in (
@@ -337,7 +571,10 @@ def _show_test_validation(validation: TestValidation) -> None:
         ("Full suite", validation.full),
     ):
         if result is None:
-            print(_status(f"[WARN] {label}: not run", "yellow"))
+            if label == "Full suite" and validation.status == "pending":
+                print(_status("[WAIT] Full suite: running in background", "cyan"))
+            else:
+                print(_status(f"[WARN] {label}: not run", "yellow"))
         else:
             expected_repair_baseline = (
                 label == "Baseline"
@@ -397,6 +634,20 @@ def _show_test_validation(validation: TestValidation) -> None:
     elif validation.status == "targeted_failed":
         print(_status("[FAIL] Relevant tests failed; targeted validation remains required for this patch.", "red"))
         print("Recommended action: repair the targeted failures before keeping this patch.")
+    elif validation.status == "pending":
+        print(_status(
+            "[WAIT] Assessment: immediate validation passed; the full suite "
+            "continues in the background.",
+            "cyan",
+        ))
+        print("No repair action is needed unless the background suite reports a failure.")
+    elif validation.status == "infrastructure_error":
+        print(_status(
+            "[WARN] Assessment: no failing test was observed, but full "
+            "validation could not be started.",
+            "yellow",
+        ))
+        print("Recommended action: run `chatcode test` later; no repair context was created.")
     else:
         print(_status("[WARN] Assessment: failures are unclear and require review.", "yellow"))
         print("Recommended action: run `chatcode repair` and send the context to ChatGPT for review.")
@@ -435,18 +686,33 @@ def extract_patch_paths(
 ) -> set[str]:
     paths: set[str] = set()
 
-    for line in patch_text.splitlines():
-        if not line.startswith(
-            ("--- ", "+++ ")
-        ):
-            continue
-
-        raw_path = (
-            line[4:]
-            .strip()
-            .split("\t", 1)[0]
+    try:
+        parsed = parse_unified_diff(
+            patch_text
         )
+    except UnifiedDiffError:
+        candidates = []
+        for line in patch_text.splitlines():
+            if not line.startswith(
+                ("--- ", "+++ ")
+            ):
+                continue
+            candidates.append(
+                line[4:]
+                .strip()
+                .split("\t", 1)[0]
+            )
+    else:
+        candidates = [
+            raw_path
+            for file_patch in parsed.files
+            for raw_path in (
+                file_patch.old_path,
+                file_patch.new_path,
+            )
+        ]
 
+    for raw_path in candidates:
         if raw_path == "/dev/null":
             continue
 
@@ -455,6 +721,7 @@ def extract_patch_paths(
         ):
             raw_path = raw_path[2:]
 
+        raw_path = raw_path.replace("\\", "/")
         paths.add(raw_path)
 
     return paths
@@ -3021,6 +3288,15 @@ def _run_apply_flow(
         print("Pre-patch baseline: using verified cached result.")
         print("[OK] Repository state unchanged since last full-suite validation." if cached_baseline.returncode == 0
               else f"[WARN] {len(cached_baseline.failed_tests)} known pre-existing failure(s).")
+    elif _CLI_APPLY_INVOCATION:
+        print(
+            "Pre-patch baseline: no verified cached result; "
+            "continuing without blocking."
+        )
+        print(
+            "Failures from this apply cannot be classified against a baseline. "
+            "The post-patch full suite will establish one for the next apply."
+        )
     else:
         baseline_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="chatcode-baseline")
         baseline_future = baseline_executor.submit(_run_background_baseline, repo)
@@ -3079,6 +3355,12 @@ def _run_apply_flow(
         current_snapshot = _capture_repository_snapshot(repo)
         if cached_baseline is not None and current_snapshot == baseline_snapshot:
             baseline = cached_baseline
+        elif _CLI_APPLY_INVOCATION:
+            if current_snapshot != baseline_snapshot:
+                print(
+                    "Repository changed during review; the cached pre-patch "
+                    "baseline no longer applies."
+                )
         elif current_snapshot != baseline_snapshot:
             # Do not overlap a replacement suite with the discarded suite:
             # project test tools often share caches and report locations.
@@ -3098,8 +3380,9 @@ def _run_apply_flow(
                 print("Waiting for pre-patch baseline...")
             baseline = baseline_future.result()
             baseline_executor.shutdown(wait=True, cancel_futures=True)
-        baseline = _preserve_test_report(repo, baseline, "baseline")
-        _show_test_result(baseline)
+        if baseline is not None:
+            baseline = _preserve_test_report(repo, baseline, "baseline")
+            _show_test_result(baseline)
     except Exception as exc:
         # Match the established baseline-infrastructure-error path. Test
         # failures are TestResult values and never arrive here as exceptions.
@@ -3115,15 +3398,36 @@ def _run_apply_flow(
     )
     assert isinstance(result, ApplyResult)
 
-    print("\n[OK] PATCH APPLIED")
+    print("\n" + _status("[OK] PATCH APPLIED", "green"))
     print("Running relevant tests, then the full suite...")
 
     test_result = None
     relevant_result = None
+    full_suite_pending = False
     test_error: Exception | None = baseline_error
     try:
         from .history import update_history_test_result
-        from .test_runner import TestError, run_project_tests, run_relevant_tests
+        from .test_runner import (
+            TestError,
+            run_project_tests,
+            run_relevant_tests,
+            unmapped_python_source_paths,
+        )
+
+        unmapped_sources = unmapped_python_source_paths(repo, result.paths)
+        if unmapped_sources:
+            print(_status(
+                "[WARN] No direct test-file match could be identified for:",
+                "yellow",
+            ))
+            for path in unmapped_sources[:10]:
+                print(f"  {path}")
+            if len(unmapped_sources) > 10:
+                print(f"  ... and {len(unmapped_sources) - 10} more")
+            print(
+                "This does not prove that test coverage is missing. "
+                "The full suite will still run."
+            )
 
         try:
             relevant_result = run_relevant_tests(repo, result.paths)
@@ -3152,19 +3456,31 @@ def _run_apply_flow(
         else:
             try:
                 full_snapshot = _capture_repository_snapshot(repo)
-                test_result = run_project_tests(repo)
-                test_result = _preserve_test_report(repo, test_result, "full-suite")
-                if _capture_repository_snapshot(repo) == full_snapshot:
-                    save_verified_baseline(repo, full_snapshot, test_result)
-                update_history_test_result(
-                    result.history_entry,
-                    "PASSED" if test_result.returncode == 0 else "FAILED",
-                    command=test_result.command,
-                    returncode=test_result.returncode,
-                    duration_seconds=test_result.duration_seconds,
-                )
-                _show_test_result(test_result)
-            except TestError as exc:
+                if _CLI_APPLY_INVOCATION:
+                    _start_background_full_suite(repo, full_snapshot)
+                    full_suite_pending = True
+                    update_history_test_result(
+                        result.history_entry,
+                        "PENDING",
+                    )
+                    print(
+                        "Full test suite started in the background. "
+                        "Its verified result will be used by the next apply."
+                    )
+                else:
+                    test_result = run_project_tests(repo)
+                    test_result = _preserve_test_report(repo, test_result, "full-suite")
+                    if _capture_repository_snapshot(repo) == full_snapshot:
+                        save_verified_baseline(repo, full_snapshot, test_result)
+                    update_history_test_result(
+                        result.history_entry,
+                        "PASSED" if test_result.returncode == 0 else "FAILED",
+                        command=test_result.command,
+                        returncode=test_result.returncode,
+                        duration_seconds=test_result.duration_seconds,
+                    )
+                    _show_test_result(test_result)
+            except (TestError, OSError) as exc:
                 test_error = exc
                 update_history_test_result(
                     result.history_entry,
@@ -3180,10 +3496,18 @@ def _run_apply_flow(
         relevant_result,
         test_result,
         repair_targets,
+        full_suite_pending=full_suite_pending,
+        infrastructure_error=test_error is not None,
     )
     _show_test_validation(validation)
-    validation_passed = validation.status in {"passed", "repair_passed", "existing"}
-    if not validation_passed:
+    validation_passed = validation.status in {
+        "passed", "repair_passed", "existing", "pending",
+    }
+    repair_context_needed = (
+        not validation_passed
+        and validation.status != "infrastructure_error"
+    )
+    if repair_context_needed:
         try:
             repair_context = build_test_failure_repair_context(
                 repo, result, validation
@@ -3207,7 +3531,7 @@ def _run_apply_flow(
                 else relevant_result
             ),
             test_error,
-            recommend_keep_for_repair=not validation_passed,
+            recommend_keep_for_repair=repair_context_needed,
             validation=validation,
         )
     elif not validation_passed:

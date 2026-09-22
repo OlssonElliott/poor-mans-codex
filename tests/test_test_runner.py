@@ -10,6 +10,7 @@ from chatcode.test_runner import (
     _failed_test_ids,
     detect_test_command,
     run_relevant_tests,
+    unmapped_python_source_paths,
 )
 
 
@@ -82,6 +83,8 @@ class TestCommandDetectionTests(unittest.TestCase):
                         "python-test",
                         "-m",
                         "pytest",
+                        "-n",
+                        "auto",
                     ],
                 )
                 config.unlink()
@@ -94,6 +97,61 @@ class TestCommandDetectionTests(unittest.TestCase):
             detect_test_command(
                 self.repo
             )
+
+    def test_configured_full_command_wins_over_autodetection(self) -> None:
+        config = self.repo / ".chatcode" / "tests.toml"
+        config.parent.mkdir()
+        config.write_text(
+            '[tests]\nfull = ["custom-test", "--all"]\n',
+            encoding="utf-8",
+        )
+        (self.repo / "package.json").write_text(
+            '{"scripts":{"test":"ignored"}}',
+            encoding="utf-8",
+        )
+
+        command = detect_test_command(self.repo)
+
+        self.assertEqual(command.args, ["custom-test", "--all"])
+
+    def test_configured_fast_command_runs_without_filename_mapping(self) -> None:
+        config = self.repo / ".chatcode" / "tests.toml"
+        config.parent.mkdir()
+        config.write_text(
+            '[tests]\nfast = ["custom-test", "--unit"]\n',
+            encoding="utf-8",
+        )
+
+        with patch("chatcode.test_runner._run_test_command") as run:
+            run_relevant_tests(self.repo, {"unmapped/source.file"})
+
+        command = run.call_args.args[1]
+        self.assertEqual(command.args, ["custom-test", "--unit"])
+
+    def test_configured_command_string_preserves_grouped_arguments(self) -> None:
+        config = self.repo / ".chatcode" / "tests.toml"
+        config.parent.mkdir()
+        config.write_text(
+            '[tests]\nfast = "python -m pytest -m \\"not integration\\""\n',
+            encoding="utf-8",
+        )
+
+        with patch("chatcode.test_runner._run_test_command") as run:
+            run_relevant_tests(self.repo, set())
+
+        command = run.call_args.args[1]
+        self.assertEqual(
+            command.args,
+            ["python", "-m", "pytest", "-m", "not integration"],
+        )
+
+    def test_invalid_configured_command_is_rejected(self) -> None:
+        config = self.repo / ".chatcode" / "tests.toml"
+        config.parent.mkdir()
+        config.write_text("[tests]\nfull = []\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(ChatCodeTestError, "tests.full"):
+            detect_test_command(self.repo)
 
     def test_relevant_unittest_file_is_run_before_full_suite(self) -> None:
         (self.repo / "pyproject.toml").write_text(
@@ -124,6 +182,29 @@ class TestCommandDetectionTests(unittest.TestCase):
             ],
         )
 
+    def test_relevant_pytest_file_uses_parallel_workers(self) -> None:
+        (self.repo / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+        tests = self.repo / "tests"
+        tests.mkdir()
+        (tests / "test_widget.py").write_text("", encoding="utf-8")
+
+        with patch(
+            "chatcode.test_runner._project_python",
+            return_value="python-test",
+        ), patch(
+            "chatcode.test_runner._run_test_command",
+        ) as run:
+            run_relevant_tests(self.repo, {"package/widget.py"})
+
+        command = run.call_args.args[1]
+        self.assertEqual(
+            command.args,
+            [
+                "python-test", "-m", "pytest", "-n", "auto",
+                "tests/test_widget.py",
+            ],
+        )
+
     def test_relevant_tests_do_not_guess_ambiguous_mapping(self) -> None:
         (self.repo / "pyproject.toml").write_text(
             "[project]\nname = \"demo\"\n",
@@ -137,6 +218,32 @@ class TestCommandDetectionTests(unittest.TestCase):
 
         self.assertIsNone(
             run_relevant_tests(self.repo, {"package/widget.py"})
+        )
+
+    def test_reports_python_source_without_identifiable_test(self) -> None:
+        (self.repo / "pyproject.toml").write_text(
+            "[project]\nname = \"demo\"\n",
+            encoding="utf-8",
+        )
+        (self.repo / "tests").mkdir()
+
+        self.assertEqual(
+            unmapped_python_source_paths(
+                self.repo,
+                {"package/widget.py", "README.md", "tests/test_other.py"},
+            ),
+            ["package/widget.py"],
+        )
+
+    def test_source_with_one_conventional_test_is_not_reported(self) -> None:
+        (self.repo / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+        tests = self.repo / "tests"
+        tests.mkdir()
+        (tests / "test_widget.py").write_text("", encoding="utf-8")
+
+        self.assertEqual(
+            unmapped_python_source_paths(self.repo, {"package/widget.py"}),
+            [],
         )
 
     def test_failure_parser_ignores_unittest_aggregate_summary(self) -> None:
