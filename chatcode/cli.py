@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 from .context_builder import (
@@ -47,7 +48,9 @@ from .patch import (
     show_repair_send_instructions,
     show_check_repair_send_instructions,
     show_chatgpt_upload_artifact,
+    _status,
     _capture_repository_snapshot,
+    get_background_full_suite_status,
     save_verified_baseline,
     undo_last_patch,
 )
@@ -115,6 +118,47 @@ def command_status(reindex: bool = False) -> None:
         print(status)
     else:
         print("Working tree clean.")
+
+    print()
+    background = get_background_full_suite_status(repo)
+    if background is None:
+        print("Background full suite: no run recorded.")
+        return
+
+    state = background.get("state")
+    if state == "running":
+        print(f"Background full suite: {_status('RUNNING', 'yellow')}")
+        if background.get("started_at") is not None:
+            started = datetime.fromtimestamp(
+                float(background["started_at"])
+            ).astimezone().isoformat(timespec="seconds")
+            print(f"Started:  {started}")
+    elif state == "completed":
+        returncode = int(background.get("returncode", 1))
+        label = "PASSED" if returncode == 0 else "FAILED"
+        color = "green" if returncode == 0 else "red"
+        print(f"Background full suite: {_status(label, color)}")
+        if background.get("command"):
+            print(f"Command:  {background['command']}")
+        if background.get("duration_seconds") is not None:
+            print(f"Duration: {float(background['duration_seconds']):.2f}s")
+        if background.get("completed_at") is not None:
+            completed = datetime.fromtimestamp(
+                float(background["completed_at"])
+            ).astimezone().isoformat(timespec="seconds")
+            print(f"Completed: {completed}")
+        failures = background.get("failed_tests", [])
+        if failures:
+            print(f"Failures: {len(failures)}")
+            for failure in failures[:10]:
+                print(f"  {failure}")
+        if background.get("report"):
+            print(f"Report:   {background['report']}")
+    elif state == "error":
+        print("Background full suite: ERROR")
+        print(f"Error: {background.get('error', 'Unknown background test error')}")
+    else:
+        print("Background full suite: UNKNOWN")
 
 
 class ConsoleIndexReporter:

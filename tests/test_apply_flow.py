@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 import threading
@@ -36,6 +37,12 @@ from chatcode.patch import (
     _open_diff_window,
     _run_apply_flow,
     _capture_repository_snapshot,
+    _cleanup_background_full_suite_artifacts,
+    get_background_full_suite_status,
+    _complete_background_full_suite,
+    _complete_background_full_suite_from_status,
+    _snapshot_payload,
+    _start_background_full_suite,
     save_verified_baseline,
     apply_patch,
 )
@@ -44,9 +51,11 @@ from chatcode.test_runner import TestResult
 from chatcode.unified_diff import canonicalize_unified_diff, parse_unified_diff
 from chatcode.workspace import (
     get_default_patch_file,
+    get_repo_workspace,
     get_repair_context_file,
     get_existing_failure_context_file,
     get_followup_context_file,
+    get_test_results_dir,
 )
 
 
@@ -141,6 +150,41 @@ class ApplyFlowTests(unittest.TestCase):
             _run_apply_flow(self.repo, self.incoming)
 
         self.assertEqual(self.source.read_text(encoding="utf-8"), "value = 1\n")
+
+    def test_apply_preserves_copy_metadata_when_source_becomes_wrapper(self) -> None:
+        self.incoming.write_text(
+            "diff --git a/app.py b/pkg/app.py\n"
+            "similarity index 100%\n"
+            "copy from app.py\n"
+            "copy to pkg/app.py\n"
+            "diff --git a/app.py b/app.py\n"
+            "--- a/app.py\n"
+            "+++ b/app.py\n"
+            "@@ -1 +1 @@\n"
+            "-value = 1\n"
+            "+from pkg.app import value\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        result = apply_patch(
+            self.repo,
+            self.incoming,
+        )
+
+        moved = self.repo / "pkg" / "app.py"
+        self.assertEqual(
+            result.paths,
+            {"app.py", "pkg/app.py"},
+        )
+        self.assertEqual(
+            moved.read_text(encoding="utf-8"),
+            "value = 1\n",
+        )
+        self.assertEqual(
+            self.source.read_text(encoding="utf-8"),
+            "from pkg.app import value\n",
+        )
 
     def test_view_diff_opens_window_instead_of_printing_patch(self) -> None:
         stdin, stdout = self.interactive()
@@ -689,6 +733,27 @@ class ApplyFlowTests(unittest.TestCase):
         run.assert_called_with(self.repo)
         prompt.assert_not_called()
 
+    def test_apply_warns_when_changed_source_has_no_identified_test(self) -> None:
+        test_result = self.result()
+        with patch(
+            "chatcode.patch._qwen_patch_summary", return_value=None
+        ), patch(
+            "chatcode.test_runner.run_project_tests", return_value=test_result
+        ), patch(
+            "chatcode.test_runner.run_relevant_tests", return_value=None
+        ), patch(
+            "chatcode.test_runner.unmapped_python_source_paths",
+            return_value=["app.py"],
+        ), patch("builtins.print") as output:
+            _run_apply_flow(self.repo, self.incoming, yes=True)
+
+        rendered = "\n".join(
+            str(call.args[0]) for call in output.call_args_list if call.args
+        )
+        self.assertIn("No direct test-file match could be identified", rendered)
+        self.assertIn("app.py", rendered)
+        self.assertIn("does not prove that test coverage is missing", rendered)
+
     def test_failure_classification_distinguishes_regressions_from_baseline(self) -> None:
         baseline = self.result(1)
         baseline = TestResult(**{**baseline.__dict__, "failed_tests": frozenset({"tests.test_old"})})
@@ -1042,6 +1107,230 @@ class ApplyFlowTests(unittest.TestCase):
 
         run.assert_called_once_with(self.repo)
         self.assertEqual(self.source.read_text(encoding="utf-8"), "value = 1\n")
+
+    def test_cli_apply_does_not_wait_for_uncached_pre_patch_baseline(self) -> None:
+        with patch(
+            "chatcode.patch._CLI_APPLY_INVOCATION", True
+        ), patch(
+            "chatcode.patch._qwen_patch_summary", return_value=None
+        ), patch(
+            "chatcode.test_runner.run_project_tests"
+        ) as synchronous_full, patch(
+            "chatcode.test_runner.run_relevant_tests", return_value=None
+        ), patch(
+            "chatcode.test_runner.unmapped_python_source_paths", return_value=[]
+        ), patch(
+            "chatcode.patch._start_background_full_suite"
+        ) as background_full, patch("builtins.print") as output:
+            _run_apply_flow(self.repo, self.incoming, yes=True)
+
+        synchronous_full.assert_not_called()
+        background_full.assert_called_once()
+        rendered = "\n".join(
+            str(call.args[0]) for call in output.call_args_list if call.args
+        )
+        self.assertIn("continuing without blocking", rendered)
+        self.assertNotIn("Waiting for pre-patch baseline", rendered)
+
+    def test_background_full_suite_is_detached_and_records_its_snapshot(self) -> None:
+        snapshot = _capture_repository_snapshot(self.repo)
+
+        with patch("chatcode.patch.subprocess.Popen") as launch:
+            _start_background_full_suite(self.repo, snapshot)
+
+        launch.assert_called_once()
+        status = json.loads(
+            (get_repo_workspace(self.repo) / "background-full-suite.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(status["state"], "running")
+        self.assertEqual(status["snapshot"], _snapshot_payload(snapshot))
+        command = launch.call_args.args[0]
+        self.assertEqual(command[-2], str(self.repo))
+        self.assertNotIn("file_hashes", " ".join(command))
+        if os.name == "nt":
+            flags = launch.call_args.kwargs["creationflags"]
+            self.assertTrue(flags & subprocess.CREATE_NO_WINDOW)
+
+    def test_background_worker_loads_snapshot_from_status_file(self) -> None:
+        snapshot = _capture_repository_snapshot(self.repo)
+        status = {
+            "run_id": "run-id",
+            "state": "running",
+            "snapshot": _snapshot_payload(snapshot),
+        }
+        workspace = get_repo_workspace(self.repo)
+        (workspace / "background-full-suite.json").write_text(
+            json.dumps(status), encoding="utf-8"
+        )
+        (workspace / "background-full-suite-run-id.json").write_text(
+            json.dumps(status), encoding="utf-8"
+        )
+
+        with patch("chatcode.patch._complete_background_full_suite") as complete:
+            _complete_background_full_suite_from_status(str(self.repo), "run-id")
+
+        complete.assert_called_once_with(
+            str(self.repo), _snapshot_payload(snapshot), "run-id"
+        )
+
+    def test_infrastructure_error_after_targeted_pass_does_not_request_repair(self) -> None:
+        validation = _classify_test_validation(
+            None,
+            self.result(),
+            None,
+            infrastructure_error=True,
+        )
+
+        self.assertEqual(validation.status, "infrastructure_error")
+        with patch("builtins.print") as output:
+            _show_test_validation(validation)
+        rendered = "\n".join(
+            str(call.args[0]) for call in output.call_args_list if call.args
+        )
+        self.assertIn("no repair context was created", rendered)
+
+    def test_pending_full_suite_does_not_recommend_repair(self) -> None:
+        validation = _classify_test_validation(
+            None,
+            self.result(),
+            None,
+            full_suite_pending=True,
+        )
+
+        with patch("builtins.print") as output:
+            _show_test_validation(validation)
+        rendered = "\n".join(
+            str(call.args[0]) for call in output.call_args_list if call.args
+        )
+        self.assertIn("continues in the background", rendered)
+        self.assertIn("No repair action is needed", rendered)
+        self.assertNotIn("chatcode repair", rendered)
+
+    def test_background_full_suite_caches_only_the_unchanged_snapshot(self) -> None:
+        snapshot = _capture_repository_snapshot(self.repo)
+        result = self.result()
+        status = {
+            "run_id": "run-id",
+            "state": "running",
+            "snapshot": _snapshot_payload(snapshot),
+        }
+        workspace = get_repo_workspace(self.repo)
+        (workspace / "background-full-suite.json").write_text(
+            json.dumps(status), encoding="utf-8"
+        )
+        (workspace / "background-full-suite-run-id.json").write_text(
+            json.dumps(status), encoding="utf-8"
+        )
+        with patch(
+            "chatcode.test_runner.run_project_tests", return_value=result
+        ) as run, patch(
+            "chatcode.patch._capture_repository_snapshot", return_value=snapshot
+        ), patch("chatcode.patch.save_verified_baseline") as save:
+            _complete_background_full_suite(
+                str(self.repo), _snapshot_payload(snapshot), "run-id"
+            )
+
+        save.assert_called_once_with(self.repo, snapshot, result)
+        completed = get_background_full_suite_status(self.repo)
+        self.assertEqual(completed["state"], "completed")
+        self.assertEqual(completed["command"], result.command)
+        self.assertEqual(
+            run.call_args.kwargs["output_file"].name,
+            "background-full-suite-run-id.md",
+        )
+
+    def test_background_artifact_cleanup_keeps_current_and_unrelated_files(self) -> None:
+        old_run_id = "a" * 32
+        current_run_id = "b" * 32
+        workspace = get_repo_workspace(self.repo)
+        results = get_test_results_dir(self.repo)
+        old_status = workspace / f"background-full-suite-{old_run_id}.json"
+        old_report = results / f"background-full-suite-{old_run_id}.md"
+        current_status = workspace / f"background-full-suite-{current_run_id}.json"
+        current_report = results / f"background-full-suite-{current_run_id}.md"
+        unrelated = results / "background-full-suite-not-a-run.md"
+        legacy_report = results / "background-full-suite.md"
+        for artifact in (
+            old_status,
+            old_report,
+            current_status,
+            current_report,
+            unrelated,
+            legacy_report,
+        ):
+            artifact.write_text("test", encoding="utf-8")
+
+        _cleanup_background_full_suite_artifacts(
+            self.repo,
+            keep_run_id=current_run_id,
+        )
+
+        self.assertFalse(old_status.exists())
+        self.assertFalse(old_report.exists())
+        self.assertFalse(legacy_report.exists())
+        self.assertTrue(current_status.exists())
+        self.assertTrue(current_report.exists())
+        self.assertTrue(unrelated.exists())
+
+    def test_background_full_suite_records_errors_before_current_check(self) -> None:
+        snapshot = _capture_repository_snapshot(self.repo)
+
+        with patch(
+            "chatcode.test_runner.run_project_tests",
+            side_effect=RuntimeError("test runner failed"),
+        ):
+            _complete_background_full_suite(
+                str(self.repo), _snapshot_payload(snapshot), "run-id"
+            )
+
+        status = json.loads(
+            (
+                get_repo_workspace(self.repo)
+                / "background-full-suite-run-id.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(status["state"], "error")
+        self.assertEqual(status["error"], "test runner failed")
+
+    def test_older_background_worker_cannot_replace_current_status(self) -> None:
+        snapshot = _capture_repository_snapshot(self.repo)
+        workspace = get_repo_workspace(self.repo)
+        current = {
+            "run_id": "new-run",
+            "state": "running",
+            "snapshot": _snapshot_payload(snapshot),
+        }
+        old = {
+            "run_id": "old-run",
+            "state": "running",
+            "snapshot": _snapshot_payload(snapshot),
+        }
+        (workspace / "background-full-suite.json").write_text(
+            json.dumps(current), encoding="utf-8"
+        )
+        (workspace / "background-full-suite-new-run.json").write_text(
+            json.dumps(current), encoding="utf-8"
+        )
+        (workspace / "background-full-suite-old-run.json").write_text(
+            json.dumps(old), encoding="utf-8"
+        )
+
+        with patch(
+            "chatcode.test_runner.run_project_tests", return_value=self.result()
+        ), patch(
+            "chatcode.patch._capture_repository_snapshot", return_value=snapshot
+        ), patch("chatcode.patch.save_verified_baseline") as save:
+            _complete_background_full_suite(
+                str(self.repo), _snapshot_payload(snapshot), "old-run"
+            )
+
+        save.assert_not_called()
+        self.assertEqual(
+            get_background_full_suite_status(self.repo)["run_id"],
+            "new-run",
+        )
 
     def test_verified_cache_skips_new_pre_patch_baseline(self) -> None:
         snapshot = _capture_repository_snapshot(self.repo)
@@ -1569,8 +1858,7 @@ class ApplyFlowTests(unittest.TestCase):
             call
             for call in output.call_args_list
             if call.args
-            and call.args[0]
-            == "\n[OK] PATCH APPLIED"
+            and "[OK] PATCH APPLIED" in str(call.args[0])
         ]
         self.assertEqual(
             len(success_messages),

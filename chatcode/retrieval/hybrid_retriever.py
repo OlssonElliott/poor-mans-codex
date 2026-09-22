@@ -1112,7 +1112,11 @@ def resolve_transport_roots(repo: Path, seeds: list[Path]) -> RetrievalResult:
     return RetrievalResult(paths, reasons, paths.copy(), required)
 
 
-def test_callsite_closure(repo: Path, task: str, seeds: list[Path]) -> RetrievalResult:
+def resolve_test_callsite_closure(
+    repo: Path,
+    task: str,
+    seeds: list[Path],
+) -> RetrievalResult:
     """Resolve calls from relevant test bodies, then walk exact definitions twice."""
     index = load_map(repo).get("files", {})
     owners: dict[str, list[tuple[str, str]]] = defaultdict(list)

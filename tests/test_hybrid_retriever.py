@@ -12,7 +12,7 @@ from chatcode.retrieval.hybrid_retriever import (
     QwenTaskHintAnalyzer,
     expand_candidates,
     implementation_closure,
-    test_callsite_closure,
+    resolve_test_callsite_closure,
     resolve_explicit_targets,
     resolve_alternative_callback_roots,
     resolve_task_surface_roots,
@@ -550,7 +550,7 @@ class HybridRetrieverTests(unittest.TestCase):
             "database.py": {"symbols": [{"name": "place_item"}, {"name": "place_catalog_item"}], "dependencies": []},
         })
         task = "When you drop many of the same thing into a room, they should stack. when you pick up a stack, you should be asked how many you want to pick up of the items"
-        result = test_callsite_closure(self.repo, task, [test])
+        result = resolve_test_callsite_closure(self.repo, task, [test])
         self.assertEqual(result.required_symbols[command], ["drop", "take"])
         self.assertEqual(result.required_symbols[service], ["drop_item", "take_loose_item"])
         self.assertEqual(result.required_symbols[database], ["place_item", "place_catalog_item"])
@@ -573,7 +573,7 @@ class HybridRetrieverTests(unittest.TestCase):
                 {"name": "drop", "kind": "function"},
             ], "dependencies": []},
         })
-        result = test_callsite_closure(self.repo, "taking and dropping items", [test])
+        result = resolve_test_callsite_closure(self.repo, "taking and dropping items", [test])
         self.assertEqual(result.required_symbols[commands], ["take_item", "drop"])
 
     def test_service_action_recovers_separately_named_command_callback_test(self) -> None:
@@ -599,7 +599,7 @@ class HybridRetrieverTests(unittest.TestCase):
             "commands/world.py": {"symbols": [{"name": "take"}, {"name": "lockpick"}], "dependencies": []},
         })
         task = "When you drop many of the same thing into a room, they should stack. when you pick up a stack, you should be asked how many you want to pick up of the items"
-        result = test_callsite_closure(self.repo, task, [test])
+        result = resolve_test_callsite_closure(self.repo, task, [test])
         self.assertIn("take", result.required_symbols[commands])
         self.assertTrue(any("test_take_names_character" in line for line in result.diagnostics))
         self.assertFalse(any("test_unrelated_lockpick" in line for line in result.diagnostics))

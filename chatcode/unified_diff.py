@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 from dataclasses import dataclass
 
 
@@ -58,6 +59,7 @@ class FilePatch:
     old_path: str
     new_path: str
     hunks: tuple[Hunk, ...]
+    git_headers: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -68,6 +70,112 @@ class UnifiedDiff:
 HUNK_HEADER = re.compile(
     r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$"
 )
+
+GIT_EXTENDED_HEADER_PREFIXES = (
+    "index ",
+    "new file mode ",
+    "deleted file mode ",
+    "old mode ",
+    "new mode ",
+    "similarity index ",
+    "dissimilarity index ",
+    "rename from ",
+    "rename to ",
+    "copy from ",
+    "copy to ",
+)
+
+GIT_METADATA_CHANGE_PREFIXES = (
+    "new file mode ",
+    "deleted file mode ",
+    "old mode ",
+    "new mode ",
+    "rename from ",
+    "rename to ",
+    "copy from ",
+    "copy to ",
+)
+
+
+def _diff_git_paths(line: str) -> tuple[str, str]:
+    try:
+        parts = shlex.split(line)
+    except ValueError as exc:
+        raise UnifiedDiffError("malformed diff --git header") from exc
+
+    if len(parts) != 4 or parts[:2] != ["diff", "--git"]:
+        raise UnifiedDiffError("malformed diff --git header")
+
+    return (
+        parts[2].replace("\\", "/"),
+        parts[3].replace("\\", "/"),
+    )
+
+
+def _metadata_path(
+    headers: list[str],
+    prefix: str,
+) -> str | None:
+    for line in headers:
+        if not line.startswith(prefix):
+            continue
+
+        value = line[len(prefix):].strip()
+        if not value:
+            raise UnifiedDiffError(f"empty {prefix.strip()} path")
+
+        if value.startswith('"'):
+            try:
+                parts = shlex.split(value)
+            except ValueError as exc:
+                raise UnifiedDiffError(
+                    f"malformed {prefix.strip()} path"
+                ) from exc
+            if len(parts) != 1:
+                raise UnifiedDiffError(
+                    f"malformed {prefix.strip()} path"
+                )
+            value = parts[0]
+
+        return value.replace("\\", "/")
+    return None
+
+
+def _metadata_only_change(headers: list[str]) -> bool:
+    return any(
+        line.startswith(GIT_METADATA_CHANGE_PREFIXES)
+        for line in headers
+    )
+
+
+def _metadata_paths(
+    headers: list[str],
+    diff_paths: tuple[str, str] | None,
+) -> tuple[str, str]:
+    rename_from = _metadata_path(headers, "rename from ")
+    rename_to = _metadata_path(headers, "rename to ")
+    copy_from = _metadata_path(headers, "copy from ")
+    copy_to = _metadata_path(headers, "copy to ")
+
+    if (rename_from is None) != (rename_to is None):
+        raise UnifiedDiffError("incomplete rename metadata")
+    if (copy_from is None) != (copy_to is None):
+        raise UnifiedDiffError("incomplete copy metadata")
+    if rename_from is not None and copy_from is not None:
+        raise UnifiedDiffError(
+            "file patch cannot be both a rename and a copy"
+        )
+
+    if rename_from is not None and rename_to is not None:
+        return rename_from, rename_to
+    if copy_from is not None and copy_to is not None:
+        return copy_from, copy_to
+    if diff_paths is not None:
+        return diff_paths
+
+    raise UnifiedDiffError(
+        "metadata-only file patch has no source or destination path"
+    )
 
 
 def _header_path(line: str, prefix: str) -> str:
@@ -111,24 +219,44 @@ def parse_unified_diff(text: str) -> UnifiedDiff:
     index = 0
 
     while index < len(lines):
-        line = lines[index]
-        if not line:
+        if not lines[index]:
             index += 1
             continue
-        if line.startswith((
-            "diff --git ",
-            "index ",
-            "new file mode ",
-            "deleted file mode ",
-            "old mode ",
-            "new mode ",
-            "similarity index ",
-            "rename from ",
-            "rename to ",
-        )):
+
+        git_headers: list[str] = []
+        diff_paths: tuple[str, str] | None = None
+
+        if lines[index].startswith("diff --git "):
+            diff_paths = _diff_git_paths(lines[index])
+            git_headers.append(lines[index])
             index += 1
-            continue
-        if not _is_file_header(lines, index):
+
+        while (
+            index < len(lines)
+            and lines[index].startswith(GIT_EXTENDED_HEADER_PREFIXES)
+        ):
+            git_headers.append(lines[index])
+            index += 1
+
+        if index >= len(lines) or not _is_file_header(lines, index):
+            if git_headers and _metadata_only_change(git_headers):
+                old_path, new_path = _metadata_paths(
+                    git_headers,
+                    diff_paths,
+                )
+                files.append(
+                    FilePatch(
+                        old_path,
+                        new_path,
+                        (),
+                        tuple(git_headers),
+                    )
+                )
+                continue
+
+            if index >= len(lines) and not git_headers:
+                break
+
             raise UnifiedDiffError(
                 "expected valid ---/+++ file headers",
                 index + 1,
@@ -217,7 +345,9 @@ def parse_unified_diff(text: str) -> UnifiedDiff:
                 raise UnifiedDiffError(
                     "hunk contains no changes",
                     source_line,
-                    "\n".join([header, *(line.kind + line.text for line in body)]),
+                    "\n".join(
+                        [header, *(line.kind + line.text for line in body)]
+                    ),
                 )
 
             hunks.append(Hunk(
@@ -232,11 +362,30 @@ def parse_unified_diff(text: str) -> UnifiedDiff:
             ))
 
         if not hunks:
+            if git_headers and _metadata_only_change(git_headers):
+                files.append(
+                    FilePatch(
+                        old_path,
+                        new_path,
+                        (),
+                        tuple(git_headers),
+                    )
+                )
+                continue
+
             raise UnifiedDiffError(
                 "file patch has no hunks",
                 index + 1,
             )
-        files.append(FilePatch(old_path, new_path, tuple(hunks)))
+
+        files.append(
+            FilePatch(
+                old_path,
+                new_path,
+                tuple(hunks),
+                tuple(git_headers),
+            )
+        )
 
     if not files:
         raise UnifiedDiffError("patch contains no file patches")
@@ -275,8 +424,10 @@ def _canonical_path(path: str, side: str) -> str:
 def serialize_unified_diff(diff: UnifiedDiff) -> str:
     output: list[str] = []
     for file_patch in diff.files:
-        output.append(f"--- {_canonical_path(file_patch.old_path, 'a')}")
-        output.append(f"+++ {_canonical_path(file_patch.new_path, 'b')}")
+        output.extend(file_patch.git_headers)
+        if file_patch.hunks:
+            output.append(f"--- {_canonical_path(file_patch.old_path, 'a')}")
+            output.append(f"+++ {_canonical_path(file_patch.new_path, 'b')}")
         for hunk in file_patch.hunks:
             old_count = hunk.actual_old_count
             new_count = hunk.actual_new_count

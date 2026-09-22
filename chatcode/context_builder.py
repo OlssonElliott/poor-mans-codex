@@ -38,7 +38,7 @@ from .retrieval.hybrid_retriever import (
     resolve_explicit_targets,
     resolve_task_surface_roots,
     resolve_semantic_hints,
-    test_callsite_closure,
+    resolve_test_callsite_closure,
 )
 from .retrieval.source_coverage import plan_source_coverage
 from .retrieval.context_contract import plan_context_contract
@@ -1002,7 +1002,7 @@ def collect_relevant_files(
         hybrid.reasons[path] = list(dict.fromkeys([
             *reasons, *hybrid.reasons.get(path, []),
         ]))
-    callsite_closure = test_callsite_closure(repo, task, [*hybrid.files, *graph_files])
+    callsite_closure = resolve_test_callsite_closure(repo, task, [*hybrid.files, *graph_files])
     implementation_roots: dict[Path, list[str]] = {}
     for result in (
         locals().get("explicit_target_result"),
@@ -2835,7 +2835,7 @@ def build_context_from_test_roots(
         for test_id in sorted(test_ids)
         for token in re.findall(r"[A-Za-z0-9]+", test_id)
     )
-    closure = test_callsite_closure(repo, closure_task, roots)
+    closure = resolve_test_callsite_closure(repo, closure_task, roots)
     files = list(dict.fromkeys([*roots, *closure.files]))
     for path, symbols in closure.required_symbols.items():
         required.setdefault(path, []).extend(symbols)

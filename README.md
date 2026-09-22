@@ -580,15 +580,19 @@ No repository mutation occurs if these checks fail.
 
 ## Baseline
 
-Before mutation, ChatCode captures the current repository state and runs or reuses a verified pre-patch full test baseline.
+Before mutation, ChatCode captures the current repository state and reuses a verified pre-patch full test baseline when one is available. A CLI apply does not block to create a missing baseline; its post-patch background suite establishes the verified state for the next apply.
 
-This matters because a red test after the patch is not automatically a regression if it was already failing before the patch.
+When a baseline is available, a red test after the patch is not automatically a regression if it was already failing before the patch. Without one, ChatCode reports that regression classification is unavailable rather than delaying the apply.
 
 ## After apply
 
-ChatCode tries to run a narrow relevant Python test selection first when it can map changed source to tests safely.
+ChatCode runs the configured `fast` test profile first. Without one, it tries a narrow relevant Python test selection when it can map changed source to tests safely.
 
-The full detected test suite then remains the main validation gate.
+When changed Python production files have no unambiguous conventional test-file match, ChatCode prints a non-blocking warning. This is a discovery warning, not proof that coverage is missing; indirect, parametrized, or differently named tests may still cover the change.
+
+The configured or detected `full` suite then runs in the background and is reused as a verified baseline on the next apply when the repository state is unchanged.
+
+Run `chatcode status` to see whether the latest background full suite is running, passed, failed, or ended with an infrastructure error. Completed status includes its command, duration, report path, and known failing test IDs.
 
 Post-patch failures are classified relative to the baseline as:
 
@@ -602,6 +606,18 @@ The resulting patch and before/after snapshots are stored in ChatCode history.
 ---
 
 # Test detection
+
+For predictable project-specific behavior, create `.chatcode/tests.toml`:
+
+```toml
+[tests]
+fast = ["python", "-m", "pytest", "-n", "auto", "-m", "not integration and not e2e"]
+full = ["python", "-m", "pytest", "-n", "auto"]
+```
+
+Argument lists are recommended because they work without shell parsing. Tokenized command strings are also accepted, but shell operators such as `&&` are not evaluated; use a project script when shell behavior is needed. `fast` is the immediate post-change check; `full` is used for complete validation and baselines. Either profile may be omitted.
+
+When a profile is not configured, ChatCode falls back to automatic detection.
 
 ChatCode currently detects common test setups for:
 

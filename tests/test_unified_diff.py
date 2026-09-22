@@ -34,6 +34,66 @@ class UnifiedDiffTests(unittest.TestCase):
         canonical, _ = canonicalize_unified_diff(patch)
         self.assertIn("@@ -1,1 +1,1 @@", canonical)
 
+    def test_rename_metadata_survives_canonicalization(self) -> None:
+        patch = (
+            "diff --git a/old.py b/pkg/new.py\n"
+            "similarity index 80%\n"
+            "rename from old.py\n"
+            "rename to pkg/new.py\n"
+            "--- a/old.py\n"
+            "+++ b/pkg/new.py\n"
+            "@@ -1 +1 @@\n"
+            "-old = True\n"
+            "+old = False\n"
+        )
+
+        canonical, mismatches = canonicalize_unified_diff(patch)
+
+        self.assertEqual(mismatches, [])
+        self.assertIn(
+            "diff --git a/old.py b/pkg/new.py\n",
+            canonical,
+        )
+        self.assertIn(
+            "similarity index 80%\n"
+            "rename from old.py\n"
+            "rename to pkg/new.py\n",
+            canonical,
+        )
+        self.assertIn("--- a/old.py\n", canonical)
+        self.assertIn("+++ b/pkg/new.py\n", canonical)
+
+    def test_metadata_only_rename_is_valid_and_preserved(self) -> None:
+        patch = (
+            "diff --git a/old.py b/pkg/new.py\n"
+            "similarity index 100%\n"
+            "rename from old.py\n"
+            "rename to pkg/new.py\n"
+        )
+
+        canonical, mismatches = canonicalize_unified_diff(patch)
+        parsed = parse_unified_diff(canonical)
+
+        self.assertEqual(mismatches, [])
+        self.assertEqual(canonical, patch)
+        self.assertEqual(len(parsed.files), 1)
+        self.assertEqual(parsed.files[0].old_path, "old.py")
+        self.assertEqual(parsed.files[0].new_path, "pkg/new.py")
+        self.assertEqual(parsed.files[0].hunks, ())
+
+    def test_metadata_only_copy_is_valid_and_preserved(self) -> None:
+        patch = (
+            "diff --git a/source.py b/pkg/source.py\n"
+            "similarity index 100%\n"
+            "copy from source.py\n"
+            "copy to pkg/source.py\n"
+        )
+
+        canonical, mismatches = canonicalize_unified_diff(patch)
+
+        self.assertEqual(mismatches, [])
+        self.assertEqual(canonical, patch)
+
     def test_missing_hunk_header_is_rejected(self) -> None:
         patch = "--- a/app.py\n+++ b/app.py\n-old\n+new\n"
         with self.assertRaisesRegex(UnifiedDiffError, "hunk header"):

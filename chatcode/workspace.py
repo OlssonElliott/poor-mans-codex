@@ -10,7 +10,10 @@ from pathlib import Path
 
 
 TEMPORARY_REPOSITORY_NAME = re.compile(r"tmp[a-z0-9_]{8}\Z")
-TEMPORARY_WORKSPACE_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+# Workspaces for repositories created by tempfile are test/tooling artifacts.
+# Keep them long enough for an interrupted command to be inspected, but do not
+# let ordinary test runs accumulate a week's worth of abandoned workspaces.
+TEMPORARY_WORKSPACE_MAX_AGE_SECONDS = 24 * 60 * 60
 
 
 def get_workspace_root() -> Path:
