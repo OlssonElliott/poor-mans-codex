@@ -82,7 +82,9 @@ class CheckCommandTests(unittest.TestCase):
             "chatcode.cli.run_project_tests", return_value=self.result(1, frozenset({failure}))
         ), patch("chatcode.cli.sys.stdin.isatty", return_value=True), patch(
             "chatcode.cli.build_check_repair_context", return_value=context
-        ) as build, patch("builtins.input", side_effect=["f"]) as prompt, patch("builtins.print") as output:
+        ) as build, patch("chatcode.cli.open_folder") as open_folder, patch(
+            "builtins.input", side_effect=["f"]
+        ) as prompt, patch("builtins.print") as output:
             code = command_check()
 
         self.assertEqual(code, 1)
@@ -93,6 +95,7 @@ class CheckCommandTests(unittest.TestCase):
         self.assertEqual(rendered.count("Check repair context created:"), 1)
         self.assertIn("[UPLOAD THIS FILE]", rendered)
         self.assertIn(str(context), rendered)
+        open_folder.assert_called_once_with(context.resolve().parent)
 
     def test_check_context_delegates_source_capture_to_shared_test_root_pipeline(self) -> None:
         from chatcode.patch import build_check_repair_context

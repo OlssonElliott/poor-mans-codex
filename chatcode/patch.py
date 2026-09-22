@@ -36,6 +36,7 @@ from .history import (
 )
 from .workspace import (
     atomic_write_text,
+    get_applied_history_dir,
     get_default_patch_file,
     get_check_repair_context_file,
     get_existing_failure_context_file,
@@ -310,6 +311,7 @@ def _complete_background_full_suite(
     repo_name: str,
     snapshot_payload: dict,
     run_id: str,
+    application_payload: dict | None = None,
 ) -> None:
     """Worker entry point for the detached post-apply full test suite."""
     repo = Path(repo_name)
@@ -347,6 +349,8 @@ def _complete_background_full_suite(
             "error": str(exc),
             "completed_at": time.time(),
         }
+    if application_payload is not None:
+        status["application"] = application_payload
     _write_background_full_suite_status(repo, status, run_file=True)
     if is_current:
         _cleanup_background_full_suite_artifacts(repo, keep_run_id=run_id)
@@ -375,12 +379,22 @@ def _complete_background_full_suite_from_status(
             "completed_at": time.time(),
         }, run_file=True)
         return
-    _complete_background_full_suite(repo_name, snapshot_payload, run_id)
+    application_payload = payload.get("application")
+    if isinstance(application_payload, dict):
+        _complete_background_full_suite(
+            repo_name,
+            snapshot_payload,
+            run_id,
+            application_payload,
+        )
+    else:
+        _complete_background_full_suite(repo_name, snapshot_payload, run_id)
 
 
 def _start_background_full_suite(
     repo: Path,
     snapshot: RepositorySnapshot,
+    application: ApplyResult | None = None,
 ) -> None:
     """Launch a full suite that can outlive the current ``chatcode apply``."""
     run_id = uuid.uuid4().hex
@@ -392,6 +406,11 @@ def _start_background_full_suite(
         "snapshot": snapshot_payload,
         "started_at": time.time(),
     }
+    if application is not None:
+        initial_status["application"] = {
+            "history_entry": application.history_entry.name,
+            "paths": sorted(application.paths),
+        }
     _write_background_full_suite_status(repo, initial_status, run_file=True)
     _write_background_full_suite_status(repo, initial_status)
     worker = (
@@ -451,6 +470,9 @@ def show_chatgpt_upload_artifact(context: Path) -> None:
     """Make a generated ChatGPT attachment unambiguous in terminal output."""
     print(_status("[UPLOAD THIS FILE]", "cyan"))
     print(_status(str(context), "cyan"))
+    # Import lazily to avoid the cli -> patch module cycle at import time.
+    from .cli import open_folder
+    open_folder(context.resolve().parent)
 
 
 def show_repair_send_instructions(repair_context: Path) -> None:
@@ -497,12 +519,24 @@ def _classify_test_validation(
         before = getattr(baseline, "failed_tests", frozenset())
         full_failures = getattr(full, "failed_tests", frozenset()) if full else frozenset()
         remaining_targets = targeted_failures & repair_targets
+        new_failures = (
+            full_failures - before
+            if baseline is not None else frozenset()
+        )
+        existing_failures = (
+            full_failures & before
+            if baseline is not None else frozenset()
+        )
+        fixed_failures = (
+            before - full_failures
+            if baseline is not None and full is not None else frozenset()
+        )
         return TestValidation(
             baseline, targeted, full,
             "repair_failed" if remaining_targets else "targeted_failed",
-            new_failures=full_failures - before,
-            existing_failures=full_failures & before,
-            fixed_failures=before - full_failures if full is not None else frozenset(),
+            new_failures=new_failures,
+            existing_failures=existing_failures,
+            fixed_failures=fixed_failures,
             repair_targets=repair_targets,
             remaining_repair_failures=remaining_targets,
         )
@@ -1442,6 +1476,9 @@ def _write_repair_context(
         repair_targets=sorted(repair_targets),
     )
     atomic_write_text(output_file, content, newline="\n")
+    # The repair artifact is now the source of truth for the next response.
+    # Clear the consumed candidate only after the replacement was published.
+    _clear_incoming_patch(repo)
     return output_file
 
 
@@ -1834,6 +1871,10 @@ def build_test_failure_repair_context(
         # This function may also be called explicitly to investigate an
         # existing failure.  It is never reached automatically for that state.
         | (validation.existing_failures if validation.status == "existing" else frozenset())
+        | (
+            getattr(validation.full, "failed_tests", frozenset())
+            if validation.status == "unclassified_failure" else frozenset()
+        )
     )
     failure_ids = sorted(repair_failure_ids)
     anchors: dict[str, int] = {}
@@ -1947,6 +1988,11 @@ def build_test_failure_repair_context(
             )),
             *(f"- regression: {name}" for name in sorted(validation.new_failures)),
         ]
+    elif validation.status == "unclassified_failure":
+        classifications = [
+            f"- observed after patch; baseline unavailable: {name}"
+            for name in sorted(repair_failure_ids)
+        ]
     else:
         classifications = [
             *(f"- regression: {name}" for name in sorted(validation.new_failures)),
@@ -1988,8 +2034,128 @@ def build_test_failure_repair_context(
         repo,
         content,
         included_paths,
-        validation.new_failures | validation.existing_failures,
+        repair_failure_ids,
     )
+
+
+def ensure_background_failure_repair_context(
+    repo: Path,
+    background: dict,
+) -> tuple[Path, bool]:
+    """Create one safe repair artifact for the current failed background run."""
+    try:
+        returncode = int(background.get("returncode", 0))
+    except (TypeError, ValueError) as exc:
+        raise PatchError("The background suite result is invalid.") from exc
+    if background.get("state") != "completed" or returncode == 0:
+        raise PatchError("The background suite did not fail.")
+
+    failures = frozenset(
+        str(item) for item in background.get("failed_tests", []) if item
+    )
+    if not failures:
+        raise PatchError(
+            "The background suite failed without stable test identifiers."
+        )
+
+    expected_context = get_repair_context_file(repo).resolve()
+    recorded_context = background.get("repair_context")
+    if recorded_context:
+        candidate = Path(str(recorded_context)).resolve()
+        if (
+            candidate == expected_context
+            and candidate.is_file()
+            and get_repair_context_stale_reason(repo) is None
+        ):
+            return candidate, False
+
+    try:
+        tested_snapshot = _snapshot_from_payload(background["snapshot"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PatchError(
+            "The background result has no valid repository snapshot."
+        ) from exc
+    if _capture_repository_snapshot(repo) != tested_snapshot:
+        raise PatchError(
+            "The working tree changed after the failed background suite; "
+            "a repair context was not generated from stale test output."
+        )
+
+    application = background.get("application")
+    entry: Path
+    recorded_paths: set[str] | None = None
+    if isinstance(application, dict):
+        entry_name = str(application.get("history_entry", ""))
+        if not entry_name or Path(entry_name).name != entry_name:
+            raise PatchError("The background patch history reference is invalid.")
+        entry = get_applied_history_dir(repo) / entry_name
+        raw_paths = application.get("paths", [])
+        if not isinstance(raw_paths, list):
+            raise PatchError("The background patch path list is invalid.")
+        recorded_paths = {str(path) for path in raw_paths}
+    else:
+        # Compatibility with background runs started before application
+        # metadata was persisted in their status file.
+        try:
+            entry = get_latest_applied_entry(repo)
+        except HistoryError as exc:
+            raise PatchError(
+                "No applied ChatCode patch could be associated with this run."
+            ) from exc
+
+    applied_dir = get_applied_history_dir(repo).resolve()
+    try:
+        resolved_entry = entry.resolve()
+    except OSError as exc:
+        raise PatchError("The applied patch history could not be resolved.") from exc
+    if resolved_entry.parent != applied_dir or not resolved_entry.exists():
+        raise PatchError("The background patch history entry is unavailable.")
+    try:
+        paths = extract_patch_paths(
+            get_history_patch_file(resolved_entry).read_text(
+                encoding="utf-8", errors="replace"
+            )
+        )
+    except OSError as exc:
+        raise PatchError("The applied patch history could not be read.") from exc
+    if not paths or (recorded_paths is not None and recorded_paths != paths):
+        raise PatchError(
+            "The background run does not match its applied patch history."
+        )
+
+    report = Path(str(background.get("report", "")))
+    try:
+        resolved_report = report.resolve()
+    except OSError as exc:
+        raise PatchError("The background test report could not be resolved.") from exc
+    if (
+        resolved_report.parent != get_test_results_dir(repo).resolve()
+        or not resolved_report.is_file()
+    ):
+        raise PatchError("The background test report is unavailable.")
+
+    full_result = TestResult(
+        command=str(background.get("command", "unknown test command")),
+        returncode=returncode,
+        duration_seconds=float(background.get("duration_seconds", 0.0)),
+        output_file=resolved_report,
+        failed_tests=failures,
+    )
+    validation = TestValidation(
+        baseline=None,
+        targeted=None,
+        full=full_result,
+        status="unclassified_failure",
+    )
+    context = build_test_failure_repair_context(
+        repo,
+        ApplyResult(paths=paths, history_entry=resolved_entry),
+        validation,
+    )
+    updated = dict(background)
+    updated["repair_context"] = str(context)
+    _write_background_full_suite_status(repo, updated, run_file=True)
+    return context, True
 
 
 def _apply_patch_core(
@@ -3146,8 +3312,6 @@ def _post_apply_choice(
                 repo, result, validation, followup_feedback, _applied_patch_summary(result),
             )
             show_followup_send_instructions(context)
-            from .cli import open_folder
-            open_folder(context.parent)
             print("Changes kept.")
             return
         except (OSError, PatchError) as exc:
@@ -3205,8 +3369,6 @@ def _post_apply_choice(
                     repo, result, validation, followup_feedback, _applied_patch_summary(result),
                 )
                 show_followup_send_instructions(context)
-                from .cli import open_folder
-                open_folder(context.parent)
                 print("Changes kept.")
                 return
             except (OSError, PatchError) as exc:
@@ -3220,11 +3382,6 @@ def _post_apply_choice(
             try:
                 context = build_existing_failure_context(repo, result, validation, selected)
                 show_existing_failure_send_instructions(context)
-                # Reuse the same cross-platform folder opener used for normal
-                # generated contexts. Importing here avoids a module import
-                # cycle between the CLI and patch workflow modules.
-                from .cli import open_folder
-                open_folder(context.parent)
             except OSError as exc:
                 print(f"Could not create existing failure context: {exc}")
                 continue
@@ -3456,8 +3613,12 @@ def _run_apply_flow(
         else:
             try:
                 full_snapshot = _capture_repository_snapshot(repo)
-                if _CLI_APPLY_INVOCATION:
-                    _start_background_full_suite(repo, full_snapshot)
+                targeted_failed = (
+                    relevant_result is not None
+                    and relevant_result.returncode != 0
+                )
+                if _CLI_APPLY_INVOCATION and not targeted_failed:
+                    _start_background_full_suite(repo, full_snapshot, result)
                     full_suite_pending = True
                     update_history_test_result(
                         result.history_entry,
@@ -3468,6 +3629,12 @@ def _run_apply_flow(
                         "Its verified result will be used by the next apply."
                     )
                 else:
+                    if _CLI_APPLY_INVOCATION and targeted_failed:
+                        print(_status(
+                            "Relevant tests failed; waiting for the full suite "
+                            "before creating repair context...",
+                            "yellow",
+                        ))
                     test_result = run_project_tests(repo)
                     test_result = _preserve_test_report(repo, test_result, "full-suite")
                     if _capture_repository_snapshot(repo) == full_snapshot:

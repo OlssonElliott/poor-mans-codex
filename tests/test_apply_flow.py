@@ -32,6 +32,7 @@ from chatcode.patch import (
     show_chatgpt_upload_artifact,
     _build_patch_summary,
     _clear_incoming_patch,
+    _write_repair_context,
     _clear_repair_context,
     _consume_cli_apply_flags,
     _open_diff_window,
@@ -39,6 +40,7 @@ from chatcode.patch import (
     _capture_repository_snapshot,
     _cleanup_background_full_suite_artifacts,
     get_background_full_suite_status,
+    ensure_background_failure_repair_context,
     _complete_background_full_suite,
     _complete_background_full_suite_from_status,
     _snapshot_payload,
@@ -90,6 +92,8 @@ class ApplyFlowTests(unittest.TestCase):
             return_value=self.workspace,
         )
         self.workspace_patch.start()
+        self.folder_patch = patch("chatcode.cli.open_folder")
+        self.folder_patch.start()
         git(self.repo, "init", "-q")
         git(self.repo, "config", "user.name", "ChatCode Tests")
         git(self.repo, "config", "user.email", "chatcode@example.test")
@@ -109,6 +113,7 @@ class ApplyFlowTests(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
+        self.folder_patch.stop()
         self.workspace_patch.stop()
         self.temporary.cleanup()
 
@@ -613,6 +618,21 @@ class ApplyFlowTests(unittest.TestCase):
         self.assertFalse(repair.exists())
         self.assertTrue(sibling.is_file())
 
+    def test_creating_repair_context_clears_canonical_incoming_patch(self) -> None:
+        canonical = get_default_patch_file(self.repo)
+        canonical.parent.mkdir(parents=True, exist_ok=True)
+        canonical.write_text("candidate patch", encoding="utf-8")
+
+        context = _write_repair_context(
+            self.repo,
+            "repair context\n",
+            {"app.py"},
+        )
+
+        self.assertTrue(context.is_file())
+        self.assertEqual(context.read_text(encoding="utf-8"), "repair context\n")
+        self.assertEqual(canonical.read_text(encoding="utf-8"), "")
+
     def test_successful_apply_clears_canonical_incoming_patch(self) -> None:
         canonical = get_default_patch_file(
             self.repo
@@ -677,7 +697,7 @@ class ApplyFlowTests(unittest.TestCase):
             original,
         )
 
-    def test_failed_validation_keeps_canonical_incoming_patch(self) -> None:
+    def test_failed_validation_moves_candidate_into_repair_context(self) -> None:
         canonical = get_default_patch_file(
             self.repo
         )
@@ -700,9 +720,13 @@ class ApplyFlowTests(unittest.TestCase):
                 canonical,
             )
 
-        self.assertTrue(
-            canonical.read_text(encoding="utf-8")
-        )
+        repair = get_repair_context_file(self.repo)
+        self.assertTrue(repair.is_file())
+        repair_content = repair.read_text(encoding="utf-8")
+        self.assertIn("## Complete generated patch", repair_content)
+        self.assertIn("--- a/app.py\n+++ b/app.py", repair_content)
+        self.assertIn("-missing = True\n+value = 2", repair_content)
+        self.assertEqual(canonical.read_text(encoding="utf-8"), "")
 
     def test_incoming_cleanup_failure_is_nonfatal(self) -> None:
         fake_incoming = Mock()
@@ -949,6 +973,19 @@ class ApplyFlowTests(unittest.TestCase):
         validation = _classify_test_validation(baseline, targeted, after)
 
         self.assertEqual(validation.status, "targeted_failed")
+
+    def test_targeted_failure_without_baseline_is_not_called_a_regression(self) -> None:
+        failure = "tests.test_broken"
+        failed = TestResult(**{
+            **self.result(1).__dict__,
+            "failed_tests": frozenset({failure}),
+        })
+
+        validation = _classify_test_validation(None, failed, failed)
+
+        self.assertEqual(validation.status, "targeted_failed")
+        self.assertFalse(validation.new_failures)
+        self.assertFalse(validation.existing_failures)
         self.assertFalse(validation.new_failures)
 
     def test_unparseable_failed_output_is_classified_as_unclear(self) -> None:
@@ -1126,11 +1163,55 @@ class ApplyFlowTests(unittest.TestCase):
 
         synchronous_full.assert_not_called()
         background_full.assert_called_once()
+        self.assertEqual(background_full.call_args.args[2].paths, {"app.py"})
         rendered = "\n".join(
             str(call.args[0]) for call in output.call_args_list if call.args
         )
         self.assertIn("continuing without blocking", rendered)
         self.assertNotIn("Waiting for pre-patch baseline", rendered)
+
+    def test_cli_apply_waits_for_full_suite_after_targeted_failure(self) -> None:
+        failure = "tests.test_broken"
+        failed = TestResult(**{
+            **self.result(1).__dict__,
+            "failed_tests": frozenset({failure}),
+        })
+        repair_context = self.root / "PATCH_REPAIR_CONTEXT.md"
+
+        with patch(
+            "chatcode.patch._CLI_APPLY_INVOCATION", True
+        ), patch(
+            "chatcode.patch._qwen_patch_summary", return_value=None
+        ), patch(
+            "chatcode.test_runner.run_relevant_tests", return_value=failed
+        ), patch(
+            "chatcode.test_runner.run_project_tests", return_value=failed
+        ) as full, patch(
+            "chatcode.test_runner.unmapped_python_source_paths", return_value=[]
+        ), patch(
+            "chatcode.patch._start_background_full_suite"
+        ) as background_full, patch(
+            "chatcode.patch.build_test_failure_repair_context",
+            return_value=repair_context,
+        ) as build_repair, patch(
+            "chatcode.patch.show_repair_send_instructions"
+        ) as show_repair, patch("builtins.print") as output:
+            _run_apply_flow(self.repo, self.incoming, yes=True)
+
+        full.assert_called_once_with(self.repo)
+        background_full.assert_not_called()
+        build_repair.assert_called_once()
+        show_repair.assert_called_once_with(repair_context)
+        validation = build_repair.call_args.args[2]
+        self.assertEqual(validation.status, "targeted_failed")
+        self.assertEqual(validation.full.returncode, 1)
+        self.assertEqual(validation.full.failed_tests, frozenset({failure}))
+        self.assertEqual(validation.full.output_file.name, "full-suite.md")
+        rendered = "\n".join(
+            str(call.args[0]) for call in output.call_args_list if call.args
+        )
+        self.assertIn("waiting for the full suite", rendered)
+        self.assertNotIn("FULL SUITE RUNNING IN BACKGROUND", rendered)
 
     def test_background_full_suite_is_detached_and_records_its_snapshot(self) -> None:
         snapshot = _capture_repository_snapshot(self.repo)
@@ -1294,6 +1375,113 @@ class ApplyFlowTests(unittest.TestCase):
         self.assertEqual(status["state"], "error")
         self.assertEqual(status["error"], "test runner failed")
 
+    def test_failed_background_suite_creates_one_repair_context(self) -> None:
+        applied = apply_patch(self.repo, self.incoming)
+        snapshot = _capture_repository_snapshot(self.repo)
+        run_id = "c" * 32
+        failure = "tests.test_broken"
+        report = get_test_results_dir(self.repo) / f"background-full-suite-{run_id}.md"
+        report.write_text(
+            "Status: FAILED\nFAIL: test_broken (tests.test_broken)\nAssertionError\n",
+            encoding="utf-8",
+        )
+        background = {
+            "run_id": run_id,
+            "state": "completed",
+            "snapshot": _snapshot_payload(snapshot),
+            "returncode": 1,
+            "report": str(report),
+            "command": "python -m pytest",
+            "duration_seconds": 1.25,
+            "failed_tests": [failure],
+            "application": {
+                "history_entry": applied.history_entry.name,
+                "paths": sorted(applied.paths),
+            },
+        }
+
+        context, created = ensure_background_failure_repair_context(
+            self.repo,
+            background,
+        )
+
+        self.assertTrue(created)
+        self.assertEqual(context, get_repair_context_file(self.repo))
+        content = context.read_text(encoding="utf-8")
+        self.assertIn("observed after patch; baseline unavailable", content)
+        self.assertIn(failure, content)
+        saved = json.loads(
+            (
+                get_repo_workspace(self.repo)
+                / f"background-full-suite-{run_id}.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(saved["repair_context"], str(context))
+
+        existing, created_again = ensure_background_failure_repair_context(
+            self.repo,
+            saved,
+        )
+        self.assertEqual(existing, context)
+        self.assertFalse(created_again)
+
+    def test_failed_background_suite_does_not_use_stale_snapshot(self) -> None:
+        applied = apply_patch(self.repo, self.incoming)
+        snapshot = _capture_repository_snapshot(self.repo)
+        report = get_test_results_dir(self.repo) / "background-full-suite-stale.md"
+        report.write_text("Status: FAILED\n", encoding="utf-8")
+        self.source.write_text("value = 3\n", encoding="utf-8")
+        background = {
+            "run_id": "d" * 32,
+            "state": "completed",
+            "snapshot": _snapshot_payload(snapshot),
+            "returncode": 1,
+            "report": str(report),
+            "command": "python -m pytest",
+            "duration_seconds": 1.0,
+            "failed_tests": ["tests.test_broken"],
+            "application": {
+                "history_entry": applied.history_entry.name,
+                "paths": sorted(applied.paths),
+            },
+        }
+
+        with self.assertRaisesRegex(PatchError, "working tree changed"):
+            ensure_background_failure_repair_context(self.repo, background)
+
+        self.assertFalse(get_repair_context_file(self.repo).exists())
+
+    def test_legacy_failed_background_suite_uses_latest_applied_patch(self) -> None:
+        apply_patch(self.repo, self.incoming)
+        snapshot = _capture_repository_snapshot(self.repo)
+        run_id = "e" * 32
+        report = get_test_results_dir(self.repo) / f"background-full-suite-{run_id}.md"
+        report.write_text(
+            "Status: FAILED\nFAIL: test_broken (tests.test_broken)\n",
+            encoding="utf-8",
+        )
+        background = {
+            "run_id": run_id,
+            "state": "completed",
+            "snapshot": _snapshot_payload(snapshot),
+            "returncode": 1,
+            "report": str(report),
+            "command": "python -m pytest",
+            "duration_seconds": 1.0,
+            "failed_tests": ["tests.test_broken"],
+        }
+
+        context, created = ensure_background_failure_repair_context(
+            self.repo,
+            background,
+        )
+
+        self.assertTrue(created)
+        self.assertTrue(context.is_file())
+        content = context.read_text(encoding="utf-8")
+        self.assertIn("app.py", content)
+        self.assertIn("tests.test_broken", content)
+
     def test_older_background_worker_cannot_replace_current_status(self) -> None:
         snapshot = _capture_repository_snapshot(self.repo)
         workspace = get_repo_workspace(self.repo)
@@ -1443,15 +1631,18 @@ class ApplyFlowTests(unittest.TestCase):
 
     def test_chatgpt_upload_artifact_is_labeled_and_color_safe(self) -> None:
         artifact = Path("EXISTING_FAILURE_CONTEXT.md")
-        with patch("builtins.print") as output:
+        with patch("chatcode.cli.open_folder") as open_folder, patch(
+            "builtins.print"
+        ) as output:
             show_chatgpt_upload_artifact(artifact)
 
         printed = [call.args[0] for call in output.call_args_list]
         self.assertEqual(printed, ["[UPLOAD THIS FILE]", str(artifact)])
+        open_folder.assert_called_once_with(artifact.resolve().parent)
 
         with patch.dict("os.environ", {}, clear=True), patch(
             "chatcode.patch.sys.stdout.isatty", return_value=True
-        ), patch("builtins.print") as output:
+        ), patch("chatcode.cli.open_folder"), patch("builtins.print") as output:
             show_chatgpt_upload_artifact(artifact)
 
         colored = [call.args[0] for call in output.call_args_list]
@@ -1711,7 +1902,7 @@ class ApplyFlowTests(unittest.TestCase):
         self.assertNotIn("NOISY SUCCESS OUTPUT", content)
 
     def test_repair_send_instructions_require_a_companion_user_prompt(self) -> None:
-        with patch("builtins.print") as output:
+        with patch("chatcode.cli.open_folder"), patch("builtins.print") as output:
             show_repair_send_instructions(Path("PATCH_REPAIR_CONTEXT.md"))
 
         printed = "\n".join(str(call.args[0]) for call in output.call_args_list)

@@ -51,6 +51,7 @@ from .patch import (
     _status,
     _capture_repository_snapshot,
     get_background_full_suite_status,
+    ensure_background_failure_repair_context,
     save_verified_baseline,
     undo_last_patch,
 )
@@ -154,6 +155,29 @@ def command_status(reindex: bool = False) -> None:
                 print(f"  {failure}")
         if background.get("report"):
             print(f"Report:   {background['report']}")
+        if returncode != 0:
+            try:
+                repair_context, created = ensure_background_failure_repair_context(
+                    repo,
+                    background,
+                )
+            except (OSError, PatchError, GitError) as exc:
+                print(_status(
+                    f"Repair context could not be created: {exc}",
+                    "yellow",
+                ))
+            else:
+                if created:
+                    print(_status(
+                        "Repair context created from the failed background suite.",
+                        "yellow",
+                    ))
+                    show_repair_send_instructions(repair_context)
+                else:
+                    print("Repair context: " + _status(
+                        str(repair_context),
+                        "cyan",
+                    ))
     elif state == "error":
         print("Background full suite: ERROR")
         print(f"Error: {background.get('error', 'Unknown background test error')}")
@@ -314,10 +338,6 @@ def command_context(
     print()
     print("Workspace directory:")
     print(output.parent)
-
-    open_folder(
-        output.parent
-    )
 
 
 def run_tests(
@@ -737,7 +757,6 @@ def command_followup() -> int:
         print("No unresolved follow-up is available for this repository.")
         return 1
     show_followup_send_instructions(context)
-    open_folder(context.parent)
     return 0
 
 

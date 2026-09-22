@@ -111,6 +111,33 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("Background full suite: ERROR", rendered)
         self.assertIn("worker failed", rendered)
 
+    def test_status_creates_handoff_for_failed_background_suite(self) -> None:
+        context = os.path.abspath("PATCH_REPAIR_CONTEXT.md")
+        background = {
+            "state": "completed",
+            "returncode": 1,
+            "failed_tests": ["tests.test_broken"],
+        }
+        with patch(
+            "chatcode.cli.get_repo_root", return_value="repo"
+        ), patch(
+            "chatcode.cli.get_branch", return_value="main"
+        ), patch(
+            "chatcode.cli.build_safe_status", return_value=""
+        ), patch(
+            "chatcode.cli.get_background_full_suite_status",
+            return_value=background,
+        ), patch(
+            "chatcode.cli.ensure_background_failure_repair_context",
+            return_value=(context, True),
+        ) as ensure, patch(
+            "chatcode.cli.show_repair_send_instructions"
+        ) as show, patch("builtins.print"):
+            command_status()
+
+        ensure.assert_called_once_with("repo", background)
+        show.assert_called_once_with(context)
+
     def test_process_environment_overrides_dotenv(self) -> None:
         with patch.dict(os.environ, {"CHATCODE_QWEN_MODEL": "session-model"}):
             self.assertEqual(get_setting("CHATCODE_QWEN_MODEL"), "session-model")
