@@ -1,6 +1,6 @@
 # Poor Man's Codex
 
-A local, patch-based coding workflow that lets ChatGPT work against the **current state of a local Git repository** without giving ChatGPT direct filesystem access and without using the OpenAI API.
+A local, patch-based coding workflow for safely validating and applying ChatGPT-generated diffs against the **current state of a local Git repository**, without giving ChatGPT direct filesystem access and without using the OpenAI API.
 
 The installed CLI command is:
 
@@ -8,46 +8,49 @@ The installed CLI command is:
 chatcode
 ```
 
-ChatCode builds a task-specific context from your repository, uses a local Qwen model through Ollama to improve retrieval when AI indexing is enabled, packages the exact source ChatGPT needs into `UPLOAD_TO_CHATGPT.md`, and then safely consumes the unified diff ChatGPT returns.
+ChatCode can build a task-specific context from your repository, uses a local Qwen model through Ollama to improve retrieval when AI indexing is enabled, packages the exact source ChatGPT needs into `UPLOAD_TO_CHATGPT.md`, and then safely consumes the unified diff ChatGPT returns.
+
+You can also connect ChatGPT to GitHub, ask it to inspect an authorized repository, and ask for a unified diff. This is often the simplest workflow when the relevant code is already pushed. ChatCode then remains the local safety layer: it reviews, validates, applies, tests, tracks, and can undo that diff against your current working tree.
 
 The core workflow is:
 
 ```text
 local repository
-      │
-      ▼
-chatcode context "task"
-      │
-      ├── static project index
-      ├── optional local Qwen semantic index
-      ├── task/retrieval analysis
-      ├── dependency + implementation expansion
-      └── source/context contract
-      │
-      ▼
-UPLOAD_TO_CHATGPT.md
-      │
-      ▼
-ChatGPT
-      │
-      ▼
-unified diff
-      │
-      ▼
-patches/incoming.diff
-      │
-      ▼
-chatcode apply
-      │
-      ├── patch validation
-      ├── review/confirmation
-      ├── pre-patch test baseline
-      ├── relevant tests
-      ├── full test suite
-      ├── regression comparison
-      ├── history
-      ├── repair context on failure
-      └── follow-up context if the user says the fix did not solve the problem
+      ├── pushed code ──────────► GitHub ────────────────┐
+      │                                                   │
+      └── local-only or uncommitted code                  │
+                  │                                       │
+                  ▼                                       │
+          chatcode context "task"                         │
+                  │                                       │
+                  ├── static project index                │
+                  ├── optional local Qwen semantic index  │
+                  ├── task/retrieval analysis             │
+                  ├── dependency + implementation expansion
+                  └── source/context contract             │
+                  │                                       │
+                  ▼                                       │
+          UPLOAD_TO_CHATGPT.md ───────────────────────────┤
+                                                          ▼
+                                                       ChatGPT
+                                                          │
+                                                          ▼
+                                                     unified diff
+                                                          │
+                                                          ▼
+                                               patches/incoming.diff
+                                                          │
+                                                          ▼
+                                                     chatcode apply
+                                                          ├── patch validation
+                                                          ├── review/confirmation
+                                                          ├── pre-patch test baseline
+                                                          ├── relevant tests
+                                                          ├── full test suite
+                                                          ├── regression comparison
+                                                          ├── history
+                                                          ├── repair context on failure
+                                                          └── follow-up context if the user says the fix did not solve the problem
 ```
 
 ## What ChatCode is trying to solve
@@ -81,7 +84,7 @@ Recommended:
 - Qwen 2.5 Coder
 - VS Code with the `code` command in `PATH` for side-by-side review
 
-ChatCode can run in `static` mode without Ollama, but `ai` mode is the intended full retrieval workflow.
+ChatCode can run in `static` mode without Ollama. `ai` mode is the full local-retrieval workflow; it is most useful when you need ChatGPT to work from a generated context upload rather than directly from GitHub.
 
 No OpenAI API key is required.
 
@@ -172,7 +175,15 @@ Example:
 cd C:\repos\my-project
 ```
 
-### 5. Create context for a task
+### 5. Choose how ChatGPT receives repository context
+
+#### Option A: Let ChatGPT inspect the GitHub repository
+
+If you have connected GitHub to ChatGPT and the relevant code is pushed, ask ChatGPT to inspect the repository and return one unified diff for your task. Save that diff as described in step 7, then use `chatcode apply`.
+
+This is a good default when ChatGPT can access the repository and you do not need it to see local-only or uncommitted changes.
+
+#### Option B: Create a local context upload
 
 ```bash
 chatcode context "Add a new API endpoint for updating user profile settings."
@@ -188,7 +199,7 @@ inside that repository's ChatCode workspace.
 
 The workspace directory is printed and opened automatically.
 
-### 6. Upload the generated file to ChatGPT
+### 6. For Option B, upload the generated file to ChatGPT
 
 Upload `UPLOAD_TO_CHATGPT.md` as-is.
 
@@ -203,7 +214,7 @@ The file already contains:
 
 For code changes, ChatGPT should return one unified diff.
 
-### 7. Save the returned diff
+### 7. Save ChatGPT's returned diff
 
 Put the returned patch into:
 
@@ -742,9 +753,9 @@ Current safeguards include:
 
 Secret detection is **best effort**, not a proof that an export contains no sensitive information.
 
-Review `UPLOAD_TO_CHATGPT.md` before uploading it when working with sensitive repositories.
+Review `UPLOAD_TO_CHATGPT.md` before uploading it when working with sensitive repositories. When using the GitHub workflow, grant ChatGPT access only to the repositories it needs.
 
-Likewise, patch applicability and green tests establish technical correctness better than authority. The current implementation does not yet enforce a strict capability policy that limits every patch hunk to only the exact paths/source regions exported to the model.
+Likewise, patch applicability and green tests establish technical correctness better than authority. The current implementation does not yet enforce a strict capability policy that limits every patch hunk to only the exact paths/source regions made available to the model.
 
 Treat repository content and model output as untrusted inputs and review important changes before keeping them.
 
@@ -840,7 +851,8 @@ Qwen:
 semantic hints and compact retrieval metadata
 
 ChatGPT:
-reason about supplied code and produce a unified diff
+reason about code available through GitHub or a supplied context upload,
+then produce a unified diff
 
 ChatCode:
 index, retrieve, materialize current source, validate, apply, test,
