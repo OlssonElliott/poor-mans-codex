@@ -10,7 +10,7 @@ chatcode
 
 ChatCode can build a task-specific context from your repository, uses a local Qwen model through Ollama to improve retrieval when AI indexing is enabled, packages the exact source ChatGPT needs into `UPLOAD_TO_CHATGPT.md`, and then safely consumes the unified diff ChatGPT returns.
 
-You can also connect ChatGPT to GitHub, ask it to inspect an authorized repository, and ask for a unified diff. This is often the simplest workflow when the relevant code is already pushed. ChatCode then remains the local safety layer: it reviews, validates, applies, tests, tracks, and can undo that diff against your current working tree.
+You can also connect ChatGPT to GitHub, ask it to inspect an authorized repository, and ask for a unified diff. This is often the simplest workflow when the relevant code is already pushed. ChatCode then remains the local safety layer: it reviews, validates, applies, tests, tracks, and can undo that diff against your current working tree. Commit and push an accepted change before asking ChatGPT for the next GitHub-based task, so it can see the new repository state.
 
 The core workflow is:
 
@@ -182,6 +182,16 @@ cd C:\repos\my-project
 If you have connected GitHub to ChatGPT and the relevant code is pushed, ask ChatGPT to inspect the repository and return one unified diff for your task. Save that diff as described in step 7, then use `chatcode apply`.
 
 This is a good default when ChatGPT can access the repository and you do not need it to see local-only or uncommitted changes.
+
+After `chatcode apply` succeeds and you have reviewed the result, commit and push the accepted change before starting the next GitHub-based task:
+
+```bash
+git add <changed-files>
+git commit -m "Describe the change"
+git push
+```
+
+ChatGPT's GitHub access sees the pushed repository, not your local working tree. If you need another ChatGPT round before committing and pushing, use `chatcode followup` or create a new `chatcode context` instead; those local context files include the current uncommitted source.
 
 #### Option B: Create a local context upload
 
