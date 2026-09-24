@@ -22,6 +22,15 @@ from chatcode.indexing.generic_structure import (
     generic_symbol_span,
 )
 from chatcode.indexing.project_graph import load_map
+from chatcode.retrieval.task_semantics import (
+    GENERIC_REQUIREMENT_TERMS,
+    REQUIREMENT_ROLE_SYMBOL_TERMS,
+    REQUIREMENT_ROLE_TERMS,
+    surface_roles,
+    surface_tokens,
+    task_is_complex,
+    task_surfaces,
+)
 
 
 MAX_CANDIDATES = 36
@@ -32,7 +41,6 @@ MAX_CLOSURE_FILES = 8
 MAX_ROOTED_CLOSURE_DEPTH = 3
 MAX_ROOTED_CLOSURE_FILES = 12
 MAX_ROOTED_CLOSURE_SYMBOLS = 24
-MAX_TASK_SURFACES = 12
 # A surface can have a small set of equally strong concrete definitions (for
 # example renderer, view, presenter, and autocomplete). Keep this bounded,
 # while allowing each independently promoted root to reach materialization.
@@ -40,60 +48,6 @@ MAX_SURFACE_ROOTS = 4
 MAX_TRANSPORT_ROOTS = 2
 MAX_SURFACE_SUPPORT_SYMBOLS = 4
 GENERIC_PATH_PARTS = {"utils", "util", "common", "config", "settings", "constants", "helpers"}
-
-REQUIREMENT_ROLE_TERMS = {
-    "persistence": frozenset({
-        "database", "db", "persist", "persistence", "schema", "storage", "store",
-        "save", "saved", "load", "loaded", "table", "repository",
-        "databas", "lagra", "lagring", "spara", "sparas", "ladda", "tabell",
-    }),
-    "transport": frozenset({
-        "api", "endpoint", "route", "request", "response", "http", "handler",
-        "controller", "server",
-    }),
-    "ui": frozenset({
-        "ui", "frontend", "dashboard", "dialog", "modal", "editor", "button",
-        "form", "component", "render", "display", "view", "panel",
-        "gränssnitt", "knapp", "visa",
-    }),
-    "tests": frozenset({
-        "test", "tests", "testing", "spec", "regression",
-        "tester", "testa", "regressionstest",
-    }),
-    "domain": frozenset({
-        "model", "entity", "service", "state", "flow", "rule", "behavior",
-        "behaviour", "type", "instance", "template",
-        "modell", "entitet", "tjänst", "flöde", "regel", "instans", "mall",
-    }),
-}
-
-REQUIREMENT_ROLE_SYMBOL_TERMS = {
-    "persistence": frozenset({
-        "init", "initialize", "schema", "migrate", "migration", "create", "insert",
-        "save", "store", "persist", "load", "read", "get", "list", "update",
-        "delete", "remove",
-    }),
-    "transport": frozenset({
-        "api", "route", "handler", "request", "response", "get", "post", "put",
-        "patch", "delete", "options", "serialize", "deserialize",
-    }),
-    "ui": frozenset({
-        "dialog", "modal", "editor", "form", "component", "render", "view",
-        "panel", "button", "submit", "handle", "open", "close",
-    }),
-    "tests": frozenset({"test", "spec", "fixture", "assert"}),
-    "domain": frozenset({
-        "model", "entity", "service", "state", "flow", "rule", "create", "update",
-        "delete", "place", "move", "transfer",
-    }),
-}
-
-GENERIC_REQUIREMENT_TERMS = frozenset({
-    "add", "allow", "change", "create", "edit", "make", "new", "replace",
-    "support", "update", "use", "when", "with", "without", "should", "same",
-    "lägg", "ändra", "skapa", "stöd", "använd", "ska", "samma",
-})
-
 
 @dataclass
 class RetrievalResult:
@@ -108,46 +62,6 @@ class RetrievalResult:
 class CompletenessResult:
     files: list[Path] = field(default_factory=list)
     reasons: dict[Path, str] = field(default_factory=dict)
-
-
-def _surface_tokens(text: str) -> set[str]:
-    tokens = {
-        token.casefold()
-        for token in re.findall(
-            r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]+",
-            text.replace("_", " "),
-        )
-        if len(token) >= 3
-    }
-    expanded = set(tokens)
-    for token in tokens:
-        if token.endswith("ies") and len(token) > 5:
-            expanded.add(token[:-3] + "y")
-        if token.endswith("ing") and len(token) > 5:
-            expanded.add(token[:-3])
-        if token.endswith("ed") and len(token) > 4:
-            expanded.add(token[:-2])
-        if token.endswith("s") and len(token) > 4:
-            expanded.add(token[:-1])
-    return expanded
-
-
-def _surface_roles(tokens: set[str]) -> set[str]:
-    return {
-        role
-        for role, trigger_terms in REQUIREMENT_ROLE_TERMS.items()
-        if tokens & trigger_terms
-    }
-
-
-def _task_is_complex(task: str, surfaces: list[str] | None = None) -> bool:
-    surfaces = surfaces if surfaces is not None else _task_surfaces(task)
-    roles = {
-        role
-        for surface in surfaces
-        for role in _surface_roles(_surface_tokens(surface))
-    }
-    return len(surfaces) >= 4 or len(task) >= 480 or len(roles) >= 3
 
 
 def _related_role_symbols(
@@ -178,7 +92,7 @@ def _related_role_symbols(
         if definition == primary:
             continue
         split_name = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", name)
-        symbol_tokens = _surface_tokens(split_name)
+        symbol_tokens = surface_tokens(split_name)
         score = 100 * len(domain_tokens & symbol_tokens)
         score += 45 * len(role_symbol_terms & symbol_tokens)
         if name.casefold() in important:
@@ -195,29 +109,6 @@ def _related_role_symbols(
     return list(
         dict.fromkeys(item[2] for item in ranked)
     )[:MAX_SURFACE_SUPPORT_SYMBOLS]
-
-
-def _task_surfaces(task: str) -> list[str]:
-    """Split broad maintenance tasks into bounded explicit requirements."""
-    normalized = re.sub(
-        r"(?m)^\s*(?:[-*•]|\d+[.)])\s+",
-        "",
-        task,
-    )
-    action_words = (
-        r"add|allow|create|delete|display|edit|load|make|persist|remove|render|"
-        r"replace|save|show|support|update|use|when|lägg|skapa|ta|visa|ändra|"
-        r"spara|ladda|stöd"
-    )
-    clauses = re.split(
-        rf"\s*(?:;|\n+|[.!?]+\s+|,\s+(?=(?:{action_words})\b)|"
-        rf"\b(?:and|och)\s+(?=(?:{action_words})\b))\s*",
-        normalized,
-        flags=re.IGNORECASE,
-    )
-    return list(
-        dict.fromkeys(clause.strip() for clause in clauses if clause.strip())
-    )[:MAX_TASK_SURFACES]
 
 
 def _python_definition_literal_terms(path: Path) -> dict[str, dict[str, int]]:
@@ -307,8 +198,8 @@ def _definition_literal_terms(path: Path) -> dict[str, dict[str, int]]:
 
 def resolve_task_surface_roots(repo: Path, task: str) -> RetrievalResult:
     """Find concrete indexed roots for each explicit requirement in the task."""
-    surfaces = _task_surfaces(task)
-    complex_task = _task_is_complex(task, surfaces)
+    surfaces = task_surfaces(task)
+    complex_task = task_is_complex(task, surfaces)
     # A single surface remains too broad for name-only promotion. Concrete
     # runtime text owned by a relevant definition is narrow enough to use.
     runtime_evidence_only = len(surfaces) < 2
@@ -320,8 +211,8 @@ def resolve_task_surface_roots(repo: Path, task: str) -> RetrievalResult:
     literal_terms_by_file: dict[str, dict[str, dict[str, int]]] = {}
     presentation_terms = {"display", "displayed", "show", "render", "rendering", "view", "embed", "ui"}
     for surface in surfaces:
-        tokens = _surface_tokens(surface)
-        roles = _surface_roles(tokens) if complex_task else set()
+        tokens = surface_tokens(surface)
+        roles = surface_roles(tokens) if complex_task else set()
         role_symbol_terms = {
             term
             for role in roles
@@ -341,8 +232,8 @@ def resolve_task_surface_roots(repo: Path, task: str) -> RetrievalResult:
                 for value in entry.get("important_symbols", [])
                 if isinstance(value, str)
             }
-            file_tokens = _surface_tokens(relative)
-            semantic_tokens = _surface_tokens(
+            file_tokens = surface_tokens(relative)
+            semantic_tokens = surface_tokens(
                 " ".join([
                     str(entry.get("summary", "")),
                     *[
@@ -361,7 +252,7 @@ def resolve_task_surface_roots(repo: Path, task: str) -> RetrievalResult:
                     continue
                 name = str(symbol["name"])
                 symbol_text = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", name)
-                symbol_tokens = _surface_tokens(symbol_text)
+                symbol_tokens = surface_tokens(symbol_text)
                 overlap = tokens & (symbol_tokens | file_tokens | semantic_tokens)
                 role_symbol_overlap = role_symbol_terms & symbol_tokens
                 definition_name = str(symbol.get("definition_name") or name)
@@ -634,8 +525,8 @@ class QwenTaskHintAnalyzer:
         candidates.sort(key=lambda item: (-item[0], item[1].lower(), item[2]["name"].lower()))
         # Broad tasks need more vocabulary coverage, but still use one bounded
         # model call and only real indexed IDs.
-        surfaces = _task_surfaces(task)
-        complex_task = _task_is_complex(task, surfaces)
+        surfaces = task_surfaces(task)
+        complex_task = task_is_complex(task, surfaces)
         entry_limit = 240 if complex_task else 180
         hint_limit = MAX_SEMANTIC_HINTS if complex_task else 12
         entries = [entry for _, _, entry in candidates[:entry_limit]]
@@ -1353,7 +1244,7 @@ def expand_candidates(repo: Path, task: str, seeds: list[Path], limit: int = 12)
     ordered = sorted(scores, key=lambda value: (-scores[value], value.lower()))
     selected_names = ordered[:max(limit, len(seed_names))]
     paths = [repo / name for name in selected_names]
-    candidate_limit = MAX_CANDIDATES if _task_is_complex(task) else 24
+    candidate_limit = MAX_CANDIDATES if task_is_complex(task) else 24
     return RetrievalResult(
         paths,
         {repo / name: reasons[name] for name in selected_names},
@@ -1378,8 +1269,8 @@ class QwenCompletenessChecker:
     def check(self, repo: Path, task: str, result: RetrievalResult) -> CompletenessResult:
         if not self.is_available():
             return CompletenessResult()
-        surfaces = _task_surfaces(task)
-        complex_task = _task_is_complex(task, surfaces)
+        surfaces = task_surfaces(task)
+        complex_task = task_is_complex(task, surfaces)
         symbol_limit = 14 if complex_task else 8
         dependency_limit = 10 if complex_task else 6
         resolved_limit = MAX_COMPLETENESS_RESOLVED if complex_task else 3

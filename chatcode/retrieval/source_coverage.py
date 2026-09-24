@@ -9,107 +9,31 @@ files outside the already selected set, and performs no model calls.
 """
 from __future__ import annotations
 
-import ast
-import re
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from chatcode.indexing.generic_structure import (
-    GENERIC_SYMBOL,
-    GENERIC_SYMBOL_SUFFIXES,
-    generic_symbol_span,
-)
 from chatcode.indexing.project_graph import load_map
-from chatcode.retrieval.hybrid_retriever import (
-    _surface_tokens,
-    _task_is_complex,
-    _task_surfaces,
+from chatcode.retrieval.evidence import (
+    GENERIC_SUFFIXES,
+    ROLE_TRIGGERS,
+    DefinitionEvidence,
+    definitions as extract_definitions,
+    domain_terms as extract_domain_terms,
+    file_corroboration,
+    kind_score as score_definition,
+    matching_terms as match_terms,
+    path_roles as infer_path_roles,
+    tokens as evidence_tokens,
+)
+from chatcode.retrieval.task_semantics import (
+    task_is_complex,
+    task_surfaces,
 )
 
 
 MAX_COVERAGE_FILES = 8
 MAX_COVERAGE_SYMBOLS = 28
 MAX_COVERAGE_SYMBOLS_PER_FILE = 6
-GENERIC_SUFFIXES = set(GENERIC_SYMBOL_SUFFIXES)
-
-ROLE_TRIGGERS = {
-    "persistence": frozenset({
-        "database", "db", "persist", "persistence", "schema", "storage",
-        "store", "save", "saved", "load", "loaded", "table", "migration",
-        "sqlite", "repository", "lagra", "lagring", "spara", "sparas",
-        "ladda", "tabell", "migrera",
-    }),
-    "transport": frozenset({
-        "api", "endpoint", "route", "request", "response", "http", "handler",
-        "controller", "server", "transport",
-    }),
-    "ui": frozenset({
-        "ui", "frontend", "dashboard", "dialog", "modal", "editor", "button",
-        "form", "component", "render", "display", "view", "panel", "library",
-        "gränssnitt", "knapp", "visa",
-    }),
-    "behavior": frozenset({
-        "behavior", "behaviour", "gameplay", "mechanic", "mechanics", "lock",
-        "lockpick", "door", "command", "validation", "validate", "interaction",
-        "beteende", "mekanik", "lås", "dörr", "validera",
-    }),
-    "tests": frozenset({
-        "test", "tests", "testing", "spec", "regression", "tester", "testa",
-        "regressionstest",
-    }),
-    "domain": frozenset({
-        "model", "entity", "state", "type", "instance", "template", "world",
-        "room", "inventory", "item", "container", "object", "connection",
-        "modell", "entitet", "tillstånd", "typ", "instans", "mall", "rum",
-    }),
-}
-
-PATH_ROLE_TERMS = {
-    "persistence": frozenset({"database", "db", "repository", "storage", "store", "persistence"}),
-    "transport": frozenset({"api", "route", "routes", "controller", "server", "transport"}),
-    "ui": frozenset({"dashboard", "frontend", "editor", "ui", "component", "components", "web"}),
-    "behavior": frozenset({"command", "commands", "mechanic", "mechanics", "interaction", "world"}),
-    "tests": frozenset({"test", "tests", "spec", "specs"}),
-    "domain": frozenset({"world", "model", "models", "service", "services", "entity", "entities", "inventory"}),
-}
-
-ROLE_SYMBOL_TERMS = {
-    "persistence": frozenset({
-        "init", "initialize", "schema", "migrate", "migration", "setup", "ensure",
-        "create", "insert", "save", "store", "persist", "load", "read", "get",
-        "list", "update", "delete", "remove", "execute",
-    }),
-    "transport": frozenset({
-        "handle", "dispatch", "route", "request", "response", "serialize",
-        "deserialize", "parse", "node", "data", "get", "post", "put", "patch",
-        "delete", "options",
-    }),
-    "ui": frozenset({
-        "editor", "modal", "dialog", "form", "panel", "inspector", "library",
-        "contents", "content", "add", "create", "render", "room", "item",
-        "container", "button", "submit", "open", "close",
-    }),
-    "behavior": frozenset({
-        "lock", "lockpick", "validate", "validation", "command", "action", "door",
-        "trap", "interaction", "can", "check",
-    }),
-    "tests": frozenset({"test", "spec", "fixture", "assert"}),
-    "domain": frozenset({
-        "entity", "kind", "model", "room", "world", "inventory", "holder", "item",
-        "container", "template", "connection", "lock", "state", "type", "instance",
-        "create", "update", "delete", "place", "move", "transfer",
-    }),
-}
-
-ACTION_TERMS = frozenset({
-    "add", "allow", "change", "create", "delete", "edit", "implement", "make",
-    "migrate", "new", "remove", "replace", "reuse", "save", "support", "update",
-    "use", "when", "with", "without", "should", "same", "existing", "current",
-    "inspect", "roughly", "similar", "general", "generic", "future", "later",
-    "lägg", "ändra", "skapa", "ta", "stöd", "använd", "ska", "samma", "befintlig",
-    "befintliga", "nuvarande", "återanvänd", "återanvända", "ungefär", "senare",
-})
-
 LIFECYCLE_TERMS = frozenset({
     "add", "create", "edit", "update", "delete", "remove", "save", "load", "migrate",
     "lägg", "skapa", "ändra", "spara", "ladda", "migrera",
@@ -120,38 +44,6 @@ REFERENCE_TERMS = frozenset({
     "befintlig", "befintliga", "nuvarande", "samma", "återanvänd", "ungefär",
 })
 
-COMMON_TERMS = frozenset({
-    "and", "are", "but", "can", "for", "from", "have", "into", "not", "that",
-    "the", "their", "them", "then", "this", "through", "with", "without", "your",
-    "att", "det", "den", "och", "för", "från", "har", "inte", "med", "ska", "som",
-    "till", "utan", "vara", "blir", "även", "samt",
-})
-
-SQL_MARKERS = (
-    "create table", "alter table", "pragma ", "sqlite_master", "create index",
-    "drop table", "foreign key",
-)
-
-
-@dataclass(frozen=True)
-class DefinitionEvidence:
-    path: Path
-    name: str
-    kind: str
-    text: str
-    line_count: int
-    owner: str | None = None
-    qualified_name: str | None = None
-    ambiguous: bool = False
-
-    @property
-    def materialization_name(self) -> str:
-        """Return a source locator that stays safe when method names collide."""
-        if self.ambiguous and self.qualified_name:
-            return self.qualified_name
-        return self.name
-
-
 @dataclass
 class SourceCoveragePlan:
     symbols: dict[Path, list[str]] = field(default_factory=dict)
@@ -161,341 +53,24 @@ class SourceCoveragePlan:
     diagnostics: list[str] = field(default_factory=list)
 
 
-def _raw_tokens(text: str) -> set[str]:
-    split = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", text.replace("_", " "))
-    return {
-        token.casefold()
-        for token in re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]+", split)
-        if len(token) >= 3
-    }
-
-
-def _tokens(text: str) -> set[str]:
-    return _surface_tokens(
-        re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", text.replace("_", " "))
-    )
-
-
-def _term_matches(term: str, token: str) -> bool:
-    if term == token:
-        return True
-    if min(len(term), len(token)) < 4:
-        return False
-    return token.startswith(term) or term.startswith(token)
-
-
-def _matching_terms(terms: set[str], tokens: set[str]) -> set[str]:
-    return {
-        term
-        for term in terms
-        if any(_term_matches(term, token) for token in tokens)
-    }
-
-
-def _text_matching_terms(terms: set[str], text: str) -> set[str]:
-    lowered = text.casefold()
-    return {
-        term
-        for term in terms
-        if term in lowered
-    }
-
-
-def _path_roles(path: Path, repo: Path) -> set[str]:
-    try:
-        relative = path.relative_to(repo).as_posix()
-    except ValueError:
-        relative = path.as_posix()
-    tokens = _tokens(relative)
-    roles = {
-        role
-        for role, role_terms in PATH_ROLE_TERMS.items()
-        if _matching_terms(set(role_terms), tokens)
-    }
-    suffix = path.suffix.casefold()
-    if suffix in {".tsx", ".jsx"}:
-        roles.add("ui")
-    if "transport" in roles and suffix == ".py":
-        explicit_ui_terms = {"frontend", "editor", "ui", "component", "components", "web"}
-        if not _matching_terms(explicit_ui_terms, tokens):
-            roles.discard("ui")
-    if (
-        path.name.casefold().startswith("test_")
-        or path.name.casefold().endswith(("_test.py", ".test.ts", ".spec.ts", ".test.js", ".spec.js"))
-    ):
-        roles.add("tests")
-    return roles
-
-
-def _definition_text(lines: list[str], node: ast.AST) -> tuple[str, int]:
-    start = getattr(node, "lineno", 1)
-    end = getattr(node, "end_lineno", start)
-    decorators = getattr(node, "decorator_list", [])
-    if decorators:
-        start = min(start, *(item.lineno for item in decorators))
-    return "".join(lines[start - 1:end]), max(1, end - start + 1)
-
-
-def _python_definitions(path: Path, source: str) -> list[DefinitionEvidence]:
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return []
-    lines = source.splitlines(keepends=True)
-    raw: list[DefinitionEvidence] = []
-    for node in tree.body:
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            continue
-        text, line_count = _definition_text(lines, node)
-        raw.append(DefinitionEvidence(
-            path,
-            node.name,
-            "class" if isinstance(node, ast.ClassDef) else "function",
-            text,
-            line_count,
-            qualified_name=node.name,
-        ))
-        if not isinstance(node, ast.ClassDef):
-            continue
-        for member in node.body:
-            if not isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                continue
-            member_text, member_lines = _definition_text(lines, member)
-            raw.append(DefinitionEvidence(
-                path,
-                member.name,
-                "class" if isinstance(member, ast.ClassDef) else "method",
-                member_text,
-                member_lines,
-                owner=node.name,
-                qualified_name=f"{node.name}.{member.name}",
-            ))
-    counts: dict[str, int] = {}
-    for definition in raw:
-        counts[definition.name] = counts.get(definition.name, 0) + 1
-    # Preserve ambiguous methods instead of deleting their evidence. Their
-    # qualified locator is used only when an unqualified name would be unsafe.
-    return [
-        replace(definition, ambiguous=counts[definition.name] > 1)
-        for definition in raw
-    ]
-
-
-def _generic_definitions(path: Path, source: str) -> list[DefinitionEvidence]:
-    lines = source.splitlines(keepends=True)
-    definitions: list[DefinitionEvidence] = []
-    for match in GENERIC_SYMBOL.finditer(source):
-        name = (
-            match.group("named")
-            or match.group("type_name")
-            or match.group("binding")
-        )
-        if not name:
-            continue
-        span = generic_symbol_span(source, name)
-        if span is None:
-            continue
-        kind = match.group("kind") or ("type" if match.group("type_name") else "function")
-        start, end = span
-        text = "".join(lines[start - 1:end])
-        definitions.append(
-            DefinitionEvidence(path, name, kind, text, max(1, end - start + 1))
-        )
-    return definitions
-
-
-def _definitions(path: Path, source: str) -> list[DefinitionEvidence]:
-    suffix = path.suffix.casefold()
-    if suffix == ".py":
-        return _python_definitions(path, source)
-    if suffix in GENERIC_SUFFIXES:
-        return _generic_definitions(path, source)
-    return []
-
-
 def _task_roles(task: str, files: list[Path], repo: Path, requirements: list[str]) -> set[str]:
-    tokens = _tokens(task)
+    tokens = evidence_tokens(task)
     roles = {
         role
         for role, triggers in ROLE_TRIGGERS.items()
-        if _matching_terms(set(triggers), tokens)
+        if match_terms(set(triggers), tokens)
     }
     roles.add("domain")
 
-    path_roles = {role for path in files for role in _path_roles(path, repo)}
+    path_roles = {role for path in files for role in infer_path_roles(path, repo)}
     lifecycle = bool(tokens & LIFECYCLE_TERMS)
     if lifecycle and "persistence" in path_roles:
         roles.add("persistence")
     if "ui" in roles and lifecycle and "transport" in path_roles:
         roles.add("transport")
-    if any(_tokens(requirement) & REFERENCE_TERMS for requirement in requirements):
+    if any(evidence_tokens(requirement) & REFERENCE_TERMS for requirement in requirements):
         roles.add("domain")
     return roles
-
-
-def _domain_terms(task: str) -> set[str]:
-    role_terms = {
-        term
-        for role in ("persistence", "transport", "ui", "tests")
-        for term in ROLE_TRIGGERS[role]
-    }
-    terms = _raw_tokens(task)
-    return {
-        term
-        for term in terms
-        if term not in ACTION_TERMS
-        and term not in COMMON_TERMS
-        and term not in role_terms
-        and len(term) >= 4
-    }
-
-
-def _file_corroboration(
-    path: Path,
-    repo: Path,
-    source: str,
-    definitions: list[DefinitionEvidence],
-    domain_terms: set[str],
-) -> set[str]:
-    try:
-        relative = path.relative_to(repo).as_posix()
-    except ValueError:
-        relative = path.as_posix()
-    names = " ".join(definition.name for definition in definitions)
-    evidence = f"{relative}\n{names}\n{source[:180_000]}"
-    return _text_matching_terms(domain_terms, evidence)
-
-
-def _kind_score(
-    kind: str,
-    definition: DefinitionEvidence,
-    file_roles: set[str],
-    path_tokens: set[str],
-    domain_terms: set[str],
-    existing: set[str],
-) -> int:
-    name_tokens = _tokens(definition.name)
-    body_lower = definition.text.casefold()
-    name_hits = _matching_terms(domain_terms, name_tokens)
-    body_hits = _text_matching_terms(domain_terms, body_lower)
-    path_hits = _matching_terms(domain_terms, path_tokens)
-
-    # Evidence kinds represent architectural roles, not generic lexical hits.
-    # Reject obviously wrong surfaces before scoring so names such as
-    # ChartContainer cannot satisfy a domain/persistence requirement merely
-    # because they contain one task noun.
-    if kind == "model":
-        if definition.kind not in {"class", "interface", "type", "enum"}:
-            return -1_000
-        core_model_terms = {
-            "entity", "kind", "room", "world", "inventory", "holder", "item",
-            "container", "state", "type", "model", "connection",
-        }
-        if not name_hits and not _matching_terms(core_model_terms, name_tokens):
-            return -1_000
-        if name_tokens & {"api", "commands", "command", "database", "service"}:
-            return -1_000
-    elif kind == "schema":
-        if "persistence" not in file_roles or definition.kind not in {"function", "method"}:
-            return -1_000
-        strong_schema_name = _matching_terms(
-            {"init", "initialize", "schema", "migrate", "migration", "setup"},
-            name_tokens,
-        )
-        if not strong_schema_name and not any(marker in body_lower for marker in SQL_MARKERS):
-            return -1_000
-    elif kind == "persistence_crud":
-        if "persistence" not in file_roles or definition.kind not in {"function", "method"}:
-            return -1_000
-        crud_name = _matching_terms(
-            {"create", "insert", "save", "store", "persist", "load", "read", "get",
-             "list", "update", "delete", "remove"},
-            name_tokens,
-        )
-        if not crud_name or not (name_hits or body_hits):
-            return -1_000
-    elif kind == "transport":
-        if "transport" not in file_roles or definition.kind not in {"function", "method"}:
-            return -1_000
-    elif kind == "ui":
-        if "ui" not in file_roles:
-            return -1_000
-    elif kind == "domain_flow":
-        if "domain" not in file_roles or definition.kind not in {"function", "method"}:
-            return -1_000
-        if not (name_hits or body_hits):
-            return -1_000
-    elif kind == "tests":
-        if "tests" not in file_roles or definition.kind not in {"function", "method"}:
-            return -1_000
-        if not (name_hits or body_hits):
-            return -1_000
-    elif kind == "behavior":
-        if definition.kind not in {"function", "method"}:
-            return -1_000
-        behavior_name = _matching_terms(set(ROLE_SYMBOL_TERMS["behavior"]), name_tokens)
-        if not behavior_name and not (
-            any(term in body_lower for term in ("lock", "door", "validate", "lockpick"))
-            and (name_hits or body_hits)
-        ):
-            return -1_000
-
-    score = 150 * len(name_hits) + 24 * min(5, len(body_hits)) + 35 * len(path_hits)
-    if definition.name in existing:
-        score += 90
-
-    if kind == "schema":
-        if any(marker in body_lower for marker in SQL_MARKERS):
-            score += 280
-        score += 180 * len(_matching_terms(
-            {"init", "initialize", "schema", "migrate", "migration", "setup"},
-            name_tokens,
-        ))
-    elif kind == "persistence_crud":
-        score += 55 * len(_matching_terms(set(ROLE_SYMBOL_TERMS["persistence"]), name_tokens))
-    elif kind == "transport":
-        score += 55 * len(_matching_terms(set(ROLE_SYMBOL_TERMS["transport"]), name_tokens))
-        if definition.name.casefold() in {"handle", "dispatch", "_node_data", "node_data"}:
-            score += 180
-    elif kind == "ui":
-        score += 45 * len(_matching_terms(set(ROLE_SYMBOL_TERMS["ui"]), name_tokens))
-        if not (name_hits or body_hits):
-            score -= 130
-    elif kind == "behavior":
-        score += 65 * len(_matching_terms(set(ROLE_SYMBOL_TERMS["behavior"]), name_tokens))
-    elif kind == "model":
-        score += 120
-        score += 45 * len(_matching_terms(set(ROLE_SYMBOL_TERMS["domain"]), name_tokens))
-    elif kind == "domain_flow":
-        score += 60
-        score += 35 * len(_matching_terms(
-            set(ROLE_SYMBOL_TERMS["domain"] | ROLE_SYMBOL_TERMS["persistence"]),
-            name_tokens,
-        ))
-    elif kind == "tests":
-        score += 45 * len(_matching_terms(set(ROLE_SYMBOL_TERMS["tests"]), name_tokens))
-
-    required_role = {
-        "schema": "persistence",
-        "persistence_crud": "persistence",
-        "transport": "transport",
-        "ui": "ui",
-        "model": "domain",
-        "domain_flow": "domain",
-        "tests": "tests",
-    }.get(kind)
-    if required_role is not None and required_role in file_roles:
-        score += 100
-
-    # Huge enclosing definitions can consume the whole context budget. Prefer
-    # precise methods and small models when the evidence is otherwise similar.
-    if definition.line_count > 500:
-        score -= 220
-    elif definition.line_count > 250:
-        score -= 90
-    if definition.kind == "class" and definition.line_count > 350 and not name_hits:
-        score -= 180
-    return score
 
 
 def _evidence_kinds(roles: set[str]) -> list[tuple[str, int]]:
@@ -525,12 +100,12 @@ def plan_source_coverage(
     That keeps project-wide discovery bounded and leaves path trust with the
     existing retriever while fixing under-materialization inside large files.
     """
-    requirements = _task_surfaces(task)
-    if not _task_is_complex(task, requirements):
+    requirements = task_surfaces(task)
+    if not task_is_complex(task, requirements):
         return SourceCoveragePlan(requirements=requirements)
 
     existing_targets = existing_targets or {}
-    domain_terms = _domain_terms(task)
+    domain_terms = extract_domain_terms(task)
     roles = _task_roles(task, files, repo, requirements)
     min_corroboration = 2 if len(domain_terms) >= 4 else 1
 
@@ -549,7 +124,7 @@ def plan_source_coverage(
             source = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        definitions = _definitions(path, source)
+        definitions = extract_definitions(path, source)
         if not definitions:
             continue
         try:
@@ -562,9 +137,9 @@ def plan_source_coverage(
             str(entry.get("summary", "")),
             *(str(tag) for tag in entry.get("tags", []) if isinstance(tag, str)),
         ])
-        path_tokens = _tokens(relative + " " + semantic)
-        file_roles = _path_roles(path, repo)
-        corroboration = _file_corroboration(
+        pathtokens = evidence_tokens(relative + " " + semantic)
+        file_roles = infer_path_roles(path, repo)
+        corroboration = file_corroboration(
             path, repo, source, definitions, domain_terms
         )
         has_existing = bool(existing_targets.get(path))
@@ -574,7 +149,7 @@ def plan_source_coverage(
             and not ("tests" in file_roles and "tests" in roles and corroboration)
         ):
             continue
-        evidence.append((path, source, path_tokens, file_roles, definitions))
+        evidence.append((path, source, pathtokens, file_roles, definitions))
 
     plan = SourceCoveragePlan(requirements=requirements)
     per_file: dict[Path, int] = {}
@@ -601,14 +176,14 @@ def plan_source_coverage(
 
     for kind, limit in _evidence_kinds(roles):
         ranked: list[tuple[int, DefinitionEvidence]] = []
-        for path, _source, path_tokens, file_roles, definitions in evidence:
+        for path, _source, pathtokens, file_roles, definitions in evidence:
             existing = set(existing_targets.get(path, []))
             for definition in definitions:
-                score = _kind_score(
+                score = score_definition(
                     kind,
                     definition,
                     file_roles,
-                    path_tokens,
+                    pathtokens,
                     domain_terms,
                     existing,
                 )

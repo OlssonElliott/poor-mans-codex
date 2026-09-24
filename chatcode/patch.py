@@ -1,88 +1,75 @@
 from __future__ import annotations
 
-import ast
-import hashlib
-import json
 import os
-import re
 import shutil
 import subprocess
 import sys
-import tempfile
-import time
-import uuid
-from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, replace
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 from .context_state import (
-    _collect_file_hashes,
     get_active_repair_targets,
     get_context_task,
     get_context_kind,
     get_stale_context_reason,
     save_context_state,
 )
-from .git_utils import GitError, get_branch, get_status, run_git
-from .history import (
-    HistoryError,
-    begin_history_entry,
-    discard_pending_entry,
-    finalize_history_entry,
-    get_history_patch_file,
-    get_latest_applied_entry,
-    move_entry_to_undone,
-    open_code_diff,
-)
+from .git_utils import run_git
+from .history import open_code_diff
 from .workspace import (
     atomic_write_text,
-    get_applied_history_dir,
     get_default_patch_file,
-    get_check_repair_context_file,
-    get_existing_failure_context_file,
-    get_followup_context_file,
-    get_followup_state_file,
     get_repair_context_file,
     get_repo_workspace,
-    get_test_results_dir,
-    get_verified_baseline_cache_file,
 )
 
-VERIFIED_BASELINE_CACHE_VERSION = 1
-VERIFIED_BASELINE_MAX_AGE_SECONDS = 30 * 60
-BACKGROUND_FULL_SUITE_STATUS = "background-full-suite.json"
-BACKGROUND_RUN_ARTIFACT = re.compile(
-    r"background-full-suite-[0-9a-f]{32}\.(?:json|md)\Z"
+from .patching.testing import baseline as _baseline
+from .patching.testing.baseline import RepositorySnapshot
+from .patching.errors import PatchAlreadyApplied, PatchError, PatchUndoError
+from .patching.models import (
+    ApplyResult,
+    PatchPreview,
+    TestValidation,
+    UndoResult,
 )
-from .unified_diff import (
-    DiffLine,
-    Hunk,
-    UnifiedDiffError,
-    canonicalize_unified_diff,
-    parse_unified_diff,
-    serialize_unified_diff,
+from .patching.testing import background_tests as _background
+from .patching.testing import background_service as _background_service
+from .patching.repair import repair_state as _repair_state
+from .patching.repair import background_repair as _background_repair
+from .patching.repair import existing_failure as _existing_failure
+from .patching.repair import followup_state as _followup_state
+from .patching.repair import followup as _followup
+from .patching.testing import validation as _validation
+from .patching import summary as _summary
+from .patching.apply import apply_service as _apply_service
+from .patching.apply import undo as _undo
+from .patching import service as _service
+from .patching import api as _patch_api
+from .patching import presentation as _presentation
+from .patching.repair import repair_refresh as _repair_refresh
+from .patching.repair import repair_service as _repair_service
+from .patching.apply.patch_validation import (
+    extract_patch_paths,
+    validate_patch_paths,
+    _required_hunk_context,
+    _old_hunk_lines,
+    _unique_sequence_start,
+    _expand_hunk_from_current_source,
+    _nonblank_sequence_spans,
+    _unique_blank_gap,
+    _rebuild_hunk_context,
+    _reanchor_hunk_from_current_source,
+    _hunks_are_ordered_and_disjoint,
+    _expand_thin_hunk_context,
+    _validate_hunk_context,
+    strip_markdown_fence,
+    normalize_patch_file,
+    patch_is_already_applied,
+    _patch_hunks,
+    _safe_candidate_paths,
+    _hunk_anchor,
+    _working_tree_section,
 )
-from .test_runner import TestResult
-
-
-class PatchError(RuntimeError):
-    def __init__(
-        self,
-        message: str,
-        failure_type: str | None = None,
-        repair_context: Path | None = None,
-    ) -> None:
-        super().__init__(message)
-        self.failure_type = failure_type
-        self.repair_context = repair_context
-
-
-class PatchAlreadyApplied(RuntimeError):
-    pass
-
-
-class PatchUndoError(RuntimeError):
-    pass
+from .patching.repair.check_repair import build_check_repair_context as _build_check_repair_context
 
 
 def _consume_cli_apply_flags() -> tuple[bool, bool]:
@@ -97,171 +84,58 @@ def _consume_cli_apply_flags() -> tuple[bool, bool]:
 
 _CLI_APPLY_INVOCATION, _CLI_APPLY_YES = _consume_cli_apply_flags()
 
+def build_check_repair_context(
+    repo: Path,
+    test_result,
+    selected_failures: frozenset[str],
+) -> Path:
+    # Compatibility seam for existing callers/tests that patch the façade.
+    from .context_builder import build_context_from_test_roots
 
-@dataclass(frozen=True)
-class ApplyResult:
-    paths: set[str]
-    history_entry: Path
-
-
-@dataclass(frozen=True)
-class PatchPreview:
-    paths: set[str]
-    patch_text: str
-
-
-@dataclass(frozen=True)
-class UndoResult:
-    paths: set[str]
-    history_entry: Path
-
-
-@dataclass(frozen=True)
-class TestValidation:
-    baseline: object | None
-    targeted: object | None
-    full: object | None
-    status: str
-    new_failures: frozenset[str] = frozenset()
-    existing_failures: frozenset[str] = frozenset()
-    fixed_failures: frozenset[str] = frozenset()
-    repair_targets: frozenset[str] = frozenset()
-    remaining_repair_failures: frozenset[str] = frozenset()
-
-
-@dataclass(frozen=True)
-class RepositorySnapshot:
-    """The full working state that a speculative baseline represents."""
-    branch: str
-    file_hashes: tuple[tuple[str, str], ...]
-    status: str
-    staged_diff_sha256: str
-
-
-def _capture_repository_snapshot(repo: Path) -> RepositorySnapshot:
-    staged = run_git("diff", "--cached", "--binary", "--no-ext-diff", cwd=repo)
-    return RepositorySnapshot(
-        branch=get_branch(repo),
-        file_hashes=tuple(sorted(_collect_file_hashes(repo).items())),
-        status=get_status(repo),
-        staged_diff_sha256=hashlib.sha256(staged.encode("utf-8")).hexdigest(),
+    return _build_check_repair_context(
+        repo,
+        test_result,
+        selected_failures,
+        build_context_from_test_roots_fn=build_context_from_test_roots,
     )
 
 
-def _test_config_identity(repo: Path) -> str | None:
-    try:
-        from .test_runner import detect_test_command
-        return detect_test_command(repo).display
-    except Exception:
-        return None
+
+_capture_repository_snapshot = _baseline.capture_repository_snapshot
 
 
-def _snapshot_payload(snapshot: RepositorySnapshot) -> dict:
-    return {
-        "branch": snapshot.branch, "file_hashes": [list(item) for item in snapshot.file_hashes],
-        "status": snapshot.status, "staged_diff_sha256": snapshot.staged_diff_sha256,
-    }
+_test_config_identity = _baseline.test_config_identity
+
+
+_snapshot_payload = _baseline.snapshot_payload
 
 
 def _load_verified_baseline(repo: Path, snapshot: RepositorySnapshot):
-    try:
-        payload = json.loads(get_verified_baseline_cache_file(repo).read_text(encoding="utf-8"))
-        if payload.get("version") != VERIFIED_BASELINE_CACHE_VERSION:
-            return None
-        if time.time() - float(payload["created_at"]) > VERIFIED_BASELINE_MAX_AGE_SECONDS:
-            return None
-        if payload.get("repository") != str(repo.resolve()):
-            return None
-        if payload.get("snapshot") != _snapshot_payload(snapshot):
-            return None
-        if payload.get("test_config") != _test_config_identity(repo):
-            return None
-        report = Path(payload["report"])
-        if not report.is_file():
-            return None
-        result = payload["result"]
-        return TestResult(
-            str(result["command"]), int(result["returncode"]), float(result["duration_seconds"]),
-            report, frozenset(result["failed_tests"]),
-        )
-    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
-        return None
+    return _baseline.load_verified_baseline(
+        repo,
+        snapshot,
+        test_config_identity_fn=_test_config_identity,
+    )
 
 
 def save_verified_baseline(repo: Path, snapshot: RepositorySnapshot, result) -> None:
-    """Persist only a completed full-suite result for this exact state."""
-    if _test_config_identity(repo) is None:
-        return
-    report = get_repo_workspace(repo) / "verified-baseline.md"
-    try:
-        shutil.copyfile(result.output_file, report)
-    except OSError:
-        return
-    payload = {
-        "version": VERIFIED_BASELINE_CACHE_VERSION,
-        "created_at": time.time(), "repository": str(repo.resolve()),
-        "snapshot": _snapshot_payload(snapshot), "test_config": _test_config_identity(repo),
-        "report": str(report),
-        "result": {"command": result.command, "returncode": result.returncode,
-                   "duration_seconds": result.duration_seconds,
-                   "failed_tests": sorted(result.failed_tests)},
-    }
-    atomic_write_text(get_verified_baseline_cache_file(repo), json.dumps(payload, indent=2) + "\n")
-
-
-def _background_full_suite_status_file(repo: Path) -> Path:
-    return get_repo_workspace(repo) / BACKGROUND_FULL_SUITE_STATUS
-
-
-def _background_full_suite_run_file(repo: Path, run_id: str) -> Path:
-    return get_repo_workspace(repo) / f"background-full-suite-{run_id}.json"
-
-
-def _background_full_suite_report_file(repo: Path, run_id: str) -> Path:
-    return get_test_results_dir(repo) / f"background-full-suite-{run_id}.md"
-
-
-def _cleanup_background_full_suite_artifacts(
-    repo: Path,
-    *,
-    keep_run_id: str,
-) -> None:
-    """Remove obsolete run-owned artifacts without touching other files."""
-    locations = (
-        get_repo_workspace(repo),
-        get_test_results_dir(repo),
+    return _baseline.save_verified_baseline(
+        repo,
+        snapshot,
+        result,
+        test_config_identity_fn=_test_config_identity,
     )
-    keep_names = {
-        f"background-full-suite-{keep_run_id}.json",
-        f"background-full-suite-{keep_run_id}.md",
-    }
-    for location in locations:
-        try:
-            resolved_location = location.resolve()
-            candidates = list(location.iterdir())
-        except OSError:
-            continue
-        for candidate in candidates:
-            if (
-                candidate.name in keep_names
-                or not BACKGROUND_RUN_ARTIFACT.fullmatch(candidate.name)
-            ):
-                continue
-            try:
-                resolved = candidate.resolve()
-                if resolved.parent != resolved_location or not candidate.is_file():
-                    continue
-                candidate.unlink()
-            except OSError:
-                continue
 
-    # One legacy shared report may remain from versions before per-run reports.
-    try:
-        (get_test_results_dir(repo) / "background-full-suite.md").unlink(
-            missing_ok=True
-        )
-    except OSError:
-        pass
+_background_full_suite_status_file = _background.status_file
+
+
+_background_full_suite_run_file = _background.run_file
+
+
+_background_full_suite_report_file = _background.report_file
+
+
+_cleanup_background_full_suite_artifacts = _background.cleanup_artifacts
 
 
 def _write_background_full_suite_status(
@@ -270,40 +144,25 @@ def _write_background_full_suite_status(
     *,
     run_file: bool = False,
 ) -> None:
-    destination = (
-        _background_full_suite_run_file(repo, str(payload["run_id"]))
-        if run_file
-        else _background_full_suite_status_file(repo)
-    )
-    atomic_write_text(
-        destination,
-        json.dumps(payload, indent=2) + "\n",
+    return _background.write_status(
+        repo,
+        payload,
+        run_file_status=run_file,
     )
 
 
-def get_background_full_suite_status(repo: Path) -> dict | None:
-    """Return the current run's status without accepting an older worker."""
-    try:
-        pointer = json.loads(
-            _background_full_suite_status_file(repo).read_text(encoding="utf-8")
-        )
-        run_id = str(pointer["run_id"])
-        run_path = _background_full_suite_run_file(repo, run_id)
-        if run_path.is_file():
-            status = json.loads(run_path.read_text(encoding="utf-8"))
-            if status.get("run_id") == run_id:
-                return status
-        return pointer
-    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
-        return None
+get_background_full_suite_status = _background.get_status
+_snapshot_from_payload = _background.snapshot_from_payload
 
 
-def _snapshot_from_payload(payload: dict) -> RepositorySnapshot:
-    return RepositorySnapshot(
-        branch=str(payload["branch"]),
-        file_hashes=tuple((str(path), str(digest)) for path, digest in payload["file_hashes"]),
-        status=str(payload["status"]),
-        staged_diff_sha256=str(payload["staged_diff_sha256"]),
+def _background_hooks() -> _background_service.BackgroundHooks:
+    return _background_service.BackgroundHooks(
+        capture_snapshot_fn=_capture_repository_snapshot,
+        save_baseline_fn=save_verified_baseline,
+        get_status_fn=get_background_full_suite_status,
+        cleanup_fn=_cleanup_background_full_suite_artifacts,
+        snapshot_payload_fn=_snapshot_payload,
+        popen_fn=subprocess.Popen,
     )
 
 
@@ -313,82 +172,24 @@ def _complete_background_full_suite(
     run_id: str,
     application_payload: dict | None = None,
 ) -> None:
-    """Worker entry point for the detached post-apply full test suite."""
-    repo = Path(repo_name)
-    snapshot = _snapshot_from_payload(snapshot_payload)
-    report = _background_full_suite_report_file(repo, run_id)
-    is_current = False
-    try:
-        from .test_runner import run_project_tests
-
-        result = run_project_tests(repo, output_file=report)
-        current_snapshot = _capture_repository_snapshot(repo)
-        current_status = get_background_full_suite_status(repo)
-        is_current = (
-            current_status is not None
-            and current_status.get("run_id") == run_id
-        )
-        if is_current and current_snapshot == snapshot:
-            save_verified_baseline(repo, snapshot, result)
-        status = {
-            "run_id": run_id,
-            "state": "completed",
-            "snapshot": snapshot_payload,
-            "returncode": result.returncode,
-            "report": str(result.output_file),
-            "command": result.command,
-            "duration_seconds": result.duration_seconds,
-            "failed_tests": sorted(result.failed_tests),
-            "completed_at": time.time(),
-        }
-    except Exception as exc:
-        status = {
-            "run_id": run_id,
-            "state": "error",
-            "snapshot": snapshot_payload,
-            "error": str(exc),
-            "completed_at": time.time(),
-        }
-    if application_payload is not None:
-        status["application"] = application_payload
-    _write_background_full_suite_status(repo, status, run_file=True)
-    if is_current:
-        _cleanup_background_full_suite_artifacts(repo, keep_run_id=run_id)
+    return _background_service.complete_full_suite(
+        _background_hooks(),
+        repo_name,
+        snapshot_payload,
+        run_id,
+        application_payload,
+    )
 
 
 def _complete_background_full_suite_from_status(
     repo_name: str,
     run_id: str,
 ) -> None:
-    """Load the large snapshot from disk so Windows argv stays small."""
-    repo = Path(repo_name)
-    try:
-        payload = json.loads(
-            _background_full_suite_run_file(repo, run_id).read_text(encoding="utf-8")
-        )
-        if payload.get("run_id") != run_id or payload.get("state") != "running":
-            return
-        snapshot_payload = payload["snapshot"]
-        if not isinstance(snapshot_payload, dict):
-            raise TypeError("background snapshot is not an object")
-    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
-        _write_background_full_suite_status(repo, {
-            "run_id": run_id,
-            "state": "error",
-            "error": f"Could not load background test state: {exc}",
-            "completed_at": time.time(),
-        }, run_file=True)
-        return
-    application_payload = payload.get("application")
-    if isinstance(application_payload, dict):
-        _complete_background_full_suite(
-            repo_name,
-            snapshot_payload,
-            run_id,
-            application_payload,
-        )
-    else:
-        _complete_background_full_suite(repo_name, snapshot_payload, run_id)
+    return _background_service.complete_full_suite_from_status(
+        repo_name,
+        run_id,
+        complete_fn=_complete_background_full_suite,
+    )
 
 
 def _start_background_full_suite(
@@ -396,91 +197,29 @@ def _start_background_full_suite(
     snapshot: RepositorySnapshot,
     application: ApplyResult | None = None,
 ) -> None:
-    """Launch a full suite that can outlive the current ``chatcode apply``."""
-    run_id = uuid.uuid4().hex
-    snapshot_payload = _snapshot_payload(snapshot)
-    _cleanup_background_full_suite_artifacts(repo, keep_run_id=run_id)
-    initial_status = {
-        "run_id": run_id,
-        "state": "running",
-        "snapshot": snapshot_payload,
-        "started_at": time.time(),
-    }
-    if application is not None:
-        initial_status["application"] = {
-            "history_entry": application.history_entry.name,
-            "paths": sorted(application.paths),
-        }
-    _write_background_full_suite_status(repo, initial_status, run_file=True)
-    _write_background_full_suite_status(repo, initial_status)
-    worker = (
-        "import sys; from chatcode.patch import _complete_background_full_suite_from_status; "
-        "_complete_background_full_suite_from_status(sys.argv[1], sys.argv[2])"
+    return _background_service.start_full_suite(
+        _background_hooks(),
+        repo,
+        snapshot,
+        application,
     )
-    creationflags = 0
-    if os.name == "nt":
-        creationflags = (
-            subprocess.CREATE_NO_WINDOW
-            | subprocess.CREATE_NEW_PROCESS_GROUP
-        )
-    try:
-        subprocess.Popen(
-            [sys.executable, "-c", worker, str(repo), run_id],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            close_fds=True,
-            creationflags=creationflags,
-        )
-    except OSError:
-        _background_full_suite_status_file(repo).unlink(missing_ok=True)
-        _background_full_suite_run_file(repo, run_id).unlink(missing_ok=True)
-        raise
 
 
-_ANSI = {
-    "green": "\x1b[32m", "red": "\x1b[31m", "yellow": "\x1b[33m",
-    "cyan": "\x1b[36m",
-}
-
-REPAIR_COMPANION_PROMPT = (
-    "Use the attached PATCH_REPAIR_CONTEXT.md as repository context and the "
-    "current source of truth. The listed repair targets are the sole success "
-    "criterion: each of those tests must pass after the patch. Trace the failing "
-    "assertion through the supplied current implementation and do not repeat the "
-    "unsuccessful attempted patch. Do not change unrelated behavior from the "
-    "original task. Investigate and repair the classified failures "
-    "without weakening tests or reverting unrelated working-tree changes. "
-    "Return exactly one complete unified diff with at least three unchanged "
-    "context lines around each hunk, and no explanation outside the diff."
-)
+REPAIR_COMPANION_PROMPT = _presentation.REPAIR_COMPANION_PROMPT
+EXISTING_FAILURE_COMPANION_PROMPT = _presentation.EXISTING_FAILURE_COMPANION_PROMPT
+FOLLOWUP_COMPANION_PROMPT = _presentation.FOLLOWUP_COMPANION_PROMPT
 
 
-def _supports_color() -> bool:
-    return "NO_COLOR" not in os.environ and sys.stdout.isatty()
+_supports_color = _presentation.supports_color
 
 
-def _status(text: str, color: str | None = None) -> str:
-    if color and _supports_color():
-        return f"{_ANSI[color]}{text}\x1b[0m"
-    return text
+_status = _presentation.status
 
 
-def show_chatgpt_upload_artifact(context: Path) -> None:
-    """Make a generated ChatGPT attachment unambiguous in terminal output."""
-    print(_status("[UPLOAD THIS FILE]", "cyan"))
-    print(_status(str(context), "cyan"))
-    # Import lazily to avoid the cli -> patch module cycle at import time.
-    from .cli import open_folder
-    open_folder(context.resolve().parent)
+show_chatgpt_upload_artifact = _presentation.show_chatgpt_upload_artifact
 
 
-def show_repair_send_instructions(repair_context: Path) -> None:
-    print(f"Repair context ready to send to ChatGPT: {repair_context}")
-    show_chatgpt_upload_artifact(repair_context)
-    print("Attach that file and send this message with it:")
-    print(REPAIR_COMPANION_PROMPT)
-
+show_repair_send_instructions = _presentation.show_repair_send_instructions
 
 def _classify_test_validation(
     baseline,
@@ -491,948 +230,34 @@ def _classify_test_validation(
     full_suite_pending: bool = False,
     infrastructure_error: bool = False,
 ) -> TestValidation:
-    """Classify post-patch failures without claiming more than the output shows."""
-    if full_suite_pending:
-        return TestValidation(
-            baseline, targeted, full, "pending",
-            repair_targets=repair_targets,
-        )
-    if (
-        infrastructure_error
-        and full is None
-        and (targeted is None or targeted.returncode == 0)
-    ):
-        return TestValidation(
-            baseline, targeted, full, "infrastructure_error",
-            repair_targets=repair_targets,
-        )
-    if targeted is None and full is None:
-        return TestValidation(
-            baseline, targeted, full, "unavailable",
-            repair_targets=repair_targets,
-        )
-    # Targeted tests are the explicit success criterion for this patch.  They
-    # remain authoritative even when their failing test was already red in the
-    # baseline; the baseline only determines full-suite regressions.
-    if targeted is not None and targeted.returncode != 0:
-        targeted_failures = getattr(targeted, "failed_tests", frozenset())
-        before = getattr(baseline, "failed_tests", frozenset())
-        full_failures = getattr(full, "failed_tests", frozenset()) if full else frozenset()
-        remaining_targets = targeted_failures & repair_targets
-        new_failures = (
-            full_failures - before
-            if baseline is not None else frozenset()
-        )
-        existing_failures = (
-            full_failures & before
-            if baseline is not None else frozenset()
-        )
-        fixed_failures = (
-            before - full_failures
-            if baseline is not None and full is not None else frozenset()
-        )
-        return TestValidation(
-            baseline, targeted, full,
-            "repair_failed" if remaining_targets else "targeted_failed",
-            new_failures=new_failures,
-            existing_failures=existing_failures,
-            fixed_failures=fixed_failures,
-            repair_targets=repair_targets,
-            remaining_repair_failures=remaining_targets,
-        )
-
-    if full is not None and full.returncode == 0:
-        before = getattr(baseline, "failed_tests", frozenset())
-        return TestValidation(
-            baseline, targeted, full,
-            "repair_passed" if repair_targets else "passed",
-            fixed_failures=before,
-            repair_targets=repair_targets,
-        )
-    if baseline is None:
-        return TestValidation(baseline, targeted, full, "unclear")
-
-    before = getattr(baseline, "failed_tests", frozenset())
-    # Regressions are deliberately the full-suite delta, B - A.  A targeted
-    # failure is handled above as a separate, patch-specific criterion.
-    after = getattr(full, "failed_tests", frozenset()) if full is not None else frozenset()
-    remaining_targets = after & repair_targets
-    if remaining_targets:
-        return TestValidation(
-            baseline, targeted, full, "repair_failed",
-            new_failures=after - before,
-            existing_failures=after & before,
-            fixed_failures=before - after,
-            repair_targets=repair_targets,
-            remaining_repair_failures=remaining_targets,
-        )
-    if baseline.returncode != 0 and not before:
-        # We know the baseline failed, but not *which* test failed.  No
-        # post-patch identifier can safely be called new in that situation.
-        return TestValidation(baseline, targeted, full, "unclear")
-    if full is None or not before and not after:
-        return TestValidation(baseline, targeted, full, "unclear")
-    new = after - before
-    existing = after & before
-    if new:
-        return TestValidation(
-            baseline, targeted, full, "regressions", new, existing,
-            fixed_failures=before - after,
-        )
-    if existing:
-        return TestValidation(
-            baseline, targeted, full, "existing", frozenset(), existing,
-            fixed_failures=before - after,
-        )
-    return TestValidation(baseline, targeted, full, "unclear")
+    return _validation.classify_test_validation(
+        baseline,
+        targeted,
+        full,
+        repair_targets,
+        full_suite_pending=full_suite_pending,
+        infrastructure_error=infrastructure_error,
+    )
 
 
 def _show_test_validation(validation: TestValidation) -> None:
-    functional_status = {
-        "passed": ("PASSED", "green"),
-        "existing": ("PASS WITH PRE-EXISTING FAILURES", "yellow"),
-        "repair_passed": ("REPAIR SUCCESSFUL", "green"),
-        "regressions": ("FAILED", "red"),
-        "repair_failed": ("REPAIR UNSUCCESSFUL", "red"),
-        "targeted_failed": ("FAILED", "red"),
-        "pending": ("FULL SUITE RUNNING IN BACKGROUND", "cyan"),
-        "infrastructure_error": ("TEST INFRASTRUCTURE ERROR", "yellow"),
-    }.get(validation.status, ("REVIEW REQUIRED", "yellow"))
-    print("\nFunctional validation: " + _status(*functional_status))
-    for label, result in (
-        ("Baseline", validation.baseline),
-        ("Relevant tests", validation.targeted),
-        ("Full suite", validation.full),
-    ):
-        if result is None:
-            if label == "Full suite" and validation.status == "pending":
-                print(_status("[WAIT] Full suite: running in background", "cyan"))
-            else:
-                print(_status(f"[WARN] {label}: not run", "yellow"))
-        else:
-            expected_repair_baseline = (
-                label == "Baseline"
-                and validation.status == "repair_passed"
-                and result.returncode != 0
-                and bool(
-                    getattr(result, "failed_tests", frozenset())
-                    & validation.repair_targets
-                )
-            )
-            if expected_repair_baseline:
-                print(_status(
-                    f"[EXPECTED] {label}: failed before repair; target reproduced ({result.command})",
-                    "yellow",
-                ))
-                continue
-            if label == "Full suite" and validation.status == "existing":
-                count = len(validation.existing_failures)
-                plural = "failure remains" if count == 1 else "failures remain"
-                print(_status(
-                    f"[WARN] {label}: same {count} pre-existing {plural} ({result.command})",
-                    "yellow",
-                ))
-                continue
-            if label == "Baseline" and validation.status == "existing":
-                count = len(validation.existing_failures)
-                print(_status(f"[FAIL] {label}: {count} existing failure(s) ({result.command})", "red"))
-                continue
-            status = "passed" if result.returncode == 0 else "failed"
-            color = "green" if result.returncode == 0 else "red"
-            symbol = "[OK]" if result.returncode == 0 else "[FAIL]"
-            print(_status(f"{symbol} {label}: {status} ({result.command})", color))
-
-    if validation.status == "repair_passed":
-        print(_status(
-            "[OK] Assessment: all repair targets now pass and no regressions were detected.",
-            "green",
-        ))
-    elif validation.status == "passed":
-        print(_status("[OK] Assessment: no new regressions detected.", "green"))
-    elif validation.status == "repair_failed":
-        print(_status("[FAIL] Repair target failures remain: " + ", ".join(
-            sorted(validation.remaining_repair_failures)
-        ), "red"))
-        print("Recommended action: review the diff/test output, then undo this unsuccessful repair and create a fresh repair context.")
-    elif validation.status == "regressions":
-        print(_status("REGRESSION DETECTED", "red"))
-        print(_status("Failed: " + ", ".join(sorted(validation.new_failures)), "red"))
-        print("Recommended action: run `chatcode repair` to create repair context, then send it to ChatGPT.")
-    elif validation.status == "existing":
-        print(_status(
-            f"[WARN] {len(validation.existing_failures)} pre-existing failure(s) remain: "
-            + ", ".join(sorted(validation.existing_failures)),
-            "yellow",
-        ))
-        print("[OK] Assessment: no new regressions detected; existing failures predate this patch.")
-    elif validation.status == "targeted_failed":
-        print(_status("[FAIL] Relevant tests failed; targeted validation remains required for this patch.", "red"))
-        print("Recommended action: repair the targeted failures before keeping this patch.")
-    elif validation.status == "pending":
-        print(_status(
-            "[WAIT] Assessment: immediate validation passed; the full suite "
-            "continues in the background.",
-            "cyan",
-        ))
-        print("No repair action is needed unless the background suite reports a failure.")
-    elif validation.status == "infrastructure_error":
-        print(_status(
-            "[WARN] Assessment: no failing test was observed, but full "
-            "validation could not be started.",
-            "yellow",
-        ))
-        print("Recommended action: run `chatcode test` later; no repair context was created.")
-    else:
-        print(_status("[WARN] Assessment: failures are unclear and require review.", "yellow"))
-        print("Recommended action: run `chatcode repair` and send the context to ChatGPT for review.")
-
-    targeted = "PASS" if validation.targeted and validation.targeted.returncode == 0 else "FAIL" if validation.targeted else "N/A"
-    full = "PASS" if validation.full and validation.full.returncode == 0 else "FAIL" if validation.full else "N/A"
-    regression_count = len(validation.new_failures)
-    targeted_color = "green" if targeted == "PASS" else "red" if targeted == "FAIL" else "yellow"
-    full_color = "green" if full == "PASS" else "red" if full == "FAIL" else "yellow"
-    regression_color = "green" if regression_count == 0 and validation.status in {"passed", "repair_passed", "existing"} else "red" if regression_count else "yellow"
-    print(" | ".join([
-        _status("APPLY: PASS", "green"),
-        _status(f"TARGETED: {targeted}", targeted_color),
-        _status(f"FULL SUITE: {full}", full_color),
-        _status(f"REGRESSIONS: {regression_count}", regression_color),
-        *(
-            [_status(f"PRE-EXISTING: {len(validation.existing_failures)}", "yellow")]
-            if validation.existing_failures else []
-        ),
-        *(
-            [_status("REPAIR: PASS | TARGET FAILURES REMAIN: 0", "green")]
-            if validation.status == "repair_passed" else []
-        ),
-        *(
-            [_status(
-                f"REPAIR: FAIL | TARGET FAILURES REMAIN: {len(validation.remaining_repair_failures)}",
-                "red",
-            )]
-            if validation.status == "repair_failed" else []
-        ),
-    ]))
+    return _validation.show_test_validation(validation, status_fn=_status)
 
 
-def extract_patch_paths(
-    patch_text: str,
-) -> set[str]:
-    paths: set[str] = set()
-
-    try:
-        parsed = parse_unified_diff(
-            patch_text
-        )
-    except UnifiedDiffError:
-        candidates = []
-        for line in patch_text.splitlines():
-            if not line.startswith(
-                ("--- ", "+++ ")
-            ):
-                continue
-            candidates.append(
-                line[4:]
-                .strip()
-                .split("\t", 1)[0]
-            )
-    else:
-        candidates = [
-            raw_path
-            for file_patch in parsed.files
-            for raw_path in (
-                file_patch.old_path,
-                file_patch.new_path,
-            )
-        ]
-
-    for raw_path in candidates:
-        if raw_path == "/dev/null":
-            continue
-
-        if raw_path.startswith(
-            ("a/", "b/")
-        ):
-            raw_path = raw_path[2:]
-
-        raw_path = raw_path.replace("\\", "/")
-        paths.add(raw_path)
-
-    return paths
+_repair_state_file = _repair_state.repair_state_file
 
 
-def validate_patch_paths(
-    patch_text: str,
-) -> set[str]:
-    paths = extract_patch_paths(
-        patch_text
+def _repair_hooks() -> _repair_service.RepairHooks:
+    return _repair_service.RepairHooks(
+        get_context_task_fn=get_context_task,
+        save_context_state_fn=save_context_state,
+        clear_incoming_fn=_clear_incoming_patch,
+        clear_repair_fn=_clear_repair_context,
+        get_context_kind_fn=get_context_kind,
+        safe_candidate_paths_fn=_safe_candidate_paths,
+        working_tree_section_fn=_working_tree_section,
+        patch_hunks_fn=_patch_hunks,
     )
-
-    if not paths:
-        raise PatchError(
-            "Patchen innehåller inga filer."
-        )
-
-    for raw_path in paths:
-        raw_path = raw_path.replace("\\", "/")
-        path = PurePosixPath(
-            raw_path
-        )
-
-        if path.is_absolute() or re.match(r"^[A-Za-z]:", raw_path):
-            raise PatchError(
-                "Absolut sökväg är inte "
-                f"tillåten: {raw_path}"
-            )
-
-        if ".." in path.parts:
-            raise PatchError(
-                "Sökväg utanför repot är "
-                f"inte tillåten: {raw_path}"
-            )
-
-        if ".git" in path.parts:
-            raise PatchError(
-                "Patchen får inte ändra "
-                f".git: {raw_path}"
-            )
-
-    return paths
-
-
-MIN_HUNK_CONTEXT_LINES = 3
-
-
-def _required_hunk_context(source_lines: list[str], hunk: Hunk) -> int:
-    removed_lines = sum(line.kind == "-" for line in hunk.lines)
-    return min(
-        MIN_HUNK_CONTEXT_LINES,
-        max(0, len(source_lines) - removed_lines),
-    )
-
-
-def _old_hunk_lines(hunk: Hunk) -> list[str]:
-    return [line.text for line in hunk.lines if line.kind in {" ", "-"}]
-
-
-def _unique_sequence_start(
-    source_lines: list[str],
-    needle: list[str],
-) -> int | None:
-    """Return a zero-based start only when the exact old-side text is unique."""
-    if not needle or len(needle) > len(source_lines):
-        return None
-    match: int | None = None
-    final_start = len(source_lines) - len(needle)
-    for start in range(final_start + 1):
-        if source_lines[start:start + len(needle)] != needle:
-            continue
-        if match is not None:
-            return None
-        match = start
-    return match
-
-
-def _expand_hunk_from_current_source(
-    source_lines: list[str],
-    hunk: Hunk,
-) -> Hunk:
-    context_lines = sum(line.kind == " " for line in hunk.lines)
-    required_context = _required_hunk_context(source_lines, hunk)
-    if context_lines >= required_context:
-        return hunk
-
-    old_lines = _old_hunk_lines(hunk)
-    match_start = _unique_sequence_start(source_lines, old_lines)
-    if match_start is None:
-        return hunk
-
-    match_end = match_start + len(old_lines)
-    missing_context = required_context - context_lines
-    before_capacity = min(MIN_HUNK_CONTEXT_LINES, match_start)
-    after_capacity = min(
-        MIN_HUNK_CONTEXT_LINES,
-        len(source_lines) - match_end,
-    )
-
-    before_count = min(before_capacity, (missing_context + 1) // 2)
-    after_count = min(after_capacity, missing_context - before_count)
-    remaining = missing_context - before_count - after_count
-    if remaining:
-        extra_before = min(before_capacity - before_count, remaining)
-        before_count += extra_before
-        remaining -= extra_before
-    if remaining:
-        extra_after = min(after_capacity - after_count, remaining)
-        after_count += extra_after
-        remaining -= extra_after
-    if remaining:
-        return hunk
-
-    expanded_old_start = match_start - before_count + 1
-    expanded_new_start = expanded_old_start + (hunk.new_start - hunk.old_start)
-    if expanded_new_start < 1:
-        return hunk
-
-    before = tuple(
-        DiffLine(" ", line)
-        for line in source_lines[match_start - before_count:match_start]
-    )
-    after = tuple(
-        DiffLine(" ", line)
-        for line in source_lines[match_end:match_end + after_count]
-    )
-    return replace(
-        hunk,
-        old_start=expanded_old_start,
-        new_start=expanded_new_start,
-        lines=before + hunk.lines + after,
-    )
-
-
-def _nonblank_sequence_spans(
-    source_lines: list[str],
-    needle: list[str],
-) -> list[tuple[int, int]]:
-    """Return source spans whose nonblank lines exactly match the needle."""
-    wanted = [line for line in needle if line.strip()]
-    if not wanted:
-        return []
-
-    indexed_source = [
-        (index, line)
-        for index, line in enumerate(source_lines)
-        if line.strip()
-    ]
-    if len(wanted) > len(indexed_source):
-        return []
-
-    spans: list[tuple[int, int]] = []
-    final_start = len(indexed_source) - len(wanted)
-    for start in range(final_start + 1):
-        candidate = indexed_source[start:start + len(wanted)]
-        if [line for _, line in candidate] != wanted:
-            continue
-        spans.append((candidate[0][0], candidate[-1][0] + 1))
-    return spans
-
-
-def _unique_blank_gap(
-    source_lines: list[str],
-    before_anchor: list[str],
-    after_anchor: list[str],
-) -> tuple[int, int] | None:
-    """Find one blank-only gap uniquely identified by its surrounding anchors."""
-    before_spans = _nonblank_sequence_spans(source_lines, before_anchor)
-    after_spans = _nonblank_sequence_spans(source_lines, after_anchor)
-    matches: list[tuple[int, int]] = []
-
-    for _before_start, before_end in before_spans:
-        for after_start, _after_end in after_spans:
-            if before_end > after_start:
-                continue
-            if any(line.strip() for line in source_lines[before_end:after_start]):
-                continue
-            matches.append((before_end, after_start))
-            if len(matches) > 1:
-                return None
-
-    return matches[0] if matches else None
-
-
-def _rebuild_hunk_context(
-    source_lines: list[str],
-    hunk: Hunk,
-    body: tuple[DiffLine, ...],
-    core_start: int,
-    core_end: int,
-) -> Hunk:
-    """Rebuild surrounding context from exact current working-tree source."""
-    internal_context = sum(line.kind == " " for line in body)
-    required_context = _required_hunk_context(source_lines, hunk)
-    missing_context = max(0, required_context - internal_context)
-
-    before_capacity = min(MIN_HUNK_CONTEXT_LINES, core_start)
-    after_capacity = min(
-        MIN_HUNK_CONTEXT_LINES,
-        len(source_lines) - core_end,
-    )
-
-    before_count = min(
-        before_capacity,
-        (missing_context + 1) // 2,
-    )
-    after_count = min(
-        after_capacity,
-        missing_context - before_count,
-    )
-    remaining = missing_context - before_count - after_count
-
-    if remaining:
-        extra_before = min(
-            before_capacity - before_count,
-            remaining,
-        )
-        before_count += extra_before
-        remaining -= extra_before
-
-    if remaining:
-        extra_after = min(
-            after_capacity - after_count,
-            remaining,
-        )
-        after_count += extra_after
-        remaining -= extra_after
-
-    if remaining:
-        return hunk
-
-    old_start = core_start - before_count + 1
-    shift = old_start - hunk.old_start
-    new_start = hunk.new_start + shift
-    if new_start < 1:
-        return hunk
-
-    before = tuple(
-        DiffLine(" ", line)
-        for line in source_lines[
-            core_start - before_count:core_start
-        ]
-    )
-    after = tuple(
-        DiffLine(" ", line)
-        for line in source_lines[
-            core_end:core_end + after_count
-        ]
-    )
-
-    return replace(
-        hunk,
-        old_start=old_start,
-        new_start=new_start,
-        lines=before + body + after,
-    )
-
-
-def _reanchor_hunk_from_current_source(
-    source_lines: list[str],
-    hunk: Hunk,
-) -> Hunk:
-    """Safely re-anchor a context-rich mismatched hunk against current source."""
-    context_lines = sum(line.kind == " " for line in hunk.lines)
-    required_context = _required_hunk_context(source_lines, hunk)
-    if context_lines < required_context:
-        return hunk
-
-    if any(line.kind == "\\" for line in hunk.lines):
-        return hunk
-
-    old_lines = _old_hunk_lines(hunk)
-    declared_start = hunk.old_start - 1
-    if (
-        declared_start >= 0
-        and source_lines[
-            declared_start:declared_start + len(old_lines)
-        ] == old_lines
-    ):
-        return hunk
-
-    exact_start = _unique_sequence_start(source_lines, old_lines)
-    if exact_start is not None:
-        shift = exact_start + 1 - hunk.old_start
-        new_start = hunk.new_start + shift
-        if new_start < 1:
-            return hunk
-        return replace(
-            hunk,
-            old_start=exact_start + 1,
-            new_start=new_start,
-        )
-
-    changed_indexes = [
-        index
-        for index, line in enumerate(hunk.lines)
-        if line.kind in {"+", "-"}
-    ]
-    if not changed_indexes:
-        return hunk
-
-    first_change = changed_indexes[0]
-    last_change = changed_indexes[-1]
-    leading = hunk.lines[:first_change]
-    body = hunk.lines[first_change:last_change + 1]
-    trailing = hunk.lines[last_change + 1:]
-
-    # Replacements/deletions are only repaired when their exact old change
-    # body occurs once in the current working tree.
-    if any(line.kind == "-" for line in body):
-        old_body = [
-            line.text
-            for line in body
-            if line.kind in {" ", "-"}
-        ]
-        core_start = _unique_sequence_start(source_lines, old_body)
-        if core_start is None:
-            return hunk
-        return _rebuild_hunk_context(
-            source_lines,
-            hunk,
-            body,
-            core_start,
-            core_start + len(old_body),
-        )
-
-    # For pure insertions, only tolerate blank-line drift between surrounding
-    # anchors. Never skip or replace nonblank current source.
-    if any(line.kind != "+" for line in body):
-        return hunk
-
-    before_anchor = [
-        line.text
-        for line in leading
-        if line.kind == " " and line.text.strip()
-    ][-MIN_HUNK_CONTEXT_LINES:]
-    after_anchor = [
-        line.text
-        for line in trailing
-        if line.kind == " " and line.text.strip()
-    ][:MIN_HUNK_CONTEXT_LINES]
-    if not before_anchor or not after_anchor:
-        return hunk
-
-    gap = _unique_blank_gap(
-        source_lines,
-        before_anchor,
-        after_anchor,
-    )
-    if gap is None:
-        return hunk
-
-    _gap_start, insertion_index = gap
-    return _rebuild_hunk_context(
-        source_lines,
-        hunk,
-        body,
-        insertion_index,
-        insertion_index,
-    )
-
-
-def _hunks_are_ordered_and_disjoint(
-    hunks: tuple[Hunk, ...],
-) -> bool:
-    previous_end = 0
-    for hunk in hunks:
-        old_count = max(1, hunk.actual_old_count)
-        current_end = hunk.old_start + old_count - 1
-        if hunk.old_start <= previous_end:
-            return False
-        previous_end = current_end
-    return True
-
-
-def _expand_thin_hunk_context(repo: Path, patch_text: str) -> str:
-    """Normalize patch hunks against exact current working-tree source."""
-    parsed = parse_unified_diff(patch_text)
-    files = []
-    changed = False
-    for file_patch in parsed.files:
-        if file_patch.old_path == "/dev/null":
-            files.append(file_patch)
-            continue
-        raw_path = file_patch.old_path.removeprefix("a/")
-        source = repo.joinpath(*PurePosixPath(raw_path).parts)
-        try:
-            source_lines = source.read_text(
-                encoding="utf-8", errors="replace"
-            ).splitlines()
-        except OSError:
-            files.append(file_patch)
-            continue
-
-        expanded_hunks = tuple(
-            _expand_hunk_from_current_source(source_lines, hunk)
-            for hunk in file_patch.hunks
-        )
-        normalized_hunks = tuple(
-            _reanchor_hunk_from_current_source(source_lines, hunk)
-            for hunk in expanded_hunks
-        )
-        if (
-            normalized_hunks != expanded_hunks
-            and not _hunks_are_ordered_and_disjoint(normalized_hunks)
-        ):
-            normalized_hunks = expanded_hunks
-
-        if normalized_hunks != file_patch.hunks:
-            changed = True
-            file_patch = replace(file_patch, hunks=normalized_hunks)
-        files.append(file_patch)
-    if not changed:
-        return patch_text
-    return serialize_unified_diff(replace(parsed, files=tuple(files)))
-
-
-def _validate_hunk_context(
-    repo: Path,
-    patch_text: str,
-) -> None:
-    """Reject fragile, line-number-only edits to non-trivial existing files."""
-    parsed = parse_unified_diff(patch_text)
-    for file_patch in parsed.files:
-        if file_patch.old_path == "/dev/null":
-            continue
-        raw_path = file_patch.old_path.removeprefix("a/")
-        source = repo.joinpath(*PurePosixPath(raw_path).parts)
-        try:
-            source_lines = source.read_text(
-                encoding="utf-8", errors="replace"
-            ).splitlines()
-        except OSError:
-            continue
-        for hunk in file_patch.hunks:
-            context_lines = sum(line.kind == " " for line in hunk.lines)
-            required_context = _required_hunk_context(source_lines, hunk)
-            # Replacing/deleting the complete file has no possible context.
-            if context_lines >= required_context:
-                continue
-            raise UnifiedDiffError(
-                f"hunk has only {context_lines} unchanged context line(s); "
-                f"include at least {required_context} surrounding current "
-                "source line(s) instead of relying on a line number",
-                hunk.source_line,
-                "\n".join([
-                    hunk.original_header,
-                    *(line.kind + line.text for line in hunk.lines),
-                ]),
-            )
-
-
-def strip_markdown_fence(
-    patch_text: str,
-) -> str:
-    lines = patch_text.splitlines()
-
-    while lines and not lines[0].strip():
-        lines.pop(0)
-
-    while lines and not lines[-1].strip():
-        lines.pop()
-
-    if len(lines) >= 2:
-        opening = lines[0].strip().lower()
-        closing = lines[-1].strip()
-
-        if (
-            opening in {
-                "```diff",
-                "```patch",
-                "```",
-            }
-            and closing == "```"
-        ):
-            lines = lines[1:-1]
-
-    return "\n".join(lines)
-
-
-def normalize_patch_file(
-    patch_file: Path,
-    *,
-    write_back: bool = True,
-) -> str:
-    try:
-        patch_text = patch_file.read_text(
-            encoding="utf-8",
-            errors="strict",
-        )
-    except UnicodeDecodeError as exc:
-        raise PatchError(
-            "Patchfilen måste vara UTF-8."
-        ) from exc
-
-    patch_text = strip_markdown_fence(
-        patch_text
-    )
-
-    if not patch_text.endswith("\n"):
-        patch_text += "\n"
-
-    if write_back:
-        patch_file.write_text(
-            patch_text,
-            encoding="utf-8",
-            newline="\n",
-        )
-
-    return patch_text
-
-
-def patch_is_already_applied(
-    repo: Path,
-    patch_file: Path,
-) -> bool:
-    try:
-        run_git(
-            "apply",
-            "--reverse",
-            "--check",
-            "--recount",
-            str(patch_file),
-            cwd=repo,
-        )
-
-        return True
-
-    except GitError:
-        pass
-
-    try:
-        run_git(
-            "apply",
-            "--reverse",
-            "--check",
-            "--recount",
-            "--ignore-space-change",
-            str(patch_file),
-            cwd=repo,
-        )
-
-        return True
-
-    except GitError:
-        return False
-
-
-def _patch_hunks(
-    patch_text: str,
-) -> list[tuple[str, int, str]]:
-    lines = patch_text.splitlines()
-    hunks: list[tuple[str, int, str]] = []
-    current_path = ""
-    old_path = ""
-    index = 0
-    hunk_header = re.compile(
-        r"^@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@"
-    )
-
-    while index < len(lines):
-        line = lines[index]
-        if line.startswith("--- "):
-            old_path = line[4:].split("\t", 1)[0].strip()
-            if old_path.startswith("a/"):
-                old_path = old_path[2:]
-
-        if line.startswith("+++ "):
-            raw_path = line[4:].split("\t", 1)[0].strip()
-            if raw_path.startswith("b/"):
-                raw_path = raw_path[2:]
-            current_path = (
-                old_path
-                if raw_path == "/dev/null"
-                else raw_path
-            )
-
-        match = hunk_header.match(line)
-        if not match:
-            index += 1
-            continue
-
-        hunk_lines = [line]
-        index += 1
-        while index < len(lines) and not lines[index].startswith(
-            ("@@ ", "diff --git ", "--- ", "+++ ")
-        ):
-            hunk_lines.append(lines[index])
-            index += 1
-        hunks.append((
-            current_path,
-            int(match.group(1)),
-            "\n".join(hunk_lines),
-        ))
-
-    return hunks
-
-
-def _safe_candidate_paths(
-    repo: Path,
-    patch_text: str,
-) -> list[str]:
-    candidates: set[str] = set()
-    for line in patch_text.splitlines():
-        if not line.startswith(("--- ", "+++ ")):
-            continue
-        raw_path = line[4:].split("\t", 1)[0].strip().replace("\\", "/")
-        if raw_path == "/dev/null":
-            continue
-        if raw_path.startswith(("a/", "b/")):
-            raw_path = raw_path[2:]
-        path = PurePosixPath(raw_path)
-        if path.is_absolute() or ".." in path.parts or ".git" in path.parts:
-            continue
-        candidates.add(path.as_posix())
-    return sorted(candidates)
-
-
-def _hunk_anchor(
-    current_lines: list[str],
-    hunk: str,
-    fallback_line: int,
-) -> int:
-    candidates = []
-    for line in hunk.splitlines():
-        if line.startswith((" ", "-")) and len(line) > 1:
-            text = line[1:]
-            if text.strip():
-                candidates.append(text)
-    candidates.sort(key=len, reverse=True)
-    for candidate in candidates:
-        try:
-            return current_lines.index(candidate) + 1
-        except ValueError:
-            continue
-    if not current_lines:
-        return 0
-    return min(max(1, fallback_line), len(current_lines))
-
-
-def _working_tree_section(
-    repo: Path,
-    raw_path: str,
-    hunk: str = "",
-    line_number: int = 1,
-    full_limit: int = 80_000,
-) -> list[str]:
-    path = repo.joinpath(*PurePosixPath(raw_path).parts)
-    data = path.read_bytes()
-    digest = hashlib.sha256(data).hexdigest()
-    content = data.decode("utf-8", errors="replace")
-    if len(content) <= full_limit:
-        label = f"Complete current working-tree file: {raw_path}"
-        source = content.rstrip("\r\n") or "[File is empty.]"
-    else:
-        current_lines = content.splitlines()
-        anchor = _hunk_anchor(current_lines, hunk, line_number)
-        start = max(1, anchor - 45)
-        end = min(len(current_lines), anchor + 65)
-        if start > end:
-            start = end = max(1, min(len(current_lines), anchor))
-        label = f"Current working-tree lines {start}-{end}: {raw_path}"
-        source = "\n".join(current_lines[start - 1:end])
-        if not source:
-            source = "[No non-empty lines in this range.]"
-    return [
-        label,
-        f"SHA-256 (current file): `{digest}`",
-        "```text",
-        source,
-        "```",
-        "",
-    ]
-
-
-def _repair_state_file(repo: Path) -> Path:
-    return get_repair_context_file(repo).with_name("patch-repair-state.json")
 
 
 def _write_repair_context(
@@ -1441,72 +266,17 @@ def _write_repair_context(
     paths: set[str] | list[str],
     repair_targets: set[str] | frozenset[str] = frozenset(),
 ) -> Path:
-    output_file = get_repair_context_file(repo)
-    hashes: dict[str, str | None] = {}
-    for raw_path in sorted(set(paths)):
-        path = repo.joinpath(*PurePosixPath(raw_path).parts)
-        try:
-            hashes[raw_path] = hashlib.sha256(path.read_bytes()).hexdigest()
-        except OSError:
-            hashes[raw_path] = None
-    state = {
-        "version": 1,
-        "context_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
-        "files": hashes,
-        "repair_targets": sorted(repair_targets),
-    }
-    # Publish state first and the watched Markdown file last. A mismatched pair
-    # is rejected by ``chatcode repair`` rather than presented as current.
-    atomic_write_text(
-        _repair_state_file(repo),
-        json.dumps(state, indent=2, ensure_ascii=False) + "\n",
-        newline="\n",
-    )
-    # A repair context is the source of truth for the next canonical incoming
-    # patch as soon as it is offered to the user. Persist its post-patch
-    # working-tree baseline instead of leaving the original task generation
-    # active until a separate ``chatcode repair`` invocation.
-    original_task = get_context_task(repo)
-    save_context_state(
+    return _repair_service.write_repair_context(
+        _repair_hooks(),
         repo,
-        task=original_task,
-        context_sha256=state["context_sha256"],
-        context_filename=output_file.name,
-        context_kind="repair",
-        repair_targets=sorted(repair_targets),
+        content,
+        paths,
+        repair_targets,
     )
-    atomic_write_text(output_file, content, newline="\n")
-    # The repair artifact is now the source of truth for the next response.
-    # Clear the consumed candidate only after the replacement was published.
-    _clear_incoming_patch(repo)
-    return output_file
 
 
-def get_repair_context_targets(repo: Path) -> frozenset[str]:
-    try:
-        state = json.loads(_repair_state_file(repo).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return frozenset()
-    targets = state.get("repair_targets")
-    if not isinstance(targets, list):
-        return frozenset()
-    return frozenset(item for item in targets if isinstance(item, str) and item)
-
-
-def _get_repair_context_paths(repo: Path) -> frozenset[str]:
-    """Return the source paths that the active repair context actually exposed."""
-    try:
-        state = json.loads(_repair_state_file(repo).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return frozenset()
-    files = state.get("files")
-    if not isinstance(files, dict):
-        return frozenset()
-    return frozenset(
-        PurePosixPath(raw_path).as_posix()
-        for raw_path in files
-        if isinstance(raw_path, str) and raw_path
-    )
+get_repair_context_targets = _repair_state.get_repair_context_targets
+_get_repair_context_paths = _repair_state.get_repair_context_paths
 
 
 def _patch_supersedes_active_repair(
@@ -1515,122 +285,32 @@ def _patch_supersedes_active_repair(
     *,
     force: bool = False,
 ) -> bool:
-    """Decide whether an incoming patch is independent of the active repair.
-
-    A repair response may only patch files whose current source was published
-    in PATCH_REPAIR_CONTEXT.md. If the incoming patch expands beyond that
-    bounded scope, it is a new independent patch and must not inherit the old
-    repair generation. ``force`` handles the inherently ambiguous case where a
-    new task happens to touch exactly the same files as the old repair.
-    """
-    if get_context_kind(repo) != "repair":
-        return False
-    if force:
-        return True
-    repair_paths = _get_repair_context_paths(repo)
-    if not repair_paths:
-        # Missing/corrupt repair metadata stays fail-closed.
-        return False
-    normalized_paths = {
-        PurePosixPath(path).as_posix()
-        for path in patch_paths
-    }
-    return not normalized_paths.issubset(repair_paths)
+    return _repair_service.patch_supersedes_active_repair(
+        _repair_hooks(),
+        repo,
+        patch_paths,
+        force=force,
+    )
 
 
 def _supersede_active_repair(repo: Path) -> None:
-    """Retire an abandoned repair generation before accepting a new task."""
-    save_context_state(
+    return _repair_service.supersede_active_repair(
+        _repair_hooks(),
         repo,
-        task=None,
-        context_kind="superseded",
     )
-    _clear_repair_context(repo)
 
 
-def get_repair_context_stale_reason(repo: Path) -> str | None:
-    output_file = get_repair_context_file(repo)
-    state_file = _repair_state_file(repo)
-    try:
-        content = output_file.read_bytes()
-        state = json.loads(state_file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return "Repair context metadata is missing or unreadable."
-    if hashlib.sha256(content).hexdigest() != state.get("context_sha256"):
-        return "Repair context and its metadata belong to different generations."
-    files = state.get("files")
-    if not isinstance(files, dict):
-        return "Repair context metadata is invalid."
-    changed: list[str] = []
-    for raw_path, expected in files.items():
-        path = repo.joinpath(*PurePosixPath(raw_path).parts)
-        try:
-            current = hashlib.sha256(path.read_bytes()).hexdigest()
-        except OSError:
-            current = None
-        if current != expected:
-            changed.append(raw_path)
-    if changed:
-        return "Working-tree files changed after repair context creation: " + ", ".join(sorted(changed))
-    return None
-
-
-def _test_result_from_saved_report(path: Path):
-    if not path.is_file():
-        return None
-    try:
-        content = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
-    fields = dict(re.findall(
-        r"^(Status|Exit code|Command|Duration):\s*(.+)$",
-        content,
-        flags=re.MULTILINE,
-    ))
-    try:
-        returncode = int(fields["Exit code"])
-        duration = float(fields.get("Duration", "0").split()[0])
-        command = fields["Command"]
-    except (KeyError, ValueError):
-        return None
-    from .test_runner import TestResult, _failed_test_ids
-
-    return TestResult(
-        command=command,
-        returncode=returncode,
-        duration_seconds=duration,
-        output_file=path,
-        failed_tests=_failed_test_ids(content, ""),
-    )
+get_repair_context_stale_reason = _repair_state.get_repair_context_stale_reason
+_test_result_from_saved_report = _repair_refresh.test_result_from_saved_report
 
 
 def refresh_test_failure_repair_context(repo: Path) -> Path | None:
-    """Rebuild a saved test-failure context from current files on demand."""
-    repair_context = get_repair_context_file(repo)
-    try:
-        if not repair_context.read_text(
-            encoding="utf-8", errors="replace"
-        ).startswith("# ChatCode Test Failure Repair Context"):
-            return None
-        history_entry = get_latest_applied_entry(repo)
-        patch_text = get_history_patch_file(history_entry).read_text(
-            encoding="utf-8", errors="replace"
-        )
-    except (OSError, HistoryError):
-        return None
-
-    reports_dir = get_test_results_dir(repo)
-    baseline = _test_result_from_saved_report(reports_dir / "baseline.md")
-    targeted = _test_result_from_saved_report(reports_dir / "targeted.md")
-    full = _test_result_from_saved_report(reports_dir / "full-suite.md")
-    if baseline is None or full is None:
-        return None
-    validation = _classify_test_validation(baseline, targeted, full)
-    result = ApplyResult(
-        paths=extract_patch_paths(patch_text),
-        history_entry=history_entry,
+    return _repair_refresh.refresh_test_failure_repair_context(
+        repo,
+        classify_test_validation_fn=_classify_test_validation,
+        extract_patch_paths_fn=extract_patch_paths,
+        build_test_failure_repair_context_fn=build_test_failure_repair_context,
     )
-    return build_test_failure_repair_context(repo, result, validation)
 
 
 def build_syntax_repair_context(
@@ -1640,60 +320,14 @@ def build_syntax_repair_context(
     malformed_hunk: str | None = None,
     failure_type: str = "invalid_patch_syntax",
 ) -> Path:
-    output_file = get_repair_context_file(repo)
-    sections: list[str] = []
-    for raw_path in _safe_candidate_paths(repo, original_patch):
-        path = repo.joinpath(*PurePosixPath(raw_path).parts)
-        if path.is_file():
-            sections.extend(_working_tree_section(repo, raw_path, original_patch))
-        else:
-            sections.extend([
-                f"Current working-tree file: {raw_path}",
-                "```text",
-                "[File does not currently exist.]",
-                "```",
-                "",
-            ])
-    content_parts = [
-        "# ChatCode Patch Repair Context",
-        "",
-        f"Failure type: `{failure_type}`",
-        "",
-        "## Original task",
-        get_context_task(repo),
-        "",
-        "## Git/parser error",
-        "```text",
-        error,
-        "```",
-    ]
-    if malformed_hunk:
-        content_parts.extend([
-            "",
-            "## Malformed hunk",
-            "```diff",
-            malformed_hunk,
-            "```",
-        ])
-    content_parts.extend([
-        "",
-        "## Complete generated patch",
-        "```diff",
-        original_patch.rstrip(),
-        "```",
-        "",
-        "## Exact current working-tree content",
-        *(sections or ["No safe affected working-tree file could be identified.", ""]),
-        "## Required response",
-        "Return only one COMPLETE corrected unified diff. Do not return a fragment or explanation.",
-        "Use repository-relative POSIX paths and preserve all uncommitted changes.",
-        "Include unchanged current source lines around every hunk whenever possible; do not rely on a guessed line number.",
-        "",
-    ])
-    return _write_repair_context(
+    return _repair_service.build_syntax_repair_context(
+        _repair_hooks(),
+        _write_repair_context,
         repo,
-        "\n".join(content_parts),
-        _safe_candidate_paths(repo, original_patch),
+        original_patch,
+        error,
+        malformed_hunk,
+        failure_type,
     )
 
 
@@ -1703,35 +337,14 @@ def build_stale_repair_context(
     stale_reason: str,
     paths: set[str],
 ) -> Path:
-    output_file = get_repair_context_file(repo)
-    sections: list[str] = []
-    for raw_path in sorted(paths):
-        path = repo.joinpath(*PurePosixPath(raw_path).parts)
-        if path.is_file():
-            sections.extend(_working_tree_section(repo, raw_path, patch_text))
-    content = "\n".join([
-            "# ChatCode Patch Repair Context",
-            "",
-            "Failure type: `stale_context`",
-            "",
-            "## Original task",
-            get_context_task(repo),
-            "",
-            "## Stale-context error",
-            stale_reason,
-            "",
-            "## Complete generated patch",
-            "```diff",
-            patch_text.rstrip(),
-            "```",
-            "",
-            "## Exact CURRENT working-tree content",
-            *sections,
-            "## Required response",
-            "Return only one COMPLETE corrected unified diff against the current files above.",
-            "",
-        ])
-    return _write_repair_context(repo, content, paths)
+    return _repair_service.build_stale_repair_context(
+        _repair_hooks(),
+        _write_repair_context,
+        repo,
+        patch_text,
+        stale_reason,
+        paths,
+    )
 
 
 def build_patch_repair_context(
@@ -1739,97 +352,12 @@ def build_patch_repair_context(
     patch_text: str,
     apply_error: str,
 ) -> Path:
-    output_file = get_repair_context_file(repo)
-    error_locations: dict[str, set[int]] = {}
-    for raw_path, raw_line in re.findall(
-        r"patch failed: (.*?):(\d+)",
-        apply_error,
-    ):
-        path = PurePosixPath(raw_path.replace("\\", "/")).as_posix()
-        error_locations.setdefault(path, set()).add(int(raw_line))
-    hunks = _patch_hunks(patch_text)
-    if error_locations:
-        failed_hunks = [
-            hunk for hunk in hunks
-            if (
-                hunk[0] in error_locations
-                and hunk[1] in error_locations[hunk[0]]
-            )
-        ]
-        if not failed_hunks:
-            failed_hunks = [
-                hunk for hunk in hunks
-                if hunk[0] in error_locations
-            ]
-    else:
-        failed_hunks = hunks
-
-    sections: list[str] = []
-    for raw_path, line_number, hunk in failed_hunks:
-        path = repo.joinpath(*PurePosixPath(raw_path).parts)
-        if path.is_file():
-            source_section = _working_tree_section(
-                repo,
-                raw_path,
-                hunk,
-                line_number,
-            )
-        else:
-            source_section = [
-                f"Current working-tree file: {raw_path}",
-                "```text",
-                "[File does not currently exist.]",
-                "```",
-                "",
-            ]
-
-        sections.extend([
-            f"### {raw_path}",
-            *source_section,
-            "Failed hunk:",
-            "```diff",
-            hunk,
-            "```",
-            "",
-        ])
-
-    if not sections:
-        sections = [
-            "No individual hunk could be identified; inspect the complete patch below.",
-            "```diff",
-            patch_text.rstrip(),
-            "```",
-            "",
-        ]
-
-    content = "\n".join([
-        "# ChatCode Patch Repair Context",
-        "",
-        "Failure type: `patch_target_mismatch`",
-        "",
-        "## Original task",
-        get_context_task(repo),
-        "",
-        "The patch failed `git apply --check`. Return only a corrected unified diff against the exact CURRENT working-tree excerpts below.",
-        "Preserve all existing uncommitted changes. Use repository-relative paths with forward slashes.",
-        "",
-        "## git apply error",
-        "```text",
-        apply_error,
-        "```",
-        "",
-        "## Failed hunks and current contents",
-        *sections,
-        "## Complete generated patch",
-        "```diff",
-        patch_text.rstrip(),
-        "```",
-        "",
-    ])
-    return _write_repair_context(
+    return _repair_service.build_patch_repair_context(
+        _repair_hooks(),
+        _write_repair_context,
         repo,
-        content,
-        _safe_candidate_paths(repo, patch_text),
+        patch_text,
+        apply_error,
     )
 
 
@@ -1838,324 +366,44 @@ def build_test_failure_repair_context(
     result: ApplyResult,
     validation: TestValidation,
 ) -> Path:
-    """Create a repair prompt from the applied patch and *current* source."""
-    patch_file = get_history_patch_file(result.history_entry)
-    patch_text = patch_file.read_text(encoding="utf-8", errors="replace")
-
-    raw_reports: dict[str, str] = {}
-    for label, test_result in (
-        ("Baseline", validation.baseline),
-        ("Targeted tests", validation.targeted),
-        ("Full suite", validation.full),
-    ):
-        if test_result is None:
-            raw_reports[label] = ""
-            continue
-        try:
-            raw_reports[label] = test_result.output_file.read_text(
-                encoding="utf-8", errors="replace"
-            )
-        except OSError:
-            raw_reports[label] = "[Saved test output is unavailable.]"
-
-    # A repair prompt must focus on failures this patch is responsible for.
-    # Unchanged baseline failures are diagnostic information, never automatic
-    # repair targets.
-    repair_failure_ids = (
-        validation.new_failures
-        | validation.remaining_repair_failures
-        | (
-            getattr(validation.targeted, "failed_tests", frozenset())
-            if validation.status == "targeted_failed" else frozenset()
-        )
-        # This function may also be called explicitly to investigate an
-        # existing failure.  It is never reached automatically for that state.
-        | (validation.existing_failures if validation.status == "existing" else frozenset())
-        | (
-            getattr(validation.full, "failed_tests", frozenset())
-            if validation.status == "unclassified_failure" else frozenset()
-        )
-    )
-    failure_ids = sorted(repair_failure_ids)
-    anchors: dict[str, int] = {}
-    relevant_paths: list[str] = []
-
-    def add_relevant(raw_path: str) -> None:
-        normalized = PurePosixPath(raw_path.replace("\\", "/")).as_posix()
-        path = PurePosixPath(normalized)
-        if (
-            path.is_absolute()
-            or ".." in path.parts
-            or ".git" in path.parts
-            or normalized in relevant_paths
-        ):
-            return
-        if repo.joinpath(*path.parts).is_file():
-            relevant_paths.append(normalized)
-
-    repo_resolved = repo.resolve()
-    for output in raw_reports.values():
-        for raw_file, raw_line in re.findall(
-            r'^\s*File "([^"]+)", line (\d+)', output, flags=re.MULTILINE
-        ):
-            try:
-                relative = Path(raw_file).resolve().relative_to(repo_resolved).as_posix()
-            except (OSError, ValueError):
-                continue
-            add_relevant(relative)
-            anchors.setdefault(relative, int(raw_line))
-
-    failed_test_paths: list[str] = []
-    for failure_id in failure_ids:
-        module = failure_id.split(".", 1)[0]
-        candidate = f"tests/{module.replace('.', '/')}" + (
-            "" if module.endswith(".py") else ".py"
-        )
-        if (repo / candidate).is_file():
-            failed_test_paths.append(candidate)
-            add_relevant(candidate)
-
-    # Existing index relationships provide direct imports for the failing test
-    # files. They only select paths; every byte included below is read fresh.
-    try:
-        from .indexing.project_graph import load_map
-
-        indexed_files = load_map(repo).get("files", {})
-        for test_path in failed_test_paths:
-            metadata = indexed_files.get(test_path, {})
-            for dependency in metadata.get("dependencies", [])[:8]:
-                if isinstance(dependency, str):
-                    add_relevant(dependency)
-    except (OSError, AttributeError, TypeError):
-        pass
-
-    for raw_path in sorted(result.paths):
-        add_relevant(raw_path)
-
-    current_sections: list[str] = []
-    source_budget = 140_000
-    included_paths: list[str] = []
-    for raw_path in relevant_paths:
-        section = _working_tree_section(
-            repo,
-            raw_path,
-            line_number=anchors.get(raw_path, 1),
-            full_limit=35_000,
-        )
-        section_size = len("\n".join(section))
-        if current_sections and section_size > source_budget:
-            continue
-        current_sections.extend(section)
-        included_paths.append(raw_path)
-        source_budget -= section_size
-
-    reports: list[str] = []
-    for label, test_result in (("Baseline", validation.baseline), ("Targeted tests", validation.targeted), ("Full suite", validation.full)):
-        reports.extend([f"### {label}"])
-        if test_result is None:
-            reports.extend(["Not run.", ""])
-            continue
-        output = raw_reports[label]
-        lines = output.splitlines()
-        metadata = [
-            line for line in lines
-            if line.startswith(("Status:", "Exit code:", "Command:", "Duration:"))
-        ]
-        if test_result.returncode != 0:
-            first_failure = next(
-                (index for index, line in enumerate(lines) if line.strip().startswith(("ERROR: ", "FAIL: "))),
-                None,
-            )
-            detail = lines[max(0, first_failure - 1):] if first_failure is not None else lines[-200:]
-        else:
-            detail = [line for line in lines if line.strip().startswith(("Ran ", "OK"))]
-        compact = "\n".join([*metadata, "", *detail]).strip()
-        reports.extend(["```text", compact or "[No relevant output.]", "```", ""])
-
-    if validation.status == "repair_failed":
-        classifications = [
-            *(f"- unresolved repair target: {name}" for name in sorted(
-                validation.remaining_repair_failures
-            )),
-            *(f"- new regression: {name}" for name in sorted(
-                validation.new_failures - validation.remaining_repair_failures
-            )),
-        ]
-    elif validation.status == "targeted_failed":
-        classifications = [
-            *(f"- failed targeted test: {name}" for name in sorted(
-                getattr(validation.targeted, "failed_tests", frozenset())
-            )),
-            *(f"- regression: {name}" for name in sorted(validation.new_failures)),
-        ]
-    elif validation.status == "unclassified_failure":
-        classifications = [
-            f"- observed after patch; baseline unavailable: {name}"
-            for name in sorted(repair_failure_ids)
-        ]
-    else:
-        classifications = [
-            *(f"- regression: {name}" for name in sorted(validation.new_failures)),
-            *(f"- pre-existing (explicit investigation): {name}" for name in sorted(
-                validation.existing_failures
-            )),
-        ]
-    classifications = classifications or [
-        "- unclear: test runner did not expose stable failure identifiers"
-    ]
-    content = "\n".join([
-        "# ChatCode Test Failure Repair Context",
-        "",
-        "## Original task",
-        get_context_task(repo),
-        "",
-        "## Classification",
-        *classifications,
-        "",
-        "## Unsuccessful patch attempt",
-        "```diff",
-        patch_text.rstrip(),
-        "```",
-        "",
-        "## Changed files",
-        *(f"- {path}" for path in sorted(result.paths)),
-        "",
-        "## Test results",
-        *reports,
-        "## Exact CURRENT working-tree contents",
-        *current_sections,
-        "## Required response",
-        "Make every unresolved repair target above pass with one complete unified diff against the current files above.",
-        "The unsuccessful patch attempt is evidence of what did not work; do not repeat it.",
-        "Do not restore or overwrite unrelated user changes.",
-        "",
-    ])
-    return _write_repair_context(
+    return _repair_service.build_test_failure_repair_context(
+        _repair_hooks(),
+        _write_repair_context,
         repo,
-        content,
-        included_paths,
-        repair_failure_ids,
+        result,
+        validation,
     )
-
 
 def ensure_background_failure_repair_context(
     repo: Path,
     background: dict,
 ) -> tuple[Path, bool]:
-    """Create one safe repair artifact for the current failed background run."""
-    try:
-        returncode = int(background.get("returncode", 0))
-    except (TypeError, ValueError) as exc:
-        raise PatchError("The background suite result is invalid.") from exc
-    if background.get("state") != "completed" or returncode == 0:
-        raise PatchError("The background suite did not fail.")
-
-    failures = frozenset(
-        str(item) for item in background.get("failed_tests", []) if item
-    )
-    if not failures:
-        raise PatchError(
-            "The background suite failed without stable test identifiers."
-        )
-
-    expected_context = get_repair_context_file(repo).resolve()
-    recorded_context = background.get("repair_context")
-    if recorded_context:
-        candidate = Path(str(recorded_context)).resolve()
-        if (
-            candidate == expected_context
-            and candidate.is_file()
-            and get_repair_context_stale_reason(repo) is None
-        ):
-            return candidate, False
-
-    try:
-        tested_snapshot = _snapshot_from_payload(background["snapshot"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise PatchError(
-            "The background result has no valid repository snapshot."
-        ) from exc
-    if _capture_repository_snapshot(repo) != tested_snapshot:
-        raise PatchError(
-            "The working tree changed after the failed background suite; "
-            "a repair context was not generated from stale test output."
-        )
-
-    application = background.get("application")
-    entry: Path
-    recorded_paths: set[str] | None = None
-    if isinstance(application, dict):
-        entry_name = str(application.get("history_entry", ""))
-        if not entry_name or Path(entry_name).name != entry_name:
-            raise PatchError("The background patch history reference is invalid.")
-        entry = get_applied_history_dir(repo) / entry_name
-        raw_paths = application.get("paths", [])
-        if not isinstance(raw_paths, list):
-            raise PatchError("The background patch path list is invalid.")
-        recorded_paths = {str(path) for path in raw_paths}
-    else:
-        # Compatibility with background runs started before application
-        # metadata was persisted in their status file.
-        try:
-            entry = get_latest_applied_entry(repo)
-        except HistoryError as exc:
-            raise PatchError(
-                "No applied ChatCode patch could be associated with this run."
-            ) from exc
-
-    applied_dir = get_applied_history_dir(repo).resolve()
-    try:
-        resolved_entry = entry.resolve()
-    except OSError as exc:
-        raise PatchError("The applied patch history could not be resolved.") from exc
-    if resolved_entry.parent != applied_dir or not resolved_entry.exists():
-        raise PatchError("The background patch history entry is unavailable.")
-    try:
-        paths = extract_patch_paths(
-            get_history_patch_file(resolved_entry).read_text(
-                encoding="utf-8", errors="replace"
-            )
-        )
-    except OSError as exc:
-        raise PatchError("The applied patch history could not be read.") from exc
-    if not paths or (recorded_paths is not None and recorded_paths != paths):
-        raise PatchError(
-            "The background run does not match its applied patch history."
-        )
-
-    report = Path(str(background.get("report", "")))
-    try:
-        resolved_report = report.resolve()
-    except OSError as exc:
-        raise PatchError("The background test report could not be resolved.") from exc
-    if (
-        resolved_report.parent != get_test_results_dir(repo).resolve()
-        or not resolved_report.is_file()
-    ):
-        raise PatchError("The background test report is unavailable.")
-
-    full_result = TestResult(
-        command=str(background.get("command", "unknown test command")),
-        returncode=returncode,
-        duration_seconds=float(background.get("duration_seconds", 0.0)),
-        output_file=resolved_report,
-        failed_tests=failures,
-    )
-    validation = TestValidation(
-        baseline=None,
-        targeted=None,
-        full=full_result,
-        status="unclassified_failure",
-    )
-    context = build_test_failure_repair_context(
+    return _background_repair.ensure_background_failure_repair_context(
         repo,
-        ApplyResult(paths=paths, history_entry=resolved_entry),
-        validation,
+        background,
+        get_stale_reason_fn=get_repair_context_stale_reason,
+        snapshot_from_payload_fn=_snapshot_from_payload,
+        capture_snapshot_fn=_capture_repository_snapshot,
+        extract_patch_paths_fn=extract_patch_paths,
+        build_test_failure_context_fn=build_test_failure_repair_context,
+        write_background_status_fn=_write_background_full_suite_status,
     )
-    updated = dict(background)
-    updated["repair_context"] = str(context)
-    _write_background_full_suite_status(repo, updated, run_file=True)
-    return context, True
+
+def _apply_hooks() -> _apply_service.ApplyHooks:
+    return _apply_service.ApplyHooks(
+        get_default_patch_file_fn=get_default_patch_file,
+        patch_supersedes_active_repair_fn=_patch_supersedes_active_repair,
+        supersede_active_repair_fn=_supersede_active_repair,
+        get_stale_context_reason_fn=get_stale_context_reason,
+        build_syntax_repair_context_fn=build_syntax_repair_context,
+        build_stale_repair_context_fn=build_stale_repair_context,
+        build_patch_repair_context_fn=build_patch_repair_context,
+        get_context_kind_fn=get_context_kind,
+        get_context_task_fn=get_context_task,
+        save_context_state_fn=save_context_state,
+        get_repair_context_file_fn=get_repair_context_file,
+        repair_state_file_fn=_repair_state_file,
+    )
 
 
 def _apply_patch_core(
@@ -2165,402 +413,43 @@ def _apply_patch_core(
     dry_run: bool = False,
     new_task: bool = False,
 ) -> ApplyResult | PatchPreview:
-    patch_file = patch_file.resolve()
-
-    if not patch_file.exists():
-        raise PatchError(
-            "Patchfilen finns inte:\n"
-            f"{patch_file}"
-        )
-
-    if not patch_file.is_file():
-        raise PatchError(
-            "Detta är inte en fil: "
-            f"{patch_file}"
-        )
-
-    original_patch = normalize_patch_file(patch_file, write_back=not dry_run)
-
-    try:
-        patch_text, _normalized_counts = canonicalize_unified_diff(
-            original_patch
-        )
-    except UnifiedDiffError as exc:
-        repair_context = build_syntax_repair_context(
-            repo,
-            original_patch,
-            str(exc),
-            malformed_hunk=exc.hunk,
-        )
-        raise PatchError(
-            "Generated patch is not a valid unified diff. "
-            "No changes were made.\n"
-            f"Reason: {exc}\n"
-            f"Repair context: {repair_context}",
-            failure_type="invalid_patch_syntax",
-            repair_context=repair_context,
-        ) from exc
-
-    paths = validate_patch_paths(
-        patch_text
-    )
-    patch_text = _expand_thin_hunk_context(repo, patch_text)
-    try:
-        _validate_hunk_context(repo, patch_text)
-    except UnifiedDiffError as exc:
-        repair_context = build_syntax_repair_context(
-            repo,
-            original_patch,
-            str(exc),
-            malformed_hunk=exc.hunk,
-            failure_type="insufficient_patch_context",
-        )
-        raise PatchError(
-            "Generated patch is too fragile to apply safely. "
-            "No changes were made.\n"
-            f"Reason: {exc}\n"
-            f"Repair context: {repair_context}",
-            failure_type="insufficient_patch_context",
-            repair_context=repair_context,
-        ) from exc
-
-    if not dry_run:
-        patch_file.write_text(
-            patch_text,
-            encoding="utf-8",
-            newline="\n",
-        )
-
-    validation_patch_file = patch_file
-    temporary_validation_file: Path | None = None
-    if dry_run:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            newline="\n",
-            suffix=".diff",
-            delete=False,
-        ) as temporary:
-            temporary.write(patch_text)
-            temporary_validation_file = Path(temporary.name)
-        validation_patch_file = temporary_validation_file
-
-    try:
-        run_git(
-            "apply",
-            "--numstat",
-            str(validation_patch_file),
-            cwd=repo,
-        )
-    except GitError as exc:
-        if temporary_validation_file is not None:
-            temporary_validation_file.unlink(missing_ok=True)
-        repair_context = build_syntax_repair_context(
-            repo,
-            original_patch,
-            str(exc),
-        )
-        raise PatchError(
-            "Generated patch is not a valid unified diff. "
-            "No changes were made.\n"
-            f"Reason: {exc}\n"
-            f"Repair context: {repair_context}",
-            failure_type="invalid_patch_syntax",
-            repair_context=repair_context,
-        ) from exc
-
-    default_patch_file = (
-        get_default_patch_file(
-            repo
-        ).resolve()
-    )
-
-    supersedes_repair = (
-        patch_file == default_patch_file
-        and _patch_supersedes_active_repair(
-            repo,
-            paths,
-            force=new_task,
-        )
-    )
-    if supersedes_repair and not dry_run:
-        _supersede_active_repair(repo)
-
-    if patch_file == default_patch_file and not supersedes_repair:
-        stale_reason = (
-            get_stale_context_reason(
-                repo,
-                paths,
-            )
-        )
-
-        if stale_reason is not None:
-            if temporary_validation_file is not None:
-                temporary_validation_file.unlink(missing_ok=True)
-            repair_context = build_stale_repair_context(
-                repo,
-                patch_text,
-                stale_reason,
-                paths,
-            )
-            raise PatchError(
-                f"{stale_reason}\n\nRepair context: {repair_context}",
-                failure_type="stale_context",
-                repair_context=repair_context,
-            )
-
-    try:
-        run_git(
-            "apply",
-            "--check",
-            str(validation_patch_file),
-            cwd=repo,
-        )
-
-    except GitError as strict_error:
-        already_applied = patch_is_already_applied(
-            repo,
-            validation_patch_file,
-        )
-        if temporary_validation_file is not None:
-            temporary_validation_file.unlink(missing_ok=True)
-        if already_applied:
-            raise PatchAlreadyApplied(
-                "Patchen verkar redan vara "
-                "applicerad."
-            )
-
-        repair_context = build_patch_repair_context(
-            repo,
-            patch_text,
-            str(strict_error),
-        )
-        raise PatchError(
-            "Patch did not pass git apply --check. No changes were made.\n"
-            f"{strict_error}\n\n"
-            f"Repair context: {repair_context}",
-            failure_type="patch_target_mismatch",
-            repair_context=repair_context,
-        ) from strict_error
-
-    if dry_run:
-        if temporary_validation_file is not None:
-            temporary_validation_file.unlink(missing_ok=True)
-        return PatchPreview(
-            paths=paths,
-            patch_text=patch_text,
-        )
-
-    try:
-        pending_entry = (
-            begin_history_entry(
-                repo,
-                patch_text,
-                paths,
-            )
-        )
-    except HistoryError as exc:
-        raise PatchError(
-            f"Kunde inte skapa historik: {exc}"
-        ) from exc
-
-    history_patch = (
-        get_history_patch_file(
-            pending_entry
-        )
-    )
-
-    apply_args = [
-        "apply",
-        str(history_patch),
-    ]
-
-    try:
-        run_git(
-            *apply_args,
-            cwd=repo,
-        )
-
-    except GitError as exc:
-        discard_pending_entry(
-            pending_entry
-        )
-
-        raise PatchError(
-            "Git kunde inte applicera "
-            "patchen:\n"
-            f"{exc}"
-        ) from exc
-
-    try:
-        history_entry = (
-            finalize_history_entry(
-                repo,
-                pending_entry,
-            )
-        )
-    except HistoryError as exc:
-        raise PatchError(
-            "Patchen applicerades, men "
-            "ChatCode kunde inte slutföra "
-            f"historiken:\n{exc}"
-        ) from exc
-
-    # Refresh a valid (or absent) derived map after an apply, but never
-    # overwrite a malformed workspace artifact as a side effect of consuming
-    # the canonical incoming patch. Context generation can rebuild it later.
-    try:
-        from .indexing.index_manager import update_project_map
-        from .indexing.project_graph import SCHEMA_VERSION, map_path
-
-        project_map = map_path(repo)
-        valid_map = not project_map.exists()
-        if project_map.exists():
-            raw_map = json.loads(project_map.read_text(encoding="utf-8"))
-            valid_map = (
-                isinstance(raw_map, dict)
-                and raw_map.get("version") == SCHEMA_VERSION
-                and isinstance(raw_map.get("files"), dict)
-            )
-        if valid_map:
-            update_project_map(repo, paths=paths, run_semantic=False)
-    except Exception:
-        pass
-
-    # Normal and repair contexts are single-use. Once their patch has been
-    # applied, keeping that generation active makes a later unrelated patch
-    # appear stale. Repair contexts are especially vulnerable because their
-    # Markdown file is removed immediately below while context-state.json would
-    # otherwise continue pointing at it.
-    if get_context_kind(repo) in {"normal", "repair"}:
-        save_context_state(
-            repo,
-            task=get_context_task(repo),
-            context_kind="consumed",
-        )
-
-    _clear_repair_context(repo)
-    _clear_incoming_patch(repo)
-
-    return ApplyResult(
-        paths=paths,
-        history_entry=history_entry,
+    return _apply_service.apply_patch_core(
+        _apply_hooks(),
+        repo,
+        patch_file,
+        dry_run=dry_run,
+        new_task=new_task,
     )
 
 
-def _clear_repair_context(
-    repo: Path,
-) -> None:
-    for path in (get_repair_context_file(repo), _repair_state_file(repo)):
-        try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            pass
-
-
-def _clear_incoming_patch(
-    repo: Path,
-) -> None:
-    incoming = get_default_patch_file(repo)
-    try:
-        if incoming.exists():
-            incoming.write_text(
-                "",
-                encoding="utf-8",
-                newline="\n",
-            )
-    except OSError:
-        pass
-
-
-def _fallback_patch_summary(
-    patch_text: str,
-    paths: set[str],
-) -> str:
-    additions = 0
-    deletions = 0
-    for line in patch_text.splitlines():
-        if line.startswith(("+++ ", "--- ")):
-            continue
-        if line.startswith("+"):
-            additions += 1
-        elif line.startswith("-"):
-            deletions += 1
-
-    lines = ["Changed files:"]
-    lines.extend(
-        f"  - {path}"
-        for path in sorted(paths)
+def _clear_repair_context(repo: Path) -> None:
+    return _apply_service.clear_repair_context(
+        _apply_hooks(),
+        repo,
     )
-    lines.append(
-        f"Diff statistics: +{additions} / -{deletions}"
+
+
+def _clear_incoming_patch(repo: Path) -> None:
+    return _apply_service.clear_incoming_patch(
+        _apply_hooks(),
+        repo,
     )
-    return "\n".join(lines)
+
+
+_fallback_patch_summary = _summary.fallback_patch_summary
 
 
 def _qwen_patch_summary(
     repo: Path,
     patch_text: str,
 ) -> str | None:
-    if shutil.which("ollama") is None:
-        return None
-
-    model = os.getenv(
-        "CHATCODE_QWEN_MODEL",
-        "qwen2.5-coder:1.5b",
-    ).strip()
-    if not model:
-        return None
-
-    prompt = "\n".join([
-        "Summarize this code patch for the developer who is about to apply it.",
-        "Describe practical behavior changes, not implementation trivia.",
-        "Return strict JSON only: {\"bullets\":[\"...\"]}.",
-        "Return 3 to 6 short bullets. Do not suggest or modify code.",
-        "",
-        "Task:",
-        get_context_task(repo),
-        "",
-        "Patch:",
-        patch_text[:60_000],
-    ])
-
-    try:
-        process = subprocess.run(
-            ["ollama", "run", model, "--format", "json"],
-            input=prompt,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-
-    if process.returncode != 0 or not process.stdout.strip():
-        return None
-
-    try:
-        parsed = json.loads(process.stdout)
-    except json.JSONDecodeError:
-        return None
-
-    bullets = parsed.get("bullets")
-    if not isinstance(bullets, list):
-        return None
-
-    cleaned = [
-        item.strip()[:300]
-        for item in bullets
-        if isinstance(item, str) and item.strip()
-    ][:6]
-    if len(cleaned) < 1:
-        return None
-
-    return "\n".join(
-        f"  - {item}"
-        for item in cleaned
+    return _summary.qwen_patch_summary(
+        repo,
+        patch_text,
+        which_fn=shutil.which,
+        run_fn=subprocess.run,
+        getenv_fn=os.getenv,
+        get_context_task_fn=get_context_task,
     )
 
 
@@ -2569,27 +458,16 @@ def _build_patch_summary(
     preview: PatchPreview,
 ) -> str:
     return (
-        _qwen_patch_summary(
-            repo,
-            preview.patch_text,
-        )
-        or _fallback_patch_summary(
-            preview.patch_text,
-            preview.paths,
-        )
+        _qwen_patch_summary(repo, preview.patch_text)
+        or _fallback_patch_summary(preview.patch_text, preview.paths)
     )
-
 
 def _ask_yes_no(
     question: str,
     *,
     default: bool,
 ) -> bool:
-    suffix = " [Y/n]: " if default else " [y/N]: "
-    answer = input(question + suffix).strip().lower()
-    if not answer:
-        return default
-    return answer in {"y", "yes"}
+    return _presentation.ask_yes_no(question, default=default)
 
 
 def _open_diff_window(
@@ -2597,520 +475,74 @@ def _open_diff_window(
     patch_text: str,
     paths: set[str],
 ) -> None:
-    try:
-        preview_root = get_repo_workspace(repo) / "patch-preview"
-        resolved_workspace = get_repo_workspace(repo).resolve()
-        resolved_preview = preview_root.resolve()
-        if resolved_preview.parent != resolved_workspace:
-            raise OSError("Unsafe patch preview directory.")
-        if preview_root.exists():
-            shutil.rmtree(preview_root)
-        before_root = preview_root / "before"
-        after_root = preview_root / "after"
-        before_root.mkdir(parents=True)
-        after_root.mkdir(parents=True)
-        preview_patch = preview_root / "canonical-preview.diff"
-        atomic_write_text(preview_patch, patch_text, newline="\n")
-
-        for raw_path in sorted(paths):
-            relative = PurePosixPath(raw_path)
-            source = repo.joinpath(*relative.parts)
-            before = before_root.joinpath(*relative.parts)
-            after = after_root.joinpath(*relative.parts)
-            before.parent.mkdir(parents=True, exist_ok=True)
-            after.parent.mkdir(parents=True, exist_ok=True)
-            if source.is_file():
-                shutil.copy2(source, before)
-                shutil.copy2(source, after)
-
-        run_git("apply", "--unsafe-paths", str(preview_patch), cwd=after_root)
-
-        for raw_path in sorted(paths):
-            relative = PurePosixPath(raw_path)
-            before = before_root.joinpath(*relative.parts)
-            after = after_root.joinpath(*relative.parts)
-            if not before.exists():
-                before.parent.mkdir(parents=True, exist_ok=True)
-                before.write_bytes(b"")
-            if not after.exists():
-                after.parent.mkdir(parents=True, exist_ok=True)
-                after.write_bytes(b"")
-            open_code_diff(before.resolve(), after.resolve())
-    except (OSError, GitError, HistoryError) as exc:
-        raise PatchError(
-            f"Could not open diff window: {exc}"
-        ) from exc
+    return _presentation.open_diff_window(
+        repo,
+        patch_text,
+        paths,
+        get_repo_workspace_fn=get_repo_workspace,
+        atomic_write_text_fn=atomic_write_text,
+        run_git_fn=run_git,
+        open_code_diff_fn=open_code_diff,
+        rmtree_fn=shutil.rmtree,
+        copy2_fn=shutil.copy2,
+    )
 
 
 def _show_test_result(test_result) -> None:
-    status = "PASSED" if test_result.returncode == 0 else "FAILED"
-    symbol = "[OK]" if test_result.returncode == 0 else "[FAIL]"
-    color = "green" if test_result.returncode == 0 else "red"
-    print(_status(
-        f"{symbol} TESTS {status}: {test_result.command} "
-        f"({test_result.duration_seconds:.2f}s)",
-        color,
-    ))
-    print(f"Test report: {test_result.output_file}")
+    return _validation.show_test_result(test_result, status_fn=_status)
 
 
-def _preserve_test_report(repo: Path, test_result, phase: str):
-    """Keep phase output for repair context while ``latest.md`` is replaced."""
-    destination = get_test_results_dir(repo) / f"{phase}.md"
-    try:
-        shutil.copyfile(test_result.output_file, destination)
-        return replace(test_result, output_file=destination)
-    except (OSError, TypeError):
-        return test_result
+_preserve_test_report = _validation.preserve_test_report
 
 
-def _clear_phase_test_reports(repo: Path) -> None:
-    for name in ("baseline.md", "targeted.md", "full-suite.md"):
-        try:
-            (get_test_results_dir(repo) / name).unlink(missing_ok=True)
-        except OSError:
-            pass
+_clear_phase_test_reports = _validation.clear_phase_test_reports
 
 
-def _run_background_baseline(repo: Path):
-    """Run the existing project-wide test command without terminal output."""
-    from .test_runner import run_project_tests
-    return run_project_tests(repo)
+_run_background_baseline = _validation.run_background_baseline
+
+_verify_undo = _undo.verify_undo
+
+show_check_repair_send_instructions = _presentation.show_check_repair_send_instructions
 
 
-def _verify_undo(
-    repo: Path,
-    undone_entry: Path,
-) -> None:
-    patch_file = get_history_patch_file(undone_entry)
-    try:
-        run_git(
-            "apply",
-            "--check",
-            "--recount",
-            str(patch_file),
-            cwd=repo,
-        )
-    except GitError as exc:
-        raise PatchUndoError(
-            "Patchen backades, men återställningen "
-            "kunde inte verifieras.\n"
-            f"{exc}"
-        ) from exc
+MAX_FOLLOWUP_ROUNDS = _followup_state.MAX_FOLLOWUP_ROUNDS
 
 
-CHECK_REPAIR_COMPANION_PROMPT = (
-    "Use the attached CHECK_REPAIR_CONTEXT.md as the current repository context "
-    "and source of truth. Fix the listed failing test(s) without weakening tests "
-    "or reverting unrelated working-tree changes. Trace the failure through the "
-    "supplied current implementation and repair the underlying behavior. Return "
-    "exactly one complete unified diff with at least three unchanged context lines "
-    "around each hunk and no explanation outside the diff."
-)
+_load_followup_state = _followup_state.load_followup_state
 
 
-def build_check_repair_context(repo: Path, test_result, selected_failures: frozenset[str]) -> Path:
-    """Materialize a focused new task from a standalone health check."""
-    selected = frozenset(selected_failures) & getattr(test_result, "failed_tests", frozenset())
-    if not selected:
-        raise PatchError("Choose at least one failing test from this health check.")
-    try:
-        output = test_result.output_file.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        output = "[Saved test output is unavailable.]"
-    traceback_paths: list[Path] = []
-    repo_root = repo.resolve()
-    for raw_path in re.findall(r'^\s*File "([^"]+)", line \d+', output, re.MULTILINE):
-        try:
-            path = Path(raw_path).resolve()
-            path.relative_to(repo_root)
-        except (OSError, ValueError):
-            continue
-        traceback_paths.append(path)
-    from .context_builder import build_context_from_test_roots
-    source_context, selected_paths = build_context_from_test_roots(
-        repo, selected, traceback_paths
-    )
-    try:
-        dirty = get_status(repo) or "[Working tree clean.]"
-    except GitError:
-        dirty = "[Working-tree status unavailable.]"
-    try:
-        diff_paths = [path.relative_to(repo).as_posix() for path in selected_paths]
-        current_diff = run_git("diff", "--no-renames", "--", *diff_paths, cwd=repo) if diff_paths else ""
-    except GitError:
-        current_diff = ""
-    diagnostics = []
-    for failure_id in sorted(selected):
-        diagnostics.extend([f"### {failure_id}", "```text", _failure_output_excerpt(output, failure_id), "```", ""])
-    content = "\n".join([
-        "# ChatCode Check Repair Context", "",
-        "Generated from `chatcode check` against the current working tree.",
-        f"Repository: `{repo.resolve()}`", "",
-        "## Repair targets", *(f"- {failure}" for failure in sorted(selected)), "",
-        "## Relevant failure output", *diagnostics,
-        "## Dirty working-tree state", "```text", dirty, "```", "",
-        "## Directly relevant current diff", "```diff", current_diff or "[No unstaged diff for selected source files.]", "```", "",
-        "## Exact current source and bounded dependencies",
-        source_context,
-        "## Repair success criterion",
-        "The listed failing tests are the repair targets. The repair is successful when those tests pass without introducing new regressions.",
-        "Do not weaken or remove tests. Do not revert unrelated working-tree changes.", "",
-    ])
-    destination = get_check_repair_context_file(repo)
-    atomic_write_text(destination, content, newline="\n")
-    return destination
+_save_followup_state = _followup_state.save_followup_state
 
 
-def show_check_repair_send_instructions(context: Path) -> None:
-    print(f"Check repair context created: {context}")
-    show_chatgpt_upload_artifact(context)
-    print("Attach that file and send this message with it:")
-    print(CHECK_REPAIR_COMPANION_PROMPT)
+mark_followup_resolved = _followup_state.mark_followup_resolved
 
 
-EXISTING_FAILURE_COMPANION_PROMPT = (
-    "Use the attached EXISTING_FAILURE_CONTEXT.md as the current repository "
-    "context and source of truth. Fix the selected pre-existing test failure "
-    "without reverting unrelated working-tree changes or the previously "
-    "successful patch. Return exactly one complete unified diff with at least "
-    "three unchanged context lines around each hunk and no explanation outside "
-    "the diff."
-)
-
-FOLLOWUP_COMPANION_PROMPT = (
-    "Use the attached FOLLOWUP_CONTEXT.md as the current repository context "
-    "and source of truth. The previous patch applied successfully and automated "
-    "validation passed, but the user reports that the original problem remains "
-    "unresolved. Use the included user feedback to continue the fix without "
-    "reverting unrelated working-tree changes or the previous patch. Return "
-    "exactly one complete unified diff with at least three unchanged context "
-    "lines around each hunk and no explanation outside the diff."
-)
-
-MAX_FOLLOWUP_ROUNDS = 5
+_followup_attempt = _followup_state.followup_attempt
 
 
-def _load_followup_state(repo: Path) -> dict | None:
-    try:
-        state = json.loads(get_followup_state_file(repo).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    return state if isinstance(state, dict) and state.get("version") == 1 else None
+_result_from_followup_attempt = _followup_state.result_from_followup_attempt
 
 
-def _save_followup_state(repo: Path, state: dict) -> None:
-    atomic_write_text(
-        get_followup_state_file(repo),
-        json.dumps(state, indent=2, ensure_ascii=False) + "\n",
-        newline="\n",
-    )
+_attempted_python_symbols_by_path = _followup_state.attempted_python_symbols_by_path
 
 
-def mark_followup_resolved(repo: Path) -> None:
-    state = _load_followup_state(repo)
-    if state is None or not state.get("unresolved"):
-        return
-    state["unresolved"] = False
-    state["updated_at"] = time.time()
-    _save_followup_state(repo, state)
+_attempted_python_symbols = _followup_state.attempted_python_symbols
 
+build_followup_context = _followup.build_followup_context
 
-def _followup_attempt(result: ApplyResult, validation: TestValidation, patch_summary: str) -> dict:
-    return {
-        "history_entry": str(result.history_entry.resolve()),
-        "paths": sorted(result.paths),
-        "patch_summary": patch_summary,
-        "validation_status": validation.status,
-    }
+regenerate_followup_context = _followup.regenerate_followup_context
 
-
-def _result_from_followup_attempt(attempt: dict) -> ApplyResult | None:
-    history_entry = attempt.get("history_entry")
-    paths = attempt.get("paths")
-    if not isinstance(history_entry, str) or not isinstance(paths, list):
-        return None
-    return ApplyResult(
-        {path for path in paths if isinstance(path, str)}, Path(history_entry)
-    )
-
-
-def _attempted_python_symbols_by_path(
-    result: ApplyResult,
-) -> dict[str, set[str]]:
-    """Recover changed Python definitions while preserving their file owner."""
-    attempted: dict[str, set[str]] = {}
-    for relative in result.paths:
-        if not relative.casefold().endswith(".py"):
-            continue
-        parts = PurePosixPath(relative).parts
-        snapshots: list[dict[str, str]] = []
-        for state in ("before", "after"):
-            path = result.history_entry.joinpath(state, *parts)
-            try:
-                source = path.read_text(encoding="utf-8", errors="replace")
-                tree = ast.parse(source)
-            except (OSError, SyntaxError):
-                snapshots.append({})
-                continue
-            snapshots.append({
-                node.name: ast.get_source_segment(source, node) or ""
-                for node in ast.walk(tree)
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            })
-        before, after = snapshots
-        changed = {
-            name for name in before.keys() | after.keys()
-            if before.get(name) != after.get(name)
-        }
-        if changed:
-            attempted[relative] = changed
-    return attempted
-
-
-def _attempted_python_symbols(result: ApplyResult) -> set[str]:
-    """Compatibility helper for follow-up alternative discovery."""
-    return {
-        symbol
-        for symbols in _attempted_python_symbols_by_path(result).values()
-        for symbol in symbols
-    }
-
-
-def build_followup_context(
-    repo: Path,
-    result: ApplyResult,
-    validation: TestValidation,
-    feedback: str,
-    patch_summary: str,
-    *,
-    original_task: str | None = None,
-    prior_attempts: list[ApplyResult] | None = None,
-    feedback_history: list[str] | None = None,
-    persist_state: bool = True,
-) -> Path:
-    """Create a fresh, post-patch task context from explicit user feedback."""
-    feedback = feedback.strip()
-    if not feedback:
-        raise PatchError("Describe what is still not working before creating a follow-up context.")
-    original_task = original_task or get_context_task(repo)
-    existing_state = _load_followup_state(repo) if persist_state else None
-    prior_feedback = list(feedback_history or [])
-    prior_results = list(prior_attempts or [])
-    if existing_state is not None and existing_state.get("unresolved"):
-        prior_feedback = [
-            item for item in existing_state.get("feedback", [])
-            if isinstance(item, str) and item
-        ]
-        prior_results = [
-            parsed for parsed in (
-                _result_from_followup_attempt(item)
-                for item in existing_state.get("attempts", [])
-                if isinstance(item, dict)
-            )
-            if parsed is not None
-        ]
-    all_feedback = [*prior_feedback, feedback]
-    all_feedback = list(dict.fromkeys(all_feedback))[-MAX_FOLLOWUP_ROUNDS:]
-    retrieval_feedback = "\n".join(
-        f"- {item}" for item in all_feedback
-    )
-    retrieval_task = "\n\n".join((
-        original_task,
-        "Previous patch applied successfully; automated validation passed.",
-        "User-provided unresolved runtime feedback:\n" + retrieval_feedback,
-    ))
-    # This is the normal current-working-tree retrieval/materialization path,
-    # deliberately rerun with feedback rather than reusing an old upload.
-    from .context_builder import (
-        _build_stable_patch_source_context,
-        _ensure_explicit_task_files,
-        collect_relevant_files,
-        is_source_file,
-    )
-    from .retrieval.hybrid_retriever import resolve_alternative_callback_roots
-    retrieved = collect_relevant_files(repo, retrieval_task, include_target_symbols=True)
-    files, target_symbols = retrieved if isinstance(retrieved, tuple) else (retrieved, {})
-    attempted_results = [*prior_results, result][-MAX_FOLLOWUP_ROUNDS:]
-    attempted_symbols = {
-        symbol for attempted in attempted_results
-        for symbol in _attempted_python_symbols(attempted)
-    }
-    attempted_paths: list[Path] = []
-    attempted_target_symbols: dict[Path, list[str]] = {}
-    repo_root = repo.resolve()
-    for attempted in attempted_results:
-        symbols_by_path = _attempted_python_symbols_by_path(attempted)
-        for raw_path in sorted(attempted.paths):
-            relative = PurePosixPath(raw_path.replace("\\", "/"))
-            if relative.is_absolute() or ".." in relative.parts or ".git" in relative.parts:
-                continue
-            candidate = repo.joinpath(*relative.parts)
-            try:
-                candidate.resolve().relative_to(repo_root)
-            except (OSError, ValueError):
-                continue
-            if (
-                candidate.is_file()
-                and is_source_file(candidate)
-                and candidate not in attempted_paths
-            ):
-                attempted_paths.append(candidate)
-            symbols = symbols_by_path.get(raw_path, set())
-            if candidate.is_file() and symbols:
-                attempted_target_symbols.setdefault(candidate, [])
-                attempted_target_symbols[candidate] = list(dict.fromkeys([
-                    *attempted_target_symbols[candidate],
-                    *sorted(symbols),
-                ]))
-    alternatives = resolve_alternative_callback_roots(
-        repo, retrieval_task, attempted_symbols
-    )
-    # Follow-up-only priority: keep the attempted dirty path in normal
-    # retrieval, but put structurally supported alternatives first so the
-    # failed hypothesis cannot consume all patchable-source allowance.
-    files = list(dict.fromkeys([*alternatives.files, *attempted_paths, *files]))
-    merged_targets: dict[Path, list[str]] = {}
-    for source in (
-        alternatives.required_symbols,
-        target_symbols,
-        attempted_target_symbols,
-    ):
-        for path, symbols in source.items():
-            merged_targets.setdefault(path, [])
-            merged_targets[path] = list(dict.fromkeys([
-                *merged_targets[path], *symbols,
-            ]))
-    target_symbols = merged_targets
-    files = _ensure_explicit_task_files(repo, retrieval_task, files)
-    source_context, source_hashes = _build_stable_patch_source_context(
-        repo, retrieval_task, files, target_symbols
-    )
-    try:
-        dirty_state = get_status(repo) or "[Working tree clean.]"
-    except GitError:
-        dirty_state = "[Working-tree status unavailable.]"
-    content = "\n".join((
-        "# ChatCode Follow-up Context", "",
-        "## Original task", original_task, "",
-        "## Previous patch result",
-        "- The previous patch applied successfully.",
-        "- Automated validation passed with no new regressions.",
-        f"- Validation classification: `{validation.status}`.",
-        "", "### Previous patch summary", patch_summary, "",
-        "## User feedback", "The following is user-provided runtime feedback:",
-        "```text", feedback, "```", "",
-        "## Bounded unresolved feedback history",
-        "\n".join(f"- {item}" for item in all_feedback), "",
-        "## Follow-up status",
-        "The previous patch applied successfully and automated validation passed, "
-        "but the user reports that the real problem remains unresolved.", "",
-        "## Current repository context", "## Dirty working-tree state",
-        "```text", dirty_state, "```", "",
-        "## Exact current source and bounded dependencies", source_context, "",
-        "## Required response",
-        "Investigate the unresolved behavior using the user feedback and current "
-        "source. Preserve unrelated working-tree changes and the previous patch.",
-        "Return one complete unified diff against the current files, with no explanation outside the diff.",
-        "",
-    ))
-    output = get_followup_context_file(repo)
-    save_context_state(
-        repo,
-        task=original_task,
-        source_hashes=source_hashes,
-        context_sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
-        generation_id=uuid.uuid4().hex,
-        context_filename=output.name,
-        context_kind="followup",
-    )
-    atomic_write_text(output, content, newline="\n")
-    if persist_state:
-        attempts = []
-        if existing_state is not None and existing_state.get("unresolved"):
-            attempts = [
-                item for item in existing_state.get("attempts", [])
-                if isinstance(item, dict)
-            ]
-        attempts.append(_followup_attempt(result, validation, patch_summary))
-        _save_followup_state(repo, {
-            "version": 1,
-            "id": (
-                existing_state.get("id")
-                if existing_state is not None and existing_state.get("unresolved")
-                else uuid.uuid4().hex
-            ),
-            "unresolved": True,
-            "original_task": original_task,
-            "feedback": all_feedback,
-            "attempts": attempts[-MAX_FOLLOWUP_ROUNDS:],
-            "updated_at": time.time(),
-        })
-    return output
-
-
-def regenerate_followup_context(repo: Path) -> Path | None:
-    """Regenerate the active follow-up from structured evidence and current source."""
-    state = _load_followup_state(repo)
-    if state is None or not state.get("unresolved"):
-        return None
-    attempts = [item for item in state.get("attempts", []) if isinstance(item, dict)]
-    feedback = [item for item in state.get("feedback", []) if isinstance(item, str) and item]
-    if not attempts or not feedback or not isinstance(state.get("original_task"), str):
-        return None
-    latest = attempts[-1]
-    result = _result_from_followup_attempt(latest)
-    if result is None:
-        return None
-    prior_results = [
-        parsed for parsed in (_result_from_followup_attempt(item) for item in attempts[:-1])
-        if parsed is not None
-    ]
-    validation = TestValidation(
-        None, None, None, str(latest.get("validation_status") or "passed")
-    )
-    return build_followup_context(
-        repo,
-        result,
-        validation,
-        feedback[-1],
-        str(latest.get("patch_summary") or "[Previous patch summary unavailable.]"),
-        original_task=state["original_task"],
-        prior_attempts=prior_results,
-        feedback_history=feedback[:-1],
-        persist_state=False,
-    )
-
-
-def show_followup_send_instructions(context: Path) -> None:
-    print("Follow-up context created.")
-    show_chatgpt_upload_artifact(context)
-    print("Attach that file and send this message with it:")
-    print(FOLLOWUP_COMPANION_PROMPT)
+show_followup_send_instructions = _presentation.show_followup_send_instructions
 
 
 def _applied_patch_summary(result: ApplyResult) -> str:
-    try:
-        patch_text = get_history_patch_file(result.history_entry).read_text(
-            encoding="utf-8", errors="replace"
-        )
-    except OSError:
-        patch_text = "[Applied patch text is unavailable; changed-file summary follows.]"
-    return _fallback_patch_summary(patch_text, result.paths)
-
-
-def _failure_output_excerpt(output: str, failure_id: str) -> str:
-    """Keep the selected failure's diagnostic, not unrelated suite noise."""
-    lines = output.splitlines()
-    index = next((i for i, line in enumerate(lines) if failure_id in line), None)
-    if index is None:
-        return output[-12_000:] or "[Selected failure details unavailable.]"
-    end = next(
-        (i for i in range(index + 1, len(lines))
-         if lines[i].startswith(("FAIL: ", "ERROR: "))),
-        min(len(lines), index + 180),
+    return _presentation.applied_patch_summary(
+        result,
+        fallback_patch_summary_fn=_fallback_patch_summary,
     )
-    return "\n".join(lines[max(0, index - 2):end]).strip()
+
+
+_failure_output_excerpt = _existing_failure.failure_output_excerpt
 
 
 def build_existing_failure_context(
@@ -3119,157 +551,20 @@ def build_existing_failure_context(
     validation: TestValidation,
     selected_failures: frozenset[str],
 ) -> Path:
-    """Create a new-task context for failures proven to predate this patch."""
-    selected_failures = frozenset(selected_failures) & validation.existing_failures
-    if not selected_failures:
-        raise PatchError("Choose at least one currently reported pre-existing failure.")
+    return _existing_failure.build_existing_failure_context(
+        repo,
+        result,
+        validation,
+        selected_failures,
+        working_tree_section_fn=_working_tree_section,
+        fallback_patch_summary_fn=_fallback_patch_summary,
+        get_context_task_fn=get_context_task,
+    )
 
-    def report_text(test_result) -> str:
-        if test_result is None:
-            return "[Not run.]"
-        try:
-            return test_result.output_file.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return "[Saved test output is unavailable.]"
-
-    baseline_output = report_text(validation.baseline)
-    post_output = report_text(validation.full)
-    relevant_paths: list[str] = []
-
-    def add_path(raw_path: str) -> None:
-        normalized = PurePosixPath(raw_path.replace("\\", "/")).as_posix()
-        path = PurePosixPath(normalized)
-        if (path.is_absolute() or ".." in path.parts or ".git" in path.parts
-                or normalized in relevant_paths):
-            return
-        if repo.joinpath(*path.parts).is_file():
-            relevant_paths.append(normalized)
-
-    test_paths: list[str] = []
-    for failure_id in sorted(selected_failures):
-        module = failure_id.split(".", 1)[0]
-        candidate = f"tests/{module.replace('.', '/')}" + ("" if module.endswith(".py") else ".py")
-        if (repo / candidate).is_file():
-            test_paths.append(candidate)
-            add_path(candidate)
-
-    # A small deterministic fallback keeps a useful implementation file in
-    # the context even when the project graph has not been built yet.
-    for test_path in test_paths:
-        try:
-            test_source = (repo / test_path).read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        modules = re.findall(r"^\s*from\s+([\w.]+)\s+import\s+", test_source, re.MULTILINE)
-        modules += re.findall(r"^\s*import\s+([\w.]+)", test_source, re.MULTILINE)
-        for module in modules[:12]:
-            add_path(module.replace(".", "/") + ".py")
-            add_path(module.replace(".", "/") + "/__init__.py")
-
-    # The graph supplies bounded direct implementation dependencies from the
-    # high-confidence failing-test seed. Content is always read from disk now.
-    try:
-        from .indexing.project_graph import load_map
-        indexed_files = load_map(repo).get("files", {})
-        for test_path in test_paths:
-            for dependency in indexed_files.get(test_path, {}).get("dependencies", [])[:8]:
-                if isinstance(dependency, str):
-                    add_path(dependency)
-    except (OSError, AttributeError, TypeError):
-        pass
-    for path in sorted(result.paths):
-        add_path(path)
-
-    sections: list[str] = []
-    budget = 140_000
-    for path in relevant_paths:
-        section = _working_tree_section(repo, path, full_limit=35_000)
-        size = len("\n".join(section))
-        if sections and size > budget:
-            continue
-        sections.extend(section)
-        budget -= size
-
-    try:
-        patch_text = get_history_patch_file(result.history_entry).read_text(
-            encoding="utf-8", errors="replace"
-        )
-    except OSError:
-        patch_text = "[Recently applied patch is unavailable.]"
-    try:
-        dirty_state = get_status(repo) or "[Working tree clean.]"
-    except GitError:
-        dirty_state = "[Working-tree status unavailable.]"
-
-    failure_sections: list[str] = []
-    for failure_id in sorted(selected_failures):
-        failure_sections.extend([
-            f"### {failure_id}",
-            "This test failed before the previous patch and still fails now.",
-            "#### Baseline failure output",
-            "```text", _failure_output_excerpt(baseline_output, failure_id), "```",
-            "#### Current post-patch failure output",
-            "```text", _failure_output_excerpt(post_output, failure_id), "```", "",
-        ])
-
-    content = "\n".join([
-        "# ChatCode Existing Failure Context",
-        "",
-        "## New-task provenance",
-        "Created from a pre-existing failure discovered during post-apply validation.",
-        f"Repository: `{repo.resolve()}`",
-        "The previous patch passed its targeted tests and introduced zero new regressions.",
-        "This is a separate bug-fix task, not a repair of the previous patch.",
-        "",
-        "## Original task for the previous patch",
-        get_context_task(repo),
-        "",
-        "## Selected pre-existing failure(s)",
-        *failure_sections,
-        "## Recently applied patch summary",
-        _fallback_patch_summary(patch_text, result.paths),
-        "",
-        "## Dirty working-tree state",
-        "```text", dirty_state, "```",
-        "",
-        "## Exact current source and bounded dependencies",
-        *(sections or ["[No selected test source could be materialized.]", ""]),
-        "## Required response",
-        "Fix only the selected pre-existing failure(s). Preserve unrelated working behavior and do not revert the previous successful patch merely to restore an old state.",
-        "Return one complete unified diff against the current files, with no explanation outside the diff.",
-        "",
-    ])
-    output_file = get_existing_failure_context_file(repo)
-    atomic_write_text(output_file, content, newline="\n")
-    return output_file
+show_existing_failure_send_instructions = _presentation.show_existing_failure_send_instructions
 
 
-def show_existing_failure_send_instructions(context: Path) -> None:
-    print(f"Existing failure context created: {context}")
-    show_chatgpt_upload_artifact(context)
-    print("Attach that file and send this message with it:")
-    print(EXISTING_FAILURE_COMPANION_PROMPT)
-
-
-def _choose_existing_failures(failures: frozenset[str]) -> frozenset[str]:
-    ordered = sorted(failures)
-    if len(ordered) == 1:
-        print(f"Selected pre-existing failure: {ordered[0]}")
-        return frozenset(ordered)
-    print("Select pre-existing failure(s) for a new fix task:")
-    for index, failure in enumerate(ordered, start=1):
-        print(f"[{index}] {failure}")
-    print("Enter comma-separated numbers, or A for all (one is recommended).")
-    answer = input("> ").strip().lower()
-    if answer == "a":
-        return frozenset(ordered)
-    try:
-        selected = {ordered[int(part.strip()) - 1] for part in answer.split(",") if part.strip()}
-    except (IndexError, ValueError):
-        selected = set()
-    if not selected:
-        print("No valid failure selected.")
-    return frozenset(selected)
+_choose_existing_failures = _presentation.choose_existing_failures
 
 
 def _post_apply_choice(
@@ -3282,132 +577,26 @@ def _post_apply_choice(
     recommend_keep_for_repair: bool = False,
     validation: TestValidation | None = None,
 ) -> None:
-    from .history import open_history_review
-
-    failed = (
-        test_result is not None
-        and test_result.returncode != 0
+    return _service.post_apply_choice(
+        repo,
+        result,
+        test_result,
+        test_error,
+        recommend_undo=recommend_undo,
+        recommend_keep_for_repair=recommend_keep_for_repair,
+        validation=validation,
+        get_context_kind_fn=get_context_kind,
+        mark_followup_resolved_fn=mark_followup_resolved,
+        build_followup_context_fn=build_followup_context,
+        applied_patch_summary_fn=_applied_patch_summary,
+        show_followup_send_instructions_fn=show_followup_send_instructions,
+        choose_existing_failures_fn=_choose_existing_failures,
+        build_existing_failure_context_fn=build_existing_failure_context,
+        show_existing_failure_send_instructions_fn=show_existing_failure_send_instructions,
+        undo_last_patch_fn=undo_last_patch,
+        verify_undo_fn=_verify_undo,
+        clear_repair_context_fn=_clear_repair_context,
     )
-    pre_existing_only = validation is not None and validation.status == "existing"
-    followup_eligible = validation is not None and validation.status in {"passed", "repair_passed"}
-    followup_feedback: str | None = None
-
-    if followup_eligible:
-        while True:
-            answer = input("Did the patch solve your problem? [Y/n] ").strip().lower()
-            if answer in {"", "y", "yes"}:
-                if get_context_kind(repo) == "followup":
-                    mark_followup_resolved(repo)
-                print("Changes kept.")
-                return
-            if answer in {"n", "no"}:
-                break
-            print("Choose Y or N.")
-        while not followup_feedback:
-            followup_feedback = input("What is still not working?\n> ").strip()
-            if not followup_feedback:
-                print("Please describe what is still not working.")
-        try:
-            context = build_followup_context(
-                repo, result, validation, followup_feedback, _applied_patch_summary(result),
-            )
-            show_followup_send_instructions(context)
-            print("Changes kept.")
-            return
-        except (OSError, PatchError) as exc:
-            print(f"Could not create follow-up context: {exc}")
-
-    while True:
-        if failed:
-            undo_label = "[U] Undo (recommended)" if recommend_undo else "[U] Undo"
-            keep_label = (
-                "[K] Keep changes (recommended for repair)"
-                if recommend_keep_for_repair else "[K] Keep changes"
-            )
-            if pre_existing_only:
-                print(f"{keep_label}  [F] Keep changes + create fix context for existing failure  {undo_label}  [R] Review diff  [T] Show test output")
-            else:
-                print(f"{keep_label}  {undo_label}  [R] Review diff  [T] Show test output")
-            choice = input("> ").strip().lower()
-            if not choice and recommend_undo:
-                choice = "u"
-            elif not choice and recommend_keep_for_repair:
-                choice = "k"
-        else:
-            retry = "  [F] Retry follow-up context" if followup_feedback else ""
-            print("[K] Keep  [U] Undo  [R] Review diff" + retry)
-            choice = input("> ").strip().lower() or "k"
-
-        if choice == "k":
-            print("Changes kept.")
-            return
-
-        if choice == "r":
-            try:
-                open_history_review(
-                    result.history_entry
-                )
-            except HistoryError as exc:
-                print(f"Could not open review: {exc}")
-            continue
-
-        if choice == "t" and failed and test_result is not None:
-            try:
-                print(
-                    test_result.output_file.read_text(
-                        encoding="utf-8",
-                        errors="replace",
-                    )
-                )
-            except OSError as exc:
-                print(f"Could not read test output: {exc}")
-            continue
-
-        if choice == "f" and followup_feedback and validation is not None:
-            try:
-                context = build_followup_context(
-                    repo, result, validation, followup_feedback, _applied_patch_summary(result),
-                )
-                show_followup_send_instructions(context)
-                print("Changes kept.")
-                return
-            except (OSError, PatchError) as exc:
-                print(f"Could not create follow-up context: {exc}")
-                continue
-
-        if choice == "f" and pre_existing_only and validation is not None:
-            selected = _choose_existing_failures(validation.existing_failures)
-            if not selected:
-                continue
-            try:
-                context = build_existing_failure_context(repo, result, validation, selected)
-                show_existing_failure_send_instructions(context)
-            except OSError as exc:
-                print(f"Could not create existing failure context: {exc}")
-                continue
-            print("Changes kept.")
-            return
-
-        if choice == "u":
-            undone = undo_last_patch(repo)
-            _verify_undo(
-                repo,
-                undone.history_entry,
-            )
-            print("Changes restored successfully.")
-            if recommend_keep_for_repair or (
-                validation is not None and validation.status == "repair_failed"
-            ):
-                _clear_repair_context(repo)
-                print("Repair context invalidated because its working-tree baseline was undone.")
-            return
-
-        if test_error is not None and choice == "t":
-            print(f"No test report is available: {test_error}")
-            continue
-
-        extra = ", T, or F." if (failed and pre_existing_only) or followup_feedback else ", or T." if failed else "."
-        print("Choose K, U, R" + extra)
 
 
 def _run_apply_flow(
@@ -3417,303 +606,34 @@ def _run_apply_flow(
     yes: bool = False,
     new_task: bool = False,
 ) -> ApplyResult:
-    preview = _apply_patch_core(
+    return _service.run_apply_flow(
         repo,
         patch_file,
-        dry_run=True,
+        yes=yes,
         new_task=new_task,
+        cli_apply_invocation=_CLI_APPLY_INVOCATION,
+        apply_patch_core_fn=_apply_patch_core,
+        patch_supersedes_active_repair_fn=_patch_supersedes_active_repair,
+        get_active_repair_targets_fn=get_active_repair_targets,
+        capture_repository_snapshot_fn=_capture_repository_snapshot,
+        clear_phase_test_reports_fn=_clear_phase_test_reports,
+        load_verified_baseline_fn=_load_verified_baseline,
+        run_background_baseline_fn=_run_background_baseline,
+        build_patch_summary_fn=_build_patch_summary,
+        fallback_patch_summary_fn=_fallback_patch_summary,
+        ask_yes_no_fn=_ask_yes_no,
+        open_diff_window_fn=_open_diff_window,
+        preserve_test_report_fn=_preserve_test_report,
+        show_test_result_fn=_show_test_result,
+        status_fn=_status,
+        start_background_full_suite_fn=_start_background_full_suite,
+        save_verified_baseline_fn=save_verified_baseline,
+        classify_test_validation_fn=_classify_test_validation,
+        show_test_validation_fn=_show_test_validation,
+        build_test_failure_repair_context_fn=build_test_failure_repair_context,
+        show_repair_send_instructions_fn=show_repair_send_instructions,
+        post_apply_choice_fn=_post_apply_choice,
     )
-    assert isinstance(preview, PatchPreview)
-    repair_targets = (
-        frozenset()
-        if _patch_supersedes_active_repair(
-            repo,
-            preview.paths,
-            force=new_task,
-        )
-        else get_active_repair_targets(repo)
-    )
-
-    # Start only after the candidate has passed all non-mutating applicability
-    # checks. The snapshot is rechecked immediately before mutation below.
-    baseline_snapshot = _capture_repository_snapshot(repo)
-    _clear_phase_test_reports(repo)
-    cached_baseline = _load_verified_baseline(repo, baseline_snapshot)
-    baseline_executor: ThreadPoolExecutor | None = None
-    baseline_future: Future | None = None
-    if cached_baseline is not None:
-        print("Pre-patch baseline: using verified cached result.")
-        print("[OK] Repository state unchanged since last full-suite validation." if cached_baseline.returncode == 0
-              else f"[WARN] {len(cached_baseline.failed_tests)} known pre-existing failure(s).")
-    elif _CLI_APPLY_INVOCATION:
-        print(
-            "Pre-patch baseline: no verified cached result; "
-            "continuing without blocking."
-        )
-        print(
-            "Failures from this apply cannot be classified against a baseline. "
-            "The post-patch full suite will establish one for the next apply."
-        )
-    else:
-        baseline_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="chatcode-baseline")
-        baseline_future = baseline_executor.submit(_run_background_baseline, repo)
-        print("Starting pre-patch test baseline in background...")
-
-    summary = _build_patch_summary(
-        repo,
-        preview,
-    ) if not repair_targets else "\n".join([
-        "Repair candidate (summary derived from the diff, not AI):",
-        _fallback_patch_summary(preview.patch_text, preview.paths),
-        "Repair targets:",
-        *(f"  - {target}" for target in sorted(repair_targets)),
-    ])
-    print("Patch is technically applicable.\n")
-    print("Planned changes:")
-    print(summary)
-
-    interactive = (
-        sys.stdin.isatty()
-        and sys.stdout.isatty()
-    )
-    if not interactive and not yes:
-        if baseline_future is not None:
-            baseline_future.cancel()
-        if baseline_executor is not None:
-            baseline_executor.shutdown(wait=False, cancel_futures=True)
-        raise PatchError(
-            "Non-interactive apply requires --yes. "
-            "No repository files were changed."
-        )
-
-    if not yes:
-        if _ask_yes_no(
-            "View full diff before applying?",
-            default=True,
-        ):
-            _open_diff_window(repo, preview.patch_text, preview.paths)
-
-        if not _ask_yes_no(
-            "Apply these changes?",
-            default=False,
-        ):
-            if baseline_future is not None:
-                baseline_future.cancel()
-            if baseline_executor is not None:
-                baseline_executor.shutdown(wait=False, cancel_futures=True)
-            print("Apply cancelled. No repository files were changed.")
-            raise PatchError(
-                "Apply cancelled by user."
-            )
-
-    baseline = None
-    baseline_error: Exception | None = None
-    try:
-        current_snapshot = _capture_repository_snapshot(repo)
-        if cached_baseline is not None and current_snapshot == baseline_snapshot:
-            baseline = cached_baseline
-        elif _CLI_APPLY_INVOCATION:
-            if current_snapshot != baseline_snapshot:
-                print(
-                    "Repository changed during review; the cached pre-patch "
-                    "baseline no longer applies."
-                )
-        elif current_snapshot != baseline_snapshot:
-            # Do not overlap a replacement suite with the discarded suite:
-            # project test tools often share caches and report locations.
-            print("Repository changed during review; discarding pre-patch baseline.")
-            if baseline_future is not None and baseline_executor is not None:
-                baseline_future.cancel()
-                try:
-                    baseline_future.result()
-                except Exception:
-                    pass
-                baseline_executor.shutdown(wait=True, cancel_futures=True)
-            print("Running fresh pre-patch test baseline...")
-            baseline = _run_background_baseline(repo)
-        else:
-            assert baseline_future is not None and baseline_executor is not None
-            if not baseline_future.done():
-                print("Waiting for pre-patch baseline...")
-            baseline = baseline_future.result()
-            baseline_executor.shutdown(wait=True, cancel_futures=True)
-        if baseline is not None:
-            baseline = _preserve_test_report(repo, baseline, "baseline")
-            _show_test_result(baseline)
-    except Exception as exc:
-        # Match the established baseline-infrastructure-error path. Test
-        # failures are TestResult values and never arrive here as exceptions.
-        baseline_error = exc
-        if baseline_executor is not None:
-            baseline_executor.shutdown(wait=False, cancel_futures=True)
-        print(f"Pre-patch tests could not be run: {exc}")
-
-    result = _apply_patch_core(
-        repo,
-        patch_file,
-        new_task=new_task,
-    )
-    assert isinstance(result, ApplyResult)
-
-    print("\n" + _status("[OK] PATCH APPLIED", "green"))
-    print("Running relevant tests, then the full suite...")
-
-    test_result = None
-    relevant_result = None
-    full_suite_pending = False
-    test_error: Exception | None = baseline_error
-    try:
-        from .history import update_history_test_result
-        from .test_runner import (
-            TestError,
-            run_project_tests,
-            run_relevant_tests,
-            unmapped_python_source_paths,
-        )
-
-        unmapped_sources = unmapped_python_source_paths(repo, result.paths)
-        if unmapped_sources:
-            print(_status(
-                "[WARN] No direct test-file match could be identified for:",
-                "yellow",
-            ))
-            for path in unmapped_sources[:10]:
-                print(f"  {path}")
-            if len(unmapped_sources) > 10:
-                print(f"  ... and {len(unmapped_sources) - 10} more")
-            print(
-                "This does not prove that test coverage is missing. "
-                "The full suite will still run."
-            )
-
-        try:
-            relevant_result = run_relevant_tests(repo, result.paths)
-            if relevant_result is not None:
-                relevant_result = _preserve_test_report(repo, relevant_result, "targeted")
-                _show_test_result(relevant_result)
-        except TestError as exc:
-            # A narrow selection is only an optimization.  It must never
-            # prevent the required full-suite validation from running.
-            test_error = exc
-            print(f"Relevant tests could not be run: {exc}")
-
-        remaining_after_targeted = (
-            getattr(relevant_result, "failed_tests", frozenset())
-            & repair_targets
-            if relevant_result is not None and relevant_result.returncode != 0
-            else frozenset()
-        )
-        if remaining_after_targeted:
-            update_history_test_result(result.history_entry, "REPAIR_FAILED")
-            print(_status(
-                "[FAIL] Repair candidate rejected by relevant tests; "
-                "the full suite was skipped.",
-                "red",
-            ))
-        else:
-            try:
-                full_snapshot = _capture_repository_snapshot(repo)
-                targeted_failed = (
-                    relevant_result is not None
-                    and relevant_result.returncode != 0
-                )
-                if _CLI_APPLY_INVOCATION and not targeted_failed:
-                    _start_background_full_suite(repo, full_snapshot, result)
-                    full_suite_pending = True
-                    update_history_test_result(
-                        result.history_entry,
-                        "PENDING",
-                    )
-                    print(
-                        "Full test suite started in the background. "
-                        "Its verified result will be used by the next apply."
-                    )
-                else:
-                    if _CLI_APPLY_INVOCATION and targeted_failed:
-                        print(_status(
-                            "Relevant tests failed; waiting for the full suite "
-                            "before creating repair context...",
-                            "yellow",
-                        ))
-                    test_result = run_project_tests(repo)
-                    test_result = _preserve_test_report(repo, test_result, "full-suite")
-                    if _capture_repository_snapshot(repo) == full_snapshot:
-                        save_verified_baseline(repo, full_snapshot, test_result)
-                    update_history_test_result(
-                        result.history_entry,
-                        "PASSED" if test_result.returncode == 0 else "FAILED",
-                        command=test_result.command,
-                        returncode=test_result.returncode,
-                        duration_seconds=test_result.duration_seconds,
-                    )
-                    _show_test_result(test_result)
-            except (TestError, OSError) as exc:
-                test_error = exc
-                update_history_test_result(
-                    result.history_entry,
-                    "ERROR",
-                )
-                print(f"Tests could not be run: {exc}")
-    except HistoryError as exc:
-        test_error = exc
-        print(f"Could not save test status: {exc}")
-
-    validation = _classify_test_validation(
-        baseline,
-        relevant_result,
-        test_result,
-        repair_targets,
-        full_suite_pending=full_suite_pending,
-        infrastructure_error=test_error is not None,
-    )
-    _show_test_validation(validation)
-    validation_passed = validation.status in {
-        "passed", "repair_passed", "existing", "pending",
-    }
-    repair_context_needed = (
-        not validation_passed
-        and validation.status != "infrastructure_error"
-    )
-    if repair_context_needed:
-        try:
-            repair_context = build_test_failure_repair_context(
-                repo, result, validation
-            )
-            color = "red" if validation.status == "regressions" else "yellow"
-            print(_status("Repair context created.", color))
-            show_repair_send_instructions(repair_context)
-        except OSError as exc:
-            print(_status(f"Could not create repair context: {exc}", "yellow"))
-
-    print("\nWhat changed:")
-    print(summary)
-
-    if interactive:
-        _post_apply_choice(
-            repo,
-            result,
-            (
-                test_result
-                if test_result is not None and test_result.returncode != 0
-                else relevant_result
-            ),
-            test_error,
-            recommend_keep_for_repair=repair_context_needed,
-            validation=validation,
-        )
-    elif not validation_passed:
-        print(
-            "Functional validation did not pass during non-interactive "
-            "--yes apply. Changes were kept; review the test report above."
-        )
-    elif test_error is not None:
-        print(
-            "Tests were unavailable during non-interactive --yes apply. "
-            "Changes were kept."
-        )
-
-    return result
-
 
 def apply_patch(
     repo: Path,
@@ -3721,143 +641,23 @@ def apply_patch(
     *,
     new_task: bool = False,
 ) -> ApplyResult:
-    if _CLI_APPLY_INVOCATION:
-        _run_apply_flow(
-            repo,
-            patch_file,
-            yes=_CLI_APPLY_YES,
-            new_task=new_task,
-        )
-        raise SystemExit(0)
-
-    result = _apply_patch_core(
+    return _patch_api.apply_patch(
         repo,
         patch_file,
         new_task=new_task,
+        cli_apply_invocation=_CLI_APPLY_INVOCATION,
+        cli_apply_yes=_CLI_APPLY_YES,
+        run_apply_flow_fn=_run_apply_flow,
+        apply_patch_core_fn=_apply_patch_core,
     )
-    assert isinstance(result, ApplyResult)
-    return result
 
 
 def undo_last_patch(
     repo: Path,
 ) -> UndoResult:
-    try:
-        history_entry = (
-            get_latest_applied_entry(
-                repo
-            )
-        )
-    except HistoryError as exc:
-        raise PatchUndoError(
-            str(exc)
-        ) from exc
-
-    patch_file = (
-        get_history_patch_file(
-            history_entry
-        )
+    return _patch_api.undo_last_patch(
+        repo,
+        undo_last_patch_fn=_undo.undo_last_patch,
+        validate_patch_paths_fn=validate_patch_paths,
     )
 
-    try:
-        patch_text = patch_file.read_text(
-            encoding="utf-8",
-            errors="strict",
-        )
-    except (
-        OSError,
-        UnicodeDecodeError,
-    ) as exc:
-        raise PatchUndoError(
-            "Historikpatchen kunde inte "
-            "läsas."
-        ) from exc
-
-    try:
-        paths = validate_patch_paths(
-            patch_text
-        )
-    except PatchError as exc:
-        raise PatchUndoError(
-            str(exc)
-        ) from exc
-
-    ignore_space = False
-
-    try:
-        run_git(
-            "apply",
-            "--reverse",
-            "--check",
-            "--recount",
-            str(patch_file),
-            cwd=repo,
-        )
-
-    except GitError:
-        try:
-            run_git(
-                "apply",
-                "--reverse",
-                "--check",
-                "--recount",
-                "--ignore-space-change",
-                str(patch_file),
-                cwd=repo,
-            )
-
-            ignore_space = True
-
-        except GitError as exc:
-            raise PatchUndoError(
-                "Den senaste ChatCode patchen "
-                "kan inte backas säkert.\n"
-                "Filerna kan ha ändrats efter "
-                "att patchen applicerades.\n\n"
-                f"{exc}"
-            ) from exc
-
-    undo_args = [
-        "apply",
-        "--reverse",
-        "--recount",
-    ]
-
-    if ignore_space:
-        undo_args.append(
-            "--ignore-space-change"
-        )
-
-    undo_args.append(
-        str(patch_file)
-    )
-
-    try:
-        run_git(
-            *undo_args,
-            cwd=repo,
-        )
-
-    except GitError as exc:
-        raise PatchUndoError(
-            "Git kunde inte backa "
-            "patchen:\n"
-            f"{exc}"
-        ) from exc
-
-    try:
-        undone_entry = (
-            move_entry_to_undone(
-                repo,
-                history_entry,
-            )
-        )
-    except HistoryError as exc:
-        raise PatchUndoError(
-            str(exc)
-        ) from exc
-
-    return UndoResult(
-        paths=paths,
-        history_entry=undone_entry,
-    )
