@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 
 from .workspace import (
+    atomic_write_text,
     get_applied_history_dir,
     get_history_dir,
     get_undone_history_dir,
@@ -170,15 +171,21 @@ def _save_metadata(
     entry_dir: Path,
     metadata: dict,
 ) -> None:
-    _metadata_file(entry_dir).write_text(
-        json.dumps(
-            metadata,
-            indent=2,
-            ensure_ascii=False,
+    try:
+        atomic_write_text(
+            _metadata_file(entry_dir),
+            json.dumps(
+                metadata,
+                indent=2,
+                ensure_ascii=False,
+            )
+            + "\n",
         )
-        + "\n",
-        encoding="utf-8",
-    )
+    except OSError as exc:
+        raise HistoryError(
+            "Kunde inte skriva historiken: "
+            f"{entry_dir}"
+        ) from exc
 
 
 def _load_metadata(
@@ -270,78 +277,96 @@ def begin_history_entry(
     paths: set[str],
 ) -> Path:
     history_id = _new_history_id()
+    entry_dir: Path | None = None
 
-    pending_root = (
-        get_history_dir(repo)
-        / ".pending"
-    )
-
-    pending_root.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    entry_dir = (
-        pending_root / history_id
-    )
-
-    entry_dir.mkdir(
-        parents=True,
-        exist_ok=False,
-    )
-
-    patch_file = (
-        entry_dir / "patch.diff"
-    )
-
-    patch_file.write_text(
-        patch_text,
-        encoding="utf-8",
-        newline="\n",
-    )
-
-    before_dir = (
-        entry_dir / "before"
-    )
-
-    before_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    files: list[dict] = []
-
-    for relative_path in sorted(paths):
-        before_exists = _capture_file(
-            repo,
-            relative_path,
-            before_dir,
+    try:
+        pending_root = (
+            get_history_dir(repo)
+            / ".pending"
         )
 
-        files.append({
-            "path": relative_path,
-            "before_exists": before_exists,
-            "after_exists": None,
-        })
+        pending_root.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
 
-    metadata = {
-        "id": history_id,
-        "status": "PENDING",
-        "applied_at": _now_iso(),
-        "undone_at": None,
-        "test_status": "NOT_RUN",
-        "test_command": None,
-        "test_returncode": None,
-        "test_duration_seconds": None,
-        "files": files,
-    }
+        entry_dir = (
+            pending_root / history_id
+        )
 
-    _save_metadata(
-        entry_dir,
-        metadata,
-    )
+        entry_dir.mkdir(
+            parents=True,
+            exist_ok=False,
+        )
 
-    return entry_dir
+        patch_file = (
+            entry_dir / "patch.diff"
+        )
+
+        patch_file.write_text(
+            patch_text,
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        before_dir = (
+            entry_dir / "before"
+        )
+
+        before_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        files: list[dict] = []
+
+        for relative_path in sorted(paths):
+            before_exists = _capture_file(
+                repo,
+                relative_path,
+                before_dir,
+            )
+
+            files.append({
+                "path": relative_path,
+                "before_exists": before_exists,
+                "after_exists": None,
+            })
+
+        metadata = {
+            "id": history_id,
+            "status": "PENDING",
+            "applied_at": _now_iso(),
+            "undone_at": None,
+            "test_status": "NOT_RUN",
+            "test_command": None,
+            "test_returncode": None,
+            "test_duration_seconds": None,
+            "files": files,
+        }
+
+        _save_metadata(
+            entry_dir,
+            metadata,
+        )
+
+        return entry_dir
+    except (OSError, HistoryError) as exc:
+        if entry_dir is not None:
+            try:
+                shutil.rmtree(
+                    entry_dir,
+                )
+            except OSError:
+                pass
+
+        if isinstance(exc, HistoryError):
+            raise
+
+        raise HistoryError(
+            "Kunde inte skapa historik "
+            "för patchen."
+        ) from exc
 
 
 def finalize_history_entry(
@@ -352,46 +377,48 @@ def finalize_history_entry(
         pending_entry
     )
 
-    after_dir = (
-        pending_entry / "after"
-    )
-
-    after_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    for file_info in metadata["files"]:
-        relative_path = file_info["path"]
-
-        after_exists = _capture_file(
-            repo,
-            relative_path,
-            after_dir,
+    try:
+        after_dir = (
+            pending_entry / "after"
         )
 
-        file_info[
-            "after_exists"
-        ] = after_exists
+        after_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
 
-    metadata["status"] = "APPLIED"
-    metadata["completed_at"] = _now_iso()
+        for file_info in metadata["files"]:
+            relative_path = file_info["path"]
 
-    _save_metadata(
-        pending_entry,
-        metadata,
-    )
+            after_exists = _capture_file(
+                repo,
+                relative_path,
+                after_dir,
+            )
 
-    destination = (
-        get_applied_history_dir(repo)
-        / pending_entry.name
-    )
+            file_info[
+                "after_exists"
+            ] = after_exists
 
-    try:
+        metadata["status"] = "APPLIED"
+        metadata["completed_at"] = _now_iso()
+
+        _save_metadata(
+            pending_entry,
+            metadata,
+        )
+
+        destination = (
+            get_applied_history_dir(repo)
+            / pending_entry.name
+        )
+
         shutil.move(
             str(pending_entry),
             str(destination),
         )
+    except HistoryError:
+        raise
     except OSError as exc:
         raise HistoryError(
             "Patchen applicerades, men "
@@ -434,15 +461,53 @@ def get_latest_applied_entry(
         get_applied_history_dir(repo)
     )
 
-    entries = [
-        path
-        for path in applied_dir.iterdir()
-        if (
-            path.is_dir()
-            or path.suffix.lower()
-            == ".diff"
+    entries: list[Path] = []
+    try:
+        candidates = list(
+            applied_dir.iterdir()
         )
-    ]
+    except OSError as exc:
+        raise HistoryError(
+            "Kunde inte läsa ChatCode historiken."
+        ) from exc
+
+    for path in candidates:
+        if path.is_file():
+            if (
+                path.suffix.lower() == ".diff"
+                and _history_name_timestamp(path)
+                is not None
+            ):
+                entries.append(path)
+            continue
+
+        if not path.is_dir():
+            continue
+
+        patch_file = get_history_patch_file(
+            path
+        )
+        if not patch_file.is_file():
+            continue
+
+        metadata_file = _metadata_file(
+            path
+        )
+        if metadata_file.is_file():
+            try:
+                metadata = _load_metadata(
+                    path
+                )
+            except HistoryError:
+                continue
+            if metadata.get("status") != "APPLIED":
+                continue
+        elif _history_name_timestamp(
+            path
+        ) is None:
+            continue
+
+        entries.append(path)
 
     if not entries:
         raise HistoryError(
@@ -467,11 +532,14 @@ def move_entry_to_undone(
         / entry.name
     )
 
+    original_metadata: dict | None = None
     if entry.is_dir():
-        metadata = _load_metadata(
+        original_metadata = _load_metadata(
             entry
         )
-
+        metadata = dict(
+            original_metadata
+        )
         metadata["status"] = "UNDONE"
         metadata["undone_at"] = (
             _now_iso()
@@ -488,6 +556,26 @@ def move_entry_to_undone(
             str(destination),
         )
     except OSError as exc:
+        rollback_error: HistoryError | None = None
+        if (
+            original_metadata is not None
+            and entry.is_dir()
+        ):
+            try:
+                _save_metadata(
+                    entry,
+                    original_metadata,
+                )
+            except HistoryError as restore_exc:
+                rollback_error = restore_exc
+
+        if rollback_error is not None:
+            raise HistoryError(
+                "Ändringen backades, men "
+                "historikflytten misslyckades "
+                "och metadata kunde inte återställas."
+            ) from rollback_error
+
         raise HistoryError(
             "Ändringen backades, men "
             "historiken kunde inte "

@@ -108,6 +108,9 @@ class TestCommandDetectionTests(unittest.TestCase):
                 with patch(
                     "chatcode.test_runner._project_python",
                     return_value="python-test",
+                ), patch(
+                    "chatcode.test_runner._python_can_import",
+                    return_value=True,
                 ):
                     command = detect_test_command(
                         self.repo
@@ -124,6 +127,32 @@ class TestCommandDetectionTests(unittest.TestCase):
                     ],
                 )
                 config.unlink()
+
+    def test_pytest_runs_serially_when_xdist_is_unavailable(self) -> None:
+        (self.repo / "pytest.ini").write_text(
+            "[pytest]\n",
+            encoding="utf-8",
+        )
+
+        with patch(
+            "chatcode.test_runner._project_python",
+            return_value="python-test",
+        ), patch(
+            "chatcode.test_runner._python_can_import",
+            return_value=False,
+        ):
+            command = detect_test_command(
+                self.repo
+            )
+
+        self.assertEqual(
+            command.args,
+            [
+                "python-test",
+                "-m",
+                "pytest",
+            ],
+        )
 
     def test_project_without_test_signals_still_raises(self) -> None:
         with self.assertRaisesRegex(
@@ -227,6 +256,9 @@ class TestCommandDetectionTests(unittest.TestCase):
         with patch(
             "chatcode.test_runner._project_python",
             return_value="python-test",
+        ), patch(
+            "chatcode.test_runner._python_can_import",
+            return_value=True,
         ), patch(
             "chatcode.test_runner._run_test_command",
         ) as run:

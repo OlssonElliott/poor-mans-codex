@@ -390,6 +390,18 @@ def _project_python(
     return sys.executable
 
 
+def _pytest_parallel_args(
+    python: str,
+) -> list[str]:
+    if _python_can_import(
+        python,
+        "xdist",
+    ):
+        return ["-n", "auto"]
+
+    return []
+
+
 def _detect_python_tests(
     repo: Path,
 ) -> TestCommand | None:
@@ -403,9 +415,15 @@ def _detect_python_tests(
     )
 
     if uses_pytest:
+        args = [
+            python,
+            "-m",
+            "pytest",
+            *_pytest_parallel_args(python),
+        ]
         return TestCommand(
-            display=f"{python} -m pytest -n auto",
-            args=[python, "-m", "pytest", "-n", "auto"],
+            display=" ".join(args),
+            args=args,
         )
 
     if not (repo / "tests").is_dir():
@@ -751,12 +769,16 @@ def run_relevant_tests(
     )
     if uses_pytest:
         target_args = [path.relative_to(repo).as_posix() for path in test_files]
+        args = [
+            python,
+            "-m",
+            "pytest",
+            *_pytest_parallel_args(python),
+            *target_args,
+        ]
         targeted = TestCommand(
-            display=(
-                f"{python} -m pytest -n auto "
-                f"{' '.join(target_args)}"
-            ),
-            args=[python, "-m", "pytest", "-n", "auto", *target_args],
+            display=" ".join(args),
+            args=args,
         )
     elif len(test_files) == 1:
         targeted = TestCommand(

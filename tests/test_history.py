@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from chatcode.history import (
+    HistoryError,
     MAX_HISTORY_ENTRIES,
     _prune_history_dir,
     begin_history_entry,
@@ -146,6 +147,108 @@ class HistoryRetentionTests(unittest.TestCase):
         self.assertEqual(
             latest.name,
             created[-1].name,
+        )
+
+    def test_latest_applied_entry_ignores_unrelated_directory(self) -> None:
+        applied = self.create_applied_entry()
+        unrelated = (
+            get_applied_history_dir(self.repo)
+            / "zzzz-manual-backup"
+        )
+        unrelated.mkdir()
+        (unrelated / "notes.txt").write_text(
+            "not chatcode history",
+            encoding="utf-8",
+        )
+
+        latest = get_latest_applied_entry(
+            self.repo
+        )
+
+        self.assertEqual(
+            latest,
+            applied,
+        )
+
+    def test_begin_history_wraps_storage_errors(self) -> None:
+        with patch(
+            "chatcode.history._capture_file",
+            side_effect=OSError("disk full"),
+        ), self.assertRaisesRegex(
+            HistoryError,
+            "Kunde inte skapa historik",
+        ):
+            begin_history_entry(
+                self.repo,
+                "--- a/app.py\n+++ b/app.py\n",
+                {"app.py"},
+            )
+
+        pending = (
+            get_applied_history_dir(self.repo)
+            .parent
+            / ".pending"
+        )
+        if pending.exists():
+            self.assertEqual(
+                list(pending.iterdir()),
+                [],
+            )
+
+    def test_finalize_history_wraps_storage_errors(self) -> None:
+        pending = begin_history_entry(
+            self.repo,
+            "--- a/app.py\n+++ b/app.py\n",
+            {"app.py"},
+        )
+
+        with patch(
+            "chatcode.history._capture_file",
+            side_effect=OSError("disk full"),
+        ), self.assertRaisesRegex(
+            HistoryError,
+            "historiken kunde inte slutföras",
+        ):
+            finalize_history_entry(
+                self.repo,
+                pending,
+            )
+
+    def test_failed_undone_move_restores_applied_metadata(self) -> None:
+        applied = self.create_applied_entry()
+        before = json.loads(
+            (applied / "metadata.json").read_text(
+                encoding="utf-8",
+            )
+        )
+
+        with patch(
+            "chatcode.history.shutil.move",
+            side_effect=OSError("locked"),
+        ), self.assertRaisesRegex(
+            HistoryError,
+            "kunde inte flyttas till undone",
+        ):
+            move_entry_to_undone(
+                self.repo,
+                applied,
+            )
+
+        after = json.loads(
+            (applied / "metadata.json").read_text(
+                encoding="utf-8",
+            )
+        )
+        self.assertEqual(
+            after,
+            before,
+        )
+        self.assertEqual(
+            after["status"],
+            "APPLIED",
+        )
+        self.assertIsNone(
+            after["undone_at"],
         )
 
     def test_cleanup_does_not_touch_other_workspace_files(self) -> None:
