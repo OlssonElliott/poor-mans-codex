@@ -10,7 +10,44 @@ from chatcode.workspace import (
     TEMPORARY_WORKSPACE_MAX_AGE_SECONDS,
     atomic_write_text,
     cleanup_stale_temporary_workspaces,
+    get_workspace_root,
 )
+
+
+class WorkspaceRootTests(unittest.TestCase):
+    def test_environment_can_redirect_workspace_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            configured = (
+                Path(temporary)
+                / "isolated-workspace"
+            )
+
+            previous = os.environ.get(
+                "CHATCODE_WORKSPACE_ROOT"
+            )
+            os.environ[
+                "CHATCODE_WORKSPACE_ROOT"
+            ] = str(configured)
+            try:
+                workspace_root = get_workspace_root()
+            finally:
+                if previous is None:
+                    os.environ.pop(
+                        "CHATCODE_WORKSPACE_ROOT",
+                        None,
+                    )
+                else:
+                    os.environ[
+                        "CHATCODE_WORKSPACE_ROOT"
+                    ] = previous
+
+            self.assertEqual(
+                workspace_root,
+                configured.resolve(),
+            )
+            self.assertTrue(
+                workspace_root.is_dir(),
+            )
 
 
 class AtomicWriteTests(unittest.TestCase):

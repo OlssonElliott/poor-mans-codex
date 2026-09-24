@@ -17,16 +17,27 @@ TEMPORARY_WORKSPACE_MAX_AGE_SECONDS = 24 * 60 * 60
 
 
 def get_workspace_root() -> Path:
-    chatcode_root = (
-        Path(__file__)
-        .resolve()
-        .parent
-        .parent
+    configured_root = os.environ.get(
+        "CHATCODE_WORKSPACE_ROOT"
     )
 
-    workspace_root = (
-        chatcode_root / "workspace"
-    )
+    if configured_root:
+        workspace_root = (
+            Path(configured_root)
+            .expanduser()
+            .resolve()
+        )
+    else:
+        chatcode_root = (
+            Path(__file__)
+            .resolve()
+            .parent
+            .parent
+        )
+
+        workspace_root = (
+            chatcode_root / "workspace"
+        )
 
     workspace_root.mkdir(
         parents=True,
