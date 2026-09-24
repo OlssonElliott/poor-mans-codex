@@ -230,6 +230,30 @@ class ApplyFlowTests(unittest.TestCase):
         self.assertIn("patch-preview", before.parts)
         self.assertIn("patch-preview", after.parts)
 
+    def test_repeated_preview_uses_fresh_vscode_diff_paths(self) -> None:
+        patch_text = self.incoming.read_text(encoding="utf-8")
+
+        with patch("chatcode.patch.open_code_diff") as open_diff:
+            _open_diff_window(
+                self.repo,
+                patch_text,
+                {"app.py"},
+            )
+            first_before, first_after = open_diff.call_args.args
+
+            open_diff.reset_mock()
+            _open_diff_window(
+                self.repo,
+                patch_text,
+                {"app.py"},
+            )
+            second_before, second_after = open_diff.call_args.args
+
+        self.assertNotEqual(first_before, second_before)
+        self.assertNotEqual(first_after, second_after)
+        self.assertEqual(second_before.read_text(encoding="utf-8"), "value = 1\n")
+        self.assertEqual(second_after.read_text(encoding="utf-8"), "value = 2\n")
+
     def test_preview_uses_canonical_counts_instead_of_raw_incoming_patch(self) -> None:
         raw = (
             "--- a/app.py\n+++ b/app.py\n"

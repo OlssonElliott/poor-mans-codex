@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import sys
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 
@@ -171,13 +172,18 @@ def open_diff_window(
     from .errors import PatchError
 
     try:
-        preview_root = get_repo_workspace_fn(repo) / "patch-preview"
         resolved_workspace = get_repo_workspace_fn(repo).resolve()
+        preview_base = resolved_workspace / "patch-preview"
+        preview_root = preview_base / uuid.uuid4().hex
+        resolved_preview_base = preview_base.resolve()
         resolved_preview = preview_root.resolve()
-        if resolved_preview.parent != resolved_workspace:
+        if (
+            resolved_preview_base.parent != resolved_workspace
+            or resolved_preview.parent != resolved_preview_base
+        ):
             raise OSError("Unsafe patch preview directory.")
-        if preview_root.exists():
-            rmtree_fn(preview_root)
+        if preview_base.exists():
+            rmtree_fn(preview_base)
 
         before_root = preview_root / "before"
         after_root = preview_root / "after"
