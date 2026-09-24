@@ -12,21 +12,21 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from chatcode.indexing.project_graph import load_map
-from chatcode.retrieval.hybrid_retriever import _task_is_complex
-from chatcode.retrieval.source_coverage import (
+from chatcode.retrieval.evidence import (
     ACTION_TERMS,
     COMMON_TERMS,
     GENERIC_SUFFIXES,
     ROLE_TRIGGERS,
     DefinitionEvidence,
-    SourceCoveragePlan,
-    _definitions,
-    _domain_terms,
-    _kind_score,
-    _matching_terms,
-    _path_roles,
-    _tokens,
+    definitions as extract_definitions,
+    domain_terms as extract_domain_terms,
+    kind_score as score_definition,
+    matching_terms as match_terms,
+    path_roles as infer_path_roles,
+    tokens as evidence_tokens,
 )
+from chatcode.retrieval.source_coverage import SourceCoveragePlan
+from chatcode.retrieval.task_semantics import task_is_complex
 
 
 MAX_CONTRACT_SYMBOLS = 64
@@ -152,11 +152,11 @@ class ContextContractPlan:
 
 
 def _requirement_roles(requirement: str) -> set[str]:
-    tokens = _tokens(requirement)
+    tokens = evidence_tokens(requirement)
     roles = {
         role
         for role, triggers in ROLE_TRIGGERS.items()
-        if _matching_terms(set(triggers), tokens)
+        if match_terms(set(triggers), tokens)
     }
     if not roles:
         roles.add("domain")
@@ -182,7 +182,7 @@ def _requirement_kinds(requirement: str) -> list[str]:
 
 
 def _requirement_terms(requirement: str, task_terms: set[str]) -> set[str]:
-    terms = _domain_terms(requirement)
+    terms = extract_domain_terms(requirement)
     if terms:
         return terms
     role_terms = {
@@ -190,7 +190,7 @@ def _requirement_terms(requirement: str, task_terms: set[str]) -> set[str]:
         for triggers in ROLE_TRIGGERS.values()
         for term in triggers
     }
-    lexical = _tokens(requirement) - set(ACTION_TERMS) - set(COMMON_TERMS) - role_terms
+    lexical = evidence_tokens(requirement) - set(ACTION_TERMS) - set(COMMON_TERMS) - role_terms
     return lexical or task_terms
 
 
@@ -230,15 +230,15 @@ def _requirement_is_support_only(requirement: str) -> bool:
 def _owner_surface_score(
     role: str,
     definition: DefinitionEvidence,
-    path_tokens: set[str],
+    pathtokens: set[str],
     owner_terms: set[str],
 ) -> int:
     """Score complete patch owners separately from ordinary evidence."""
     lowered = definition.name.casefold()
-    name_tokens = _tokens(definition.name)
+    nametokens = evidence_tokens(definition.name)
     body_lower = definition.text.casefold()
-    name_hits = _matching_terms(owner_terms, name_tokens)
-    path_hits = _matching_terms(owner_terms, path_tokens)
+    name_hits = match_terms(owner_terms, nametokens)
+    path_hits = match_terms(owner_terms, pathtokens)
     body_hits = {
         term for term in owner_terms
         if term in body_lower
@@ -263,8 +263,8 @@ def _owner_surface_score(
     if role == "ui":
         if definition.kind not in {"function", "class"}:
             return -1_000
-        owner_hits = _matching_terms(UI_OWNER_TERMS, name_tokens)
-        path_owner_hits = _matching_terms(name_tokens, path_tokens)
+        owner_hits = match_terms(UI_OWNER_TERMS, nametokens)
+        path_owner_hits = match_terms(nametokens, pathtokens)
         if not owner_hits:
             return -1_000
         if not (name_hits or body_hits or path_hits or path_owner_hits):
@@ -276,7 +276,7 @@ def _owner_surface_score(
             + 80 * len(path_hits)
             + 180 * len(path_owner_hits)
         )
-        if "editor" in name_tokens or "inspector" in name_tokens:
+        if "editor" in nametokens or "inspector" in nametokens:
             score += 180
         return score
 
@@ -286,7 +286,7 @@ def _owner_surface_score(
             or not lowered.startswith("test")
         ):
             return -1_000
-        action_hits = _matching_terms(TEST_ACTION_TERMS, name_tokens)
+        action_hits = match_terms(TEST_ACTION_TERMS, nametokens)
         if not (name_hits or body_hits):
             return -1_000
         return (
@@ -316,9 +316,9 @@ def _definition_target(definition: DefinitionEvidence) -> str:
 def _is_ui_owner(definition: DefinitionEvidence) -> bool:
     if definition.kind not in {"function", "class"}:
         return False
-    name_tokens = _tokens(definition.name)
+    nametokens = evidence_tokens(definition.name)
     return bool(
-        _matching_terms(UI_OWNER_TERMS, name_tokens)
+        match_terms(UI_OWNER_TERMS, nametokens)
         or definition.name[:1].isupper()
     )
 
@@ -345,7 +345,7 @@ def _effective_owner_roles(
         *TRANSPORT_CORE_OWNER_ORDER,
         *TRANSPORT_HTTP_OWNER_ORDER,
     }
-    for path, _path_tokens, file_roles, definitions in evidence:
+    for path, _pathtokens, file_roles, definitions in evidence:
         if path not in preferred_paths or not anchor_symbols.get(path):
             continue
 
@@ -448,7 +448,7 @@ def _structural_owner_candidates(
         ]
         owner_rows = core_rows or candidate_rows
 
-        for path, path_tokens, _file_roles, definitions in owner_rows[:2]:
+        for path, pathtokens, _file_roles, definitions in owner_rows[:2]:
             anchors = {
                 symbol.casefold()
                 for symbol in anchor_symbols.get(path, [])
@@ -465,10 +465,10 @@ def _structural_owner_candidates(
             ranked_owners: list[
                 tuple[int, int, int, bool, str, list[DefinitionEvidence], list[str]]
             ] = []
-            for owner, owner_definitions in owner_groups.items():
+            for owner, ownerdefinitions in owner_groups.items():
                 names = {
                     definition.name.casefold()
-                    for definition in owner_definitions
+                    for definition in ownerdefinitions
                 }
                 core = [
                     name for name in TRANSPORT_CORE_OWNER_ORDER
@@ -493,9 +493,9 @@ def _structural_owner_candidates(
                         or symbol in names
                     )
                 )
-                path_overlap = len(_matching_terms(
-                    _tokens(owner or ""),
-                    path_tokens,
+                path_overlap = len(match_terms(
+                    evidence_tokens(owner or ""),
+                    pathtokens,
                 ))
                 ranked_owners.append((
                     anchor_hits,
@@ -503,7 +503,7 @@ def _structural_owner_candidates(
                     len(core),
                     owner is not None,
                     owner or "",
-                    owner_definitions,
+                    ownerdefinitions,
                     dispatch,
                 ))
 
@@ -525,23 +525,23 @@ def _structural_owner_candidates(
                 _core_count,
                 _owned,
                 owner,
-                owner_definitions,
+                ownerdefinitions,
                 dispatch,
             ) = ranked_owners[0]
             owner_name = owner or None
             by_name = {
                 definition.name.casefold(): definition
-                for definition in owner_definitions
+                for definition in ownerdefinitions
             }
-            dispatch_definitions: list[DefinitionEvidence] = []
+            dispatchdefinitions: list[DefinitionEvidence] = []
             for name in dispatch:
                 definition = by_name.get(name)
                 if definition is None:
                     continue
                 add("transport", definition)
-                dispatch_definitions.append(definition)
+                dispatchdefinitions.append(definition)
 
-            if not dispatch_definitions:
+            if not dispatchdefinitions:
                 continue
 
             # Known serializers belong to the transport patch surface. Prefer
@@ -571,12 +571,12 @@ def _structural_owner_candidates(
             # route-specific serializers/helpers without turning _handle into
             # an unbounded closure over every endpoint in the file.
             dispatch_text = "\n".join(
-                definition.text for definition in dispatch_definitions
+                definition.text for definition in dispatchdefinitions
             )
             helper_count = 0
             serializer_names = set(TRANSPORT_SERIALIZER_ORDER)
             for candidate in callables:
-                if candidate in dispatch_definitions:
+                if candidate in dispatchdefinitions:
                     continue
                 if candidate.owner not in {None, owner_name}:
                     continue
@@ -584,9 +584,9 @@ def _structural_owner_candidates(
                     continue
                 if not _mentions_symbol(dispatch_text, candidate.name):
                     continue
-                name_hits = _matching_terms(
+                name_hits = match_terms(
                     owner_terms,
-                    _tokens(candidate.name),
+                    evidence_tokens(candidate.name),
                 )
                 body_lower = candidate.text.casefold()
                 body_hits = {
@@ -608,7 +608,7 @@ def _structural_owner_candidates(
             for row in evidence
             if row[0] in preferred_paths and "ui" in row[2]
         ]
-        for path, _path_tokens, _file_roles, definitions in rows:
+        for path, _pathtokens, _file_roles, definitions in rows:
             anchors = {
                 symbol.casefold()
                 for symbol in anchor_symbols.get(path, [])
@@ -659,7 +659,7 @@ def _structural_owner_candidates(
             if "tests" in row[2]
         ]
         preferred = [row for row in rows if row[0] in preferred_paths]
-        for path, path_tokens, _file_roles, definitions in (preferred or rows):
+        for path, pathtokens, _file_roles, definitions in (preferred or rows):
             matching_tests = [
                 definition
                 for definition in definitions
@@ -667,7 +667,7 @@ def _structural_owner_candidates(
                     definition.kind in {"function", "method"}
                     and definition.name.casefold().startswith("test")
                     and (
-                        _matching_terms(owner_terms, _tokens(definition.name))
+                        match_terms(owner_terms, evidence_tokens(definition.name))
                         or any(term in definition.text.casefold() for term in owner_terms)
                     )
                 )
@@ -681,14 +681,14 @@ def _structural_owner_candidates(
             ranked_suites = sorted(
                 suites.items(),
                 key=lambda item: (
-                    -len(_matching_terms(
-                        _tokens(item[0] or ""),
-                        path_tokens,
+                    -len(match_terms(
+                        evidence_tokens(item[0] or ""),
+                        pathtokens,
                     )),
                     -len(item[1]),
-                    -len(_matching_terms(
+                    -len(match_terms(
                         owner_terms,
-                        _tokens(item[0] or ""),
+                        evidence_tokens(item[0] or ""),
                     )),
                     (item[0] or "").casefold(),
                 ),
@@ -741,7 +741,7 @@ def _owner_surface_candidates(
         if role not in roles or role in structurally_resolved:
             continue
         ranked: list[tuple[int, DefinitionEvidence]] = []
-        for path, path_tokens, file_roles, definitions in evidence:
+        for path, pathtokens, file_roles, definitions in evidence:
             if role not in file_roles:
                 continue
             # Do not turn owner expansion into broad retrieval. Transport and
@@ -754,7 +754,7 @@ def _owner_surface_candidates(
                 score = _owner_surface_score(
                     role,
                     definition,
-                    path_tokens,
+                    pathtokens,
                     owner_terms,
                 )
                 if score >= 0:
@@ -775,7 +775,7 @@ def _owner_surface_candidates(
     return selected
 
 
-def _path_tokens(path: Path, repo: Path, index: dict) -> set[str]:
+def _pathtokens(path: Path, repo: Path, index: dict) -> set[str]:
     try:
         relative = path.relative_to(repo).as_posix()
     except ValueError:
@@ -786,7 +786,7 @@ def _path_tokens(path: Path, repo: Path, index: dict) -> set[str]:
         str(entry.get("summary", "")),
         *(str(tag) for tag in entry.get("tags", []) if isinstance(tag, str)),
     ])
-    return _tokens(relative + " " + semantic)
+    return evidence_tokens(relative + " " + semantic)
 
 
 def _evidence(
@@ -802,13 +802,13 @@ def _evidence(
             source = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        definitions = _definitions(path, source)
+        definitions = extract_definitions(path, source)
         if not definitions:
             continue
         rows.append((
             path,
-            _path_tokens(path, repo, index),
-            _path_roles(path, repo),
+            _pathtokens(path, repo, index),
+            infer_path_roles(path, repo),
             definitions,
         ))
     return rows
@@ -828,7 +828,7 @@ def plan_context_contract(
     an implementation requirement are allowed to veto context publication.
     """
     requirements = list(coverage_plan.requirements)
-    if not _task_is_complex(task, requirements):
+    if not task_is_complex(task, requirements):
         return ContextContractPlan(requirements=requirements)
 
     plan = ContextContractPlan(active=True, requirements=requirements)
@@ -892,8 +892,8 @@ def plan_context_contract(
     for candidate_requirement in requirements:
         if _requirement_is_support_only(candidate_requirement):
             continue
-        implementation_terms.update(_domain_terms(candidate_requirement))
-    task_terms = implementation_terms or _domain_terms(task)
+        implementation_terms.update(extract_domain_terms(candidate_requirement))
+    task_terms = implementation_terms or extract_domain_terms(task)
 
     for requirement in requirements:
         if _requirement_is_support_only(requirement):
@@ -909,14 +909,14 @@ def plan_context_contract(
 
         for kind in _requirement_kinds(requirement):
             ranked: list[tuple[int, DefinitionEvidence]] = []
-            for path, path_tokens, file_roles, definitions in evidence:
+            for path, pathtokens, file_roles, definitions in evidence:
                 existing = set(plan.symbols.get(path, []))
                 for definition in definitions:
-                    score = _kind_score(
+                    score = score_definition(
                         kind,
                         definition,
                         file_roles,
-                        path_tokens,
+                        pathtokens,
                         requirement_terms,
                         existing,
                     )
@@ -1019,16 +1019,16 @@ def plan_context_contract(
                 f"{symbol} ({owner_basis})"
             )
             if role == "ui":
-                owner_definitions = next(
+                ownerdefinitions = next(
                     (
                         definitions
-                        for evidence_path, _path_tokens, _roles, definitions in evidence
+                        for evidence_path, _pathtokens, _roles, definitions in evidence
                         if evidence_path == definition.path
                     ),
                     [],
                 )
                 bundle_added = 0
-                for support in owner_definitions:
+                for support in ownerdefinitions:
                     if support.kind not in {"type", "interface", "enum"}:
                         continue
                     if support.name not in definition.text:
@@ -1057,7 +1057,7 @@ def plan_context_contract(
             definitions = next(
                 (
                     definitions
-                    for evidence_path, _path_tokens, _roles, definitions in evidence
+                    for evidence_path, _pathtokens, _roles, definitions in evidence
                     if evidence_path == path
                 ),
                 [],

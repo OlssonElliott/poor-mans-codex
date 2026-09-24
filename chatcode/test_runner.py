@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from .context_builder import redact_sensitive_text
+from .context.safety import redact_sensitive_text
 from .workspace import get_test_results_file
 
 
@@ -22,7 +22,7 @@ TEST_PROFILE_FILE = Path(".chatcode") / "tests.toml"
 
 
 class TestError(RuntimeError):
-    pass
+    __test__ = False
 
 
 @dataclass(frozen=True)
@@ -33,6 +33,8 @@ class TestCommand:
 
 @dataclass(frozen=True)
 class TestResult:
+    __test__ = False
+
     command: str
     returncode: int
     duration_seconds: float
