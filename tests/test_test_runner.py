@@ -8,6 +8,7 @@ from unittest.mock import patch
 from chatcode.test_runner import (
     TestError as ChatCodeTestError,
     _failed_test_ids,
+    _project_python,
     detect_test_command,
     run_relevant_tests,
     unmapped_python_source_paths,
@@ -48,6 +49,41 @@ class TestCommandDetectionTests(unittest.TestCase):
                 "tests",
             ],
         )
+
+    def test_project_python_skips_candidate_without_required_module(self) -> None:
+        with patch(
+            "chatcode.test_runner._python_candidates",
+            return_value=["tool-python", "project-python"],
+        ), patch(
+            "chatcode.test_runner._python_can_import",
+            side_effect=lambda python, module: (
+                python == "project-python"
+                and module == "pytest"
+            ),
+        ):
+            selected = _project_python(
+                self.repo,
+                required_module="pytest",
+            )
+
+        self.assertEqual(selected, "project-python")
+
+    def test_project_python_reports_missing_required_module(self) -> None:
+        with patch(
+            "chatcode.test_runner._python_candidates",
+            return_value=["tool-python"],
+        ), patch(
+            "chatcode.test_runner._python_can_import",
+            return_value=False,
+        ):
+            with self.assertRaisesRegex(
+                ChatCodeTestError,
+                "kan importera pytest",
+            ):
+                _project_python(
+                    self.repo,
+                    required_module="pytest",
+                )
 
     def test_setup_cfg_and_tox_ini_can_signal_pytest(self) -> None:
         configs = {

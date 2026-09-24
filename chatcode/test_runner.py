@@ -299,30 +299,93 @@ def _uses_pytest(
     )
 
 
-def _project_python(
+def _python_candidates(
     repo: Path,
-) -> str:
+) -> list[str]:
     if os.name == "nt":
-        candidates = [
+        path_candidates = [
             repo / ".venv" / "Scripts" / "python.exe",
             repo / "venv" / "Scripts" / "python.exe",
-            repo / ".tools" / "python313" / "python.exe",
         ]
+        active_env = os.environ.get("VIRTUAL_ENV")
+        if active_env:
+            path_candidates.append(
+                Path(active_env) / "Scripts" / "python.exe"
+            )
+        path_candidates.append(
+            repo / ".tools" / "python313" / "python.exe"
+        )
     else:
-        candidates = [
+        path_candidates = [
             repo / ".venv" / "bin" / "python",
             repo / "venv" / "bin" / "python",
         ]
+        active_env = os.environ.get("VIRTUAL_ENV")
+        if active_env:
+            path_candidates.append(
+                Path(active_env) / "bin" / "python"
+            )
 
-    for candidate in candidates:
-        if candidate.exists():
-            return str(candidate)
+    candidates = [
+        str(candidate)
+        for candidate in path_candidates
+        if candidate.exists()
+    ]
 
     if os.name == "nt" and shutil.which("py"):
-        return "py"
+        candidates.append("py")
 
     if shutil.which("python"):
-        return "python"
+        candidates.append("python")
+
+    if sys.executable:
+        candidates.append(sys.executable)
+
+    return list(dict.fromkeys(candidates))
+
+
+def _python_can_import(
+    python: str,
+    module: str,
+) -> bool:
+    try:
+        process = subprocess.run(
+            [python, "-c", f"import {module}"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+    return process.returncode == 0
+
+
+def _project_python(
+    repo: Path,
+    *,
+    required_module: str | None = None,
+) -> str:
+    candidates = _python_candidates(repo)
+
+    if required_module is not None:
+        for candidate in candidates:
+            if _python_can_import(
+                candidate,
+                required_module,
+            ):
+                return candidate
+
+        raise TestError(
+            "ChatCode hittade ingen Python-miljö som kan importera "
+            f"{required_module}. Installera paketet i projektets "
+            "virtuella miljö eller konfigurera .chatcode/tests.toml."
+        )
+
+    if candidates:
+        return candidates[0]
 
     return sys.executable
 
@@ -333,9 +396,13 @@ def _detect_python_tests(
     if not _is_python_project(repo):
         return None
 
-    python = _project_python(repo)
+    uses_pytest = _uses_pytest(repo)
+    python = _project_python(
+        repo,
+        required_module="pytest" if uses_pytest else None,
+    )
 
-    if _uses_pytest(repo):
+    if uses_pytest:
         return TestCommand(
             display=f"{python} -m pytest -n auto",
             args=[python, "-m", "pytest", "-n", "auto"],
@@ -677,8 +744,12 @@ def run_relevant_tests(
     if not test_files:
         return None
 
-    python = _project_python(repo)
-    if _uses_pytest(repo):
+    uses_pytest = _uses_pytest(repo)
+    python = _project_python(
+        repo,
+        required_module="pytest" if uses_pytest else None,
+    )
+    if uses_pytest:
         target_args = [path.relative_to(repo).as_posix() for path in test_files]
         targeted = TestCommand(
             display=(
