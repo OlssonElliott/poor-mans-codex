@@ -161,13 +161,9 @@ def open_diff_window(
     *,
     get_repo_workspace_fn: Callable[[Path], Path],
     atomic_write_text_fn: Callable,
-    run_git_fn: Callable,
-    open_code_diff_fn: Callable,
+    open_code_file_fn: Callable,
     rmtree_fn: Callable,
-    copy2_fn: Callable,
 ) -> None:
-    from pathlib import PurePosixPath
-    from ..git_utils import GitError
     from ..history import HistoryError
     from .errors import PatchError
 
@@ -185,44 +181,17 @@ def open_diff_window(
         if preview_base.exists():
             rmtree_fn(preview_base)
 
-        before_root = preview_root / "before"
-        after_root = preview_root / "after"
-        before_root.mkdir(parents=True)
-        after_root.mkdir(parents=True)
+        preview_root.mkdir(
+            parents=True
+        )
 
         preview_patch = preview_root / "canonical-preview.diff"
         atomic_write_text_fn(preview_patch, patch_text, newline="\n")
 
-        for raw_path in sorted(paths):
-            relative = PurePosixPath(raw_path)
-            source = repo.joinpath(*relative.parts)
-            before = before_root.joinpath(*relative.parts)
-            after = after_root.joinpath(*relative.parts)
-            before.parent.mkdir(parents=True, exist_ok=True)
-            after.parent.mkdir(parents=True, exist_ok=True)
-            if source.is_file():
-                copy2_fn(source, before)
-                copy2_fn(source, after)
-
-        run_git_fn(
-            "apply",
-            "--unsafe-paths",
-            str(preview_patch),
-            cwd=after_root,
+        open_code_file_fn(
+            preview_patch.resolve()
         )
-
-        for raw_path in sorted(paths):
-            relative = PurePosixPath(raw_path)
-            before = before_root.joinpath(*relative.parts)
-            after = after_root.joinpath(*relative.parts)
-            if not before.exists():
-                before.parent.mkdir(parents=True, exist_ok=True)
-                before.write_bytes(b"")
-            if not after.exists():
-                after.parent.mkdir(parents=True, exist_ok=True)
-                after.write_bytes(b"")
-            open_code_diff_fn(before.resolve(), after.resolve())
-    except (OSError, GitError, HistoryError) as exc:
+    except (OSError, HistoryError) as exc:
         raise PatchError(
             f"Could not open diff window: {exc}"
         ) from exc

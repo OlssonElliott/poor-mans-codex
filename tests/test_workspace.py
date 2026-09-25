@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from chatcode.workspace import (
+    TEMPORARY_WORKSPACE_MAX_COUNT,
     TEMPORARY_WORKSPACE_MAX_AGE_SECONDS,
     atomic_write_text,
     cleanup_stale_temporary_workspaces,
@@ -108,6 +109,98 @@ class TemporaryWorkspaceCleanupTests(unittest.TestCase):
             cleanup_stale_temporary_workspaces(root, now=now)
 
             self.assertFalse(stale.exists())
+
+    def test_limits_number_of_recent_temporary_workspaces(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            now = time.time()
+            total = (
+                TEMPORARY_WORKSPACE_MAX_COUNT
+                + 3
+            )
+
+            directories: list[Path] = []
+            for index in range(total):
+                directory = (
+                    root
+                    / f"tmp{index:08d}"
+                )
+                directory.mkdir()
+                os.utime(
+                    directory,
+                    (
+                        now - index - 1,
+                        now - index - 1,
+                    ),
+                )
+                directories.append(
+                    directory
+                )
+
+            cleanup_stale_temporary_workspaces(
+                root,
+                now=now,
+            )
+
+            remaining = [
+                directory
+                for directory in directories
+                if directory.exists()
+            ]
+
+            self.assertEqual(
+                len(remaining),
+                TEMPORARY_WORKSPACE_MAX_COUNT,
+            )
+            self.assertFalse(
+                directories[-1].exists()
+            )
+            self.assertFalse(
+                directories[-2].exists()
+            )
+            self.assertFalse(
+                directories[-3].exists()
+            )
+
+    def test_count_limit_never_removes_active_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            now = time.time()
+            total = (
+                TEMPORARY_WORKSPACE_MAX_COUNT
+                + 1
+            )
+
+            directories = [
+                root / f"tmp{index:08d}"
+                for index in range(total)
+            ]
+            for index, directory in enumerate(directories):
+                (directory / "_workspace").mkdir(
+                    parents=True
+                )
+                modified = now - index - 1
+                os.utime(
+                    directory,
+                    (modified, modified),
+                )
+
+            active = directories[-1]
+
+            cleanup_stale_temporary_workspaces(
+                root,
+                active_workspace=active / "_workspace",
+                now=now,
+            )
+
+            self.assertTrue(active.exists())
+            self.assertEqual(
+                sum(
+                    directory.exists()
+                    for directory in directories
+                ),
+                TEMPORARY_WORKSPACE_MAX_COUNT,
+            )
 
 
 if __name__ == "__main__":

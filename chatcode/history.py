@@ -827,6 +827,73 @@ def format_history(
     return "\n".join(lines).rstrip()
 
 
+def open_code_file(
+    path: Path,
+) -> None:
+    """Open one file in VS Code and wait for the CLI handoff to complete.
+
+    ``--wait`` is deliberately not used: ChatCode only needs to know that
+    VS Code accepted the request, not that the user closed the editor.
+    """
+    code = shutil.which("code")
+
+    if code is None:
+        raise HistoryError(
+            "VS Code kommandot 'code' "
+            "kunde inte hittas i PATH."
+        )
+
+    try:
+        if os.name == "nt":
+            command_line = (
+                subprocess.list2cmdline([
+                    "code",
+                    "--reuse-window",
+                    str(path),
+                ])
+            )
+
+            result = subprocess.run(
+                [
+                    "cmd.exe",
+                    "/d",
+                    "/s",
+                    "/c",
+                    command_line,
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        else:
+            result = subprocess.run(
+                [
+                    code,
+                    "--reuse-window",
+                    str(path),
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+    except OSError as exc:
+        raise HistoryError(
+            f"Kunde inte öppna VS Code: {exc}"
+        ) from exc
+
+    if result.returncode != 0:
+        message = (
+            result.stderr.strip()
+            or result.stdout.strip()
+            or f"exit code {result.returncode}"
+        )
+        raise HistoryError(
+            f"VS Code kunde inte öppna filen: {message}"
+        )
+
+
 def open_code_diff(
     before: Path,
     after: Path,

@@ -11,9 +11,10 @@ from pathlib import Path
 
 TEMPORARY_REPOSITORY_NAME = re.compile(r"tmp[a-z0-9_]{8}\Z")
 # Workspaces for repositories created by tempfile are test/tooling artifacts.
-# Keep them long enough for an interrupted command to be inspected, but do not
-# let ordinary test runs accumulate a week's worth of abandoned workspaces.
+# Keep them long enough for an interrupted command to be inspected, while also
+# bounding how many can accumulate during a busy session.
 TEMPORARY_WORKSPACE_MAX_AGE_SECONDS = 24 * 60 * 60
+TEMPORARY_WORKSPACE_MAX_COUNT = 20
 
 
 def get_workspace_root() -> Path:
@@ -53,11 +54,11 @@ def cleanup_stale_temporary_workspaces(
     active_workspace: Path | None = None,
     now: float | None = None,
 ) -> None:
-    """Remove old workspaces created for Python-style temporary repositories.
+    """Remove old or excess Python-style temporary repository workspaces.
 
-    This deliberately ignores all normal repository names.  A generous age
-    limit also avoids disturbing a long-running command, while the active
-    workspace is explicitly excluded regardless of its age.
+    Normal repository names are never touched. The active workspace is always
+    protected. Stale workspaces are removed first, then the oldest remaining
+    temporary workspaces are removed until the configured count limit is met.
     """
     workspace_root = workspace_root.resolve()
     active_workspace = (
@@ -72,6 +73,8 @@ def cleanup_stale_temporary_workspaces(
     except OSError:
         return
 
+    temporary: list[tuple[Path, float, bool]] = []
+
     for candidate in candidates:
         if (
             not candidate.is_dir()
@@ -84,18 +87,72 @@ def cleanup_stale_temporary_workspaces(
             resolved_candidate = candidate.resolve()
             if resolved_candidate.parent != workspace_root:
                 continue
-            if (
+
+            is_active = (
                 active_workspace is not None
                 and active_workspace.is_relative_to(resolved_candidate)
-            ):
-                continue
-            if candidate.stat().st_mtime >= cutoff:
-                continue
+            )
+            modified = candidate.stat().st_mtime
+            temporary.append(
+                (
+                    candidate,
+                    modified,
+                    is_active,
+                )
+            )
+        except OSError:
+            continue
+
+    remaining: list[tuple[Path, float, bool]] = []
+
+    for candidate, modified, is_active in temporary:
+        if is_active or modified >= cutoff:
+            remaining.append(
+                (
+                    candidate,
+                    modified,
+                    is_active,
+                )
+            )
+            continue
+
+        try:
             shutil.rmtree(candidate)
         except OSError:
-            # Cleanup is opportunistic: a locked or concurrently used folder
-            # is left for a future invocation.
+            # Cleanup is opportunistic. A locked directory remains eligible
+            # for another cleanup attempt later.
+            remaining.append(
+                (
+                    candidate,
+                    modified,
+                    is_active,
+                )
+            )
+
+    excess = max(
+        0,
+        len(remaining)
+        - TEMPORARY_WORKSPACE_MAX_COUNT,
+    )
+
+    if excess == 0:
+        return
+
+    for candidate, _modified, is_active in sorted(
+        remaining,
+        key=lambda item: item[1],
+    ):
+        if excess == 0:
+            break
+        if is_active:
             continue
+
+        try:
+            shutil.rmtree(candidate)
+        except OSError:
+            continue
+
+        excess -= 1
 
 
 def atomic_write_text(
