@@ -19,6 +19,8 @@ _ANSI = {
     "cyan": "\x1b[36m",
 }
 
+PATCH_PREVIEW_MAX_SESSIONS = 5
+
 REPAIR_COMPANION_PROMPT = (
     "Use the attached PATCH_REPAIR_CONTEXT.md as repository context and the "
     "current source of truth. The listed repair targets are the sole success "
@@ -161,9 +163,13 @@ def open_diff_window(
     *,
     get_repo_workspace_fn: Callable[[Path], Path],
     atomic_write_text_fn: Callable,
-    open_code_file_fn: Callable,
+    run_git_fn: Callable,
+    open_code_diff_fn: Callable,
     rmtree_fn: Callable,
+    copy2_fn: Callable,
 ) -> None:
+    from pathlib import PurePosixPath
+    from ..git_utils import GitError
     from ..history import HistoryError
     from .errors import PatchError
 
@@ -178,21 +184,76 @@ def open_diff_window(
             or resolved_preview.parent != resolved_preview_base
         ):
             raise OSError("Unsafe patch preview directory.")
-        if preview_base.exists():
-            rmtree_fn(preview_base)
 
-        preview_root.mkdir(
-            parents=True
+        preview_base.mkdir(
+            parents=True,
+            exist_ok=True,
         )
+
+        before_root = preview_root / "before"
+        after_root = preview_root / "after"
+        before_root.mkdir(parents=True)
+        after_root.mkdir(parents=True)
 
         preview_patch = preview_root / "canonical-preview.diff"
         atomic_write_text_fn(preview_patch, patch_text, newline="\n")
 
-        open_code_file_fn(
-            preview_patch.resolve()
+        for raw_path in sorted(paths):
+            relative = PurePosixPath(raw_path)
+            source = repo.joinpath(*relative.parts)
+            before = before_root.joinpath(*relative.parts)
+            after = after_root.joinpath(*relative.parts)
+            before.parent.mkdir(parents=True, exist_ok=True)
+            after.parent.mkdir(parents=True, exist_ok=True)
+            if source.is_file():
+                copy2_fn(source, before)
+                copy2_fn(source, after)
+
+        run_git_fn(
+            "apply",
+            "--unsafe-paths",
+            str(preview_patch),
+            cwd=after_root,
         )
-    except (OSError, HistoryError) as exc:
+
+        for raw_path in sorted(paths):
+            relative = PurePosixPath(raw_path)
+            before = before_root.joinpath(*relative.parts)
+            after = after_root.joinpath(*relative.parts)
+            if not before.exists():
+                before.parent.mkdir(parents=True, exist_ok=True)
+                before.write_bytes(b"")
+            if not after.exists():
+                after.parent.mkdir(parents=True, exist_ok=True)
+                after.write_bytes(b"")
+            open_code_diff_fn(
+                before.resolve(),
+                after.resolve(),
+            )
+
+        try:
+            previous_sessions = [
+                candidate
+                for candidate in preview_base.iterdir()
+                if (
+                    candidate.is_dir()
+                    and candidate != preview_root
+                )
+            ]
+            previous_sessions.sort(
+                key=lambda candidate: candidate.stat().st_mtime,
+                reverse=True,
+            )
+            for stale in previous_sessions[
+                PATCH_PREVIEW_MAX_SESSIONS - 1:
+            ]:
+                try:
+                    rmtree_fn(stale)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+    except (OSError, GitError, HistoryError) as exc:
         raise PatchError(
             f"Could not open diff window: {exc}"
         ) from exc
-

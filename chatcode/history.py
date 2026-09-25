@@ -906,33 +906,60 @@ def open_code_diff(
             "kunde inte hittas i PATH."
         )
 
-    if os.name == "nt":
-        command_line = (
-            subprocess.list2cmdline([
-                "code",
-                "--reuse-window",
-                "--diff",
-                str(before),
-                str(after),
-            ])
+    try:
+        if os.name == "nt":
+            command_line = (
+                subprocess.list2cmdline([
+                    code,
+                    "--reuse-window",
+                    "--diff",
+                    str(before),
+                    str(after),
+                ])
+            )
+
+            process = subprocess.run(
+                [
+                    "cmd.exe",
+                    "/d",
+                    "/s",
+                    "/c",
+                    command_line,
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        else:
+            process = subprocess.run(
+                [
+                    code,
+                    "--reuse-window",
+                    "--diff",
+                    str(before),
+                    str(after),
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+    except OSError as exc:
+        raise HistoryError(
+            f"Kunde inte öppna VS Code diff: {exc}"
+        ) from exc
+
+    if process.returncode != 0:
+        detail = (
+            process.stderr.strip()
+            or process.stdout.strip()
+            or f"exit code {process.returncode}"
         )
-
-        subprocess.Popen([
-            "cmd.exe",
-            "/d",
-            "/s",
-            "/c",
-            command_line,
-        ])
-
-    else:
-        subprocess.Popen([
-            code,
-            "--reuse-window",
-            "--diff",
-            str(before),
-            str(after),
-        ])
+        raise HistoryError(
+            "VS Code kunde inte öppna diffen: "
+            f"{detail}"
+        )
 
 
 def open_history_review(

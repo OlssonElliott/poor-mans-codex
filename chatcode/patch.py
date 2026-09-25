@@ -14,7 +14,7 @@ from .context_state import (
     save_context_state,
 )
 from .git_utils import run_git
-from .history import open_code_file
+from .history import open_code_diff
 from .workspace import (
     atomic_write_text,
     get_default_patch_file,
@@ -481,8 +481,10 @@ def _open_diff_window(
         paths,
         get_repo_workspace_fn=get_repo_workspace,
         atomic_write_text_fn=atomic_write_text,
-        open_code_file_fn=open_code_file,
+        run_git_fn=run_git,
+        open_code_diff_fn=open_code_diff,
         rmtree_fn=shutil.rmtree,
+        copy2_fn=shutil.copy2,
     )
 
 

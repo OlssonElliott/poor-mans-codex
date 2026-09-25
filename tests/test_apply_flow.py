@@ -216,64 +216,119 @@ class ApplyFlowTests(unittest.TestCase):
             "value = 1\n",
         )
 
-    def test_preview_opens_exact_patch_in_vscode(self) -> None:
+    def test_preview_opens_side_by_side_vscode_diff(self) -> None:
         patch_text = self.incoming.read_text(
             encoding="utf-8"
         )
 
         with patch(
-            "chatcode.patch.open_code_file"
-        ) as open_file:
+            "chatcode.patch.open_code_diff"
+        ) as open_diff:
             _open_diff_window(
                 self.repo,
                 patch_text,
                 {"app.py"},
             )
 
-        preview, = open_file.call_args.args
+        before, after = open_diff.call_args.args
         self.assertEqual(
-            preview.name,
-            "canonical-preview.diff",
+            before.read_text(encoding="utf-8"),
+            "value = 1\n",
+        )
+        self.assertEqual(
+            after.read_text(encoding="utf-8"),
+            "value = 2\n",
         )
         self.assertIn(
             "patch-preview",
-            preview.parts,
+            before.parts,
         )
-        self.assertEqual(
-            preview.read_text(encoding="utf-8"),
-            patch_text,
+        self.assertIn(
+            "patch-preview",
+            after.parts,
         )
 
-    def test_repeated_preview_uses_fresh_vscode_diff_paths(self) -> None:
-        patch_text = self.incoming.read_text(encoding="utf-8")
+    def test_repeated_preview_keeps_previous_session_alive(self) -> None:
+        patch_text = self.incoming.read_text(
+            encoding="utf-8"
+        )
 
         with patch(
-            "chatcode.patch.open_code_file"
-        ) as open_file:
+            "chatcode.patch.open_code_diff"
+        ) as open_diff:
             _open_diff_window(
                 self.repo,
                 patch_text,
                 {"app.py"},
             )
-            first_preview, = open_file.call_args.args
+            first_before, first_after = (
+                open_diff.call_args.args
+            )
 
-            open_file.reset_mock()
+            open_diff.reset_mock()
             _open_diff_window(
                 self.repo,
                 patch_text,
                 {"app.py"},
             )
-            second_preview, = open_file.call_args.args
+            second_before, second_after = (
+                open_diff.call_args.args
+            )
 
         self.assertNotEqual(
-            first_preview,
-            second_preview,
+            first_before,
+            second_before,
+        )
+        self.assertNotEqual(
+            first_after,
+            second_after,
+        )
+        self.assertTrue(
+            first_before.is_file()
+        )
+        self.assertTrue(
+            first_after.is_file()
         )
         self.assertEqual(
-            second_preview.read_text(
+            second_before.read_text(
                 encoding="utf-8"
             ),
-            patch_text,
+            "value = 1\n",
+        )
+        self.assertEqual(
+            second_after.read_text(
+                encoding="utf-8"
+            ),
+            "value = 2\n",
+        )
+
+    def test_preview_keeps_at_most_five_sessions(self) -> None:
+        patch_text = self.incoming.read_text(
+            encoding="utf-8"
+        )
+
+        with patch(
+            "chatcode.patch.open_code_diff"
+        ):
+            for _ in range(7):
+                _open_diff_window(
+                    self.repo,
+                    patch_text,
+                    {"app.py"},
+                )
+
+        preview_base = (
+            get_repo_workspace(self.repo)
+            / "patch-preview"
+        )
+        sessions = [
+            path
+            for path in preview_base.iterdir()
+            if path.is_dir()
+        ]
+        self.assertLessEqual(
+            len(sessions),
+            5,
         )
 
     def test_preview_uses_canonical_counts_instead_of_raw_incoming_patch(self) -> None:
@@ -284,16 +339,18 @@ class ApplyFlowTests(unittest.TestCase):
         canonical, _ = canonicalize_unified_diff(raw)
 
         with patch(
-            "chatcode.patch.open_code_file"
-        ) as open_file:
-            _open_diff_window(self.repo, canonical, {"app.py"})
+            "chatcode.patch.open_code_diff"
+        ) as open_diff:
+            _open_diff_window(
+                self.repo,
+                canonical,
+                {"app.py"},
+            )
 
-        preview, = open_file.call_args.args
+        _before, after = open_diff.call_args.args
         self.assertEqual(
-            preview.read_text(
-                encoding="utf-8"
-            ),
-            canonical,
+            after.read_text(encoding="utf-8"),
+            "value = 2\n",
         )
 
     def test_unique_contextless_hunk_is_expanded_before_apply(self) -> None:
